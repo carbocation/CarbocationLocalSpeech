@@ -529,18 +529,28 @@ import Foundation
     ) -> (prefix: String, remainder: String) {
         let previousTokens = tokens(in: previous)
         let currentTokens = tokens(in: current)
+        let previousNormalized = previousTokens.map(\.normalized)
+        let currentNormalized = currentTokens.map(\.normalized)
         let overlapTokenCount = suffixPrefixOverlapTokenCount(
-            previousTokens: previousTokens.map(\.normalized),
-            currentTokens: currentTokens.map(\.normalized)
+            previousTokens: previousNormalized,
+            currentTokens: currentNormalized
         )
 
-        guard overlapTokenCount > 0, overlapTokenCount < previousTokens.count else {
-            return ("", current.trimmingCharacters(in: .whitespacesAndNewlines))
+        if overlapTokenCount > 0, overlapTokenCount < previousTokens.count {
+            let expiredTokenCount = previousTokens.count - overlapTokenCount
+            let split = splitConfirmedPrefix(in: previous, tokenCount: expiredTokenCount)
+            return (split.prefix, current.trimmingCharacters(in: .whitespacesAndNewlines))
         }
 
-        let expiredTokenCount = previousTokens.count - overlapTokenCount
-        let split = splitConfirmedPrefix(in: previous, tokenCount: expiredTokenCount)
-        return (split.prefix, current.trimmingCharacters(in: .whitespacesAndNewlines))
+        if let overlapStart = internalPrefixOverlapStart(
+            previousTokens: previousNormalized,
+            currentTokens: currentNormalized
+        ) {
+            let split = splitConfirmedPrefix(in: previous, tokenCount: overlapStart)
+            return (split.prefix, current.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        return ("", current.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private static func mergeOverlappingText(_ first: String, _ second: String) -> String {
@@ -596,6 +606,33 @@ import Foundation
         }
 
         return 0
+    }
+
+    private static func internalPrefixOverlapStart(
+        previousTokens: [String],
+        currentTokens: [String]
+    ) -> Int? {
+        let minimumOverlap = 2
+        let maximumOverlap = min(previousTokens.count, currentTokens.count, 12)
+        guard maximumOverlap >= minimumOverlap, previousTokens.count > minimumOverlap else {
+            return nil
+        }
+
+        for count in stride(from: maximumOverlap, through: minimumOverlap, by: -1) {
+            let currentPrefix = Array(currentTokens.prefix(count))
+            guard currentPrefix.count == count else { continue }
+
+            let lastStart = previousTokens.count - count
+            guard lastStart >= 1 else { continue }
+            for start in 1...lastStart {
+                let previousSlice = Array(previousTokens[start..<(start + count)])
+                if previousSlice == currentPrefix {
+                    return start
+                }
+            }
+        }
+
+        return nil
     }
 
     private static func dropPrefixTokens(_ count: Int, from text: String) -> String {

@@ -812,6 +812,69 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         })
     }
 
+    func testSpeechChunkStreamingPipelineDoesNotDuplicateInternalOverlapAfterWindowShift() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            for index in 0..<2 {
+                continuation.yield(AudioChunk(
+                    samples: Array(repeating: 0.05, count: 8_000),
+                    sampleRate: 16_000,
+                    channelCount: 1,
+                    startTime: TimeInterval(index) * 0.5,
+                    duration: 0.5
+                ))
+            }
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(useCase: .dictation),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 1.0, updateInterval: 0.5, overlap: 0.25)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribe: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1:
+                    text = "he finds himself confronting a painful memory and"
+                case 2:
+                    text = "painful memory embodied in the physical likeness"
+                default:
+                    return Transcript()
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            })
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == "he finds himself confronting a painful memory embodied in the physical likeness"
+            }
+            return false
+        })
+        XCTAssertFalse(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.transcript.text.contains("painful memory and painful memory")
+            }
+            return false
+        })
+    }
+
     func testSpeechChunkStreamingPipelineCommitsPreviousLocalAgreementWhenWindowTextDoesNotOverlap() async throws {
         let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
             for index in 0..<2 {

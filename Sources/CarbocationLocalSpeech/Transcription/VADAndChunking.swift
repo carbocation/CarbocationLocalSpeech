@@ -259,6 +259,9 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
 
         if isFinal {
             reset()
+        } else {
+            samples = emittedSamples
+            startTime = emissionStart
         }
 
         return SpeechAudioChunk(audio: prepared, startTime: emissionStart, isFinal: isFinal)

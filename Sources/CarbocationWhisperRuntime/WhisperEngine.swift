@@ -525,7 +525,7 @@ private extension WhisperEngine {
             try withOptionalCString(prompt) { promptPointer in
                 try withOptionalCString(vadModelPath) { vadModelPathPointer in
                     var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
-                    params.n_threads = threadCount()
+                    params.n_threads = threadCount(isStreaming: streamingContext != nil)
                     params.translate = options.task == .translate
                     params.no_timestamps = false
                     params.token_timestamps = options.timestampMode == .words
@@ -613,6 +613,7 @@ private extension WhisperEngine {
         params.max_tokens = tuning.maxTokens
         params.no_context = true
         params.carry_initial_prompt = false
+        params.temperature_inc = 0
         params.audio_ctx = clampedAudioContext(tuning.audioContext, context: context)
         if includeWords {
             params.single_segment = false
@@ -703,11 +704,12 @@ private extension WhisperEngine {
         return SpeechLanguage(code: code)
     }
 
-    func threadCount() -> Int32 {
+    func threadCount(isStreaming: Bool = false) -> Int32 {
         if let threadCount = configuration.threadCount {
             return max(1, threadCount)
         }
-        return Int32(max(1, min(8, ProcessInfo.processInfo.activeProcessorCount - 1)))
+        let maximumDefaultThreadCount = isStreaming ? 4 : 8
+        return Int32(max(1, min(maximumDefaultThreadCount, ProcessInfo.processInfo.activeProcessorCount - 1)))
     }
 
     func normalizedLanguage(_ language: String?) -> String? {

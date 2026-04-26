@@ -135,7 +135,8 @@ public struct LiveTranscriptDebugView: View {
     }
 
     @ViewBuilder private var eventStream: some View {
-        if eventLogText.isEmpty {
+        let lines = eventLogLines
+        if lines.isEmpty {
             ContentUnavailableView {
                 Label("No Transcript Events", systemImage: "waveform.path.ecg")
             } description: {
@@ -143,20 +144,24 @@ public struct LiveTranscriptDebugView: View {
             }
         } else {
             ScrollView {
-                Text(eventLogText)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(lines.indices, id: \.self) { index in
+                        Text(lines[index])
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(12)
             }
         }
     }
 
-    private var eventLogText: String {
+    private var eventLogLines: [String] {
         if let eventDescriptions {
-            return eventDescriptions.joined(separator: "\n")
+            return eventDescriptions
         }
-        return events.map(Self.describe).joined(separator: "\n")
+        return events.map(Self.describe)
     }
 
     public static func describe(_ event: TranscriptEvent) -> String {
