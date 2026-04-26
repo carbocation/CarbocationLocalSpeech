@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @_spi(Internal)
 @testable import CarbocationLocalSpeech
@@ -187,6 +188,50 @@ final class CarbocationLocalSpeechTests: XCTestCase {
 
         let disabled = TranscriptionOptions(voiceActivityDetection: .disabled)
         XCTAssertEqual(disabled.voiceActivityDetection.mode, .disabled)
+    }
+
+    func testAudioFileReaderPreparesLocalAudioFileAsMonoSamples() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("stereo.wav")
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48_000,
+            channels: 2,
+            interleaved: false
+        ), let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4) else {
+            XCTFail("Could not create test audio buffer.")
+            return
+        }
+
+        buffer.frameLength = 4
+        let left: [Float] = [0.2, 0.4, -0.2, -0.4]
+        let right: [Float] = [0.6, 0.2, 0.2, -0.2]
+        for frame in 0..<4 {
+            buffer.floatChannelData?[0][frame] = left[frame]
+            buffer.floatChannelData?[1][frame] = right[frame]
+        }
+
+        var settings = format.settings
+        settings[AVLinearPCMIsNonInterleaved] = false
+        do {
+            let file = try AVAudioFile(
+                forWriting: url,
+                settings: settings,
+                commonFormat: .pcmFormatFloat32,
+                interleaved: false
+            )
+            try file.write(from: buffer)
+        }
+
+        let prepared = try await AVAssetAudioFileReader().prepareFile(at: url)
+
+        XCTAssertEqual(prepared.sampleRate, 48_000, accuracy: 0.01)
+        XCTAssertEqual(prepared.samples.count, 4)
+        XCTAssertEqual(prepared.samples[0], 0.4, accuracy: 0.000_1)
+        XCTAssertEqual(prepared.samples[1], 0.3, accuracy: 0.000_1)
+        XCTAssertEqual(prepared.samples[2], 0.0, accuracy: 0.000_1)
+        XCTAssertEqual(prepared.samples[3], -0.3, accuracy: 0.000_1)
+        XCTAssertEqual(prepared.duration, Double(4) / 48_000, accuracy: 0.000_1)
     }
 
     @MainActor

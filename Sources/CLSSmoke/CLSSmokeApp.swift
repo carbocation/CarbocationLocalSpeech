@@ -3,6 +3,7 @@ import CarbocationLocalSpeech
 import CarbocationLocalSpeechRuntime
 import CarbocationLocalSpeechUI
 import SwiftUI
+import UniformTypeIdentifiers
 
 @main
 private enum CLSSmokeApp {
@@ -27,13 +28,13 @@ private final class CLSSmokeAppDelegate: NSObject, NSApplicationDelegate {
         configureMainMenu()
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 680),
+            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "CLSSmoke"
-        window.contentMinSize = NSSize(width: 980, height: 600)
+        window.contentMinSize = NSSize(width: 980, height: 650)
         window.contentViewController = NSHostingController(rootView: CLSSmokeRootView())
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -84,10 +85,28 @@ private struct CLSSmokeRootView: View {
     @State private var lastLoggedVoiceActivityState: VoiceActivityState?
     @State private var lastLoggedProgressDuration: TimeInterval?
     @State private var lastTranscriptProgressDuration: TimeInterval?
+    @State private var selectedFileURL: URL?
+    @State private var fileTranscript: Transcript?
+    @State private var fileProcessingDuration: TimeInterval?
+    @State private var fileStatusMessage = "Pick or drop an audio or movie file."
+    @State private var fileStatusTone = CLSSmokeStatusTone.secondary
+    @State private var isFileDropTargeted = false
+    @State private var isFileTranscribing = false
+    @State private var fileTranscriptionTask: Task<Void, Never>?
+    @State private var activeFileTranscriptionID: UUID?
 
     private let maximumDisplayedEvents = 500
     private let diagnosticLogThrottleInterval: TimeInterval = 1.0
     private let transcriptMetricThrottleInterval: TimeInterval = 1.0
+    private static let supportedAudioFileExtensions: Set<String> = [
+        "aac", "aif", "aiff", "caf", "flac", "m4a", "m4b", "m4p",
+        "m4v", "mov", "mp3", "mp4", "wav", "wave"
+    ]
+    private static let supportedAudioFileTypes: [UTType] = {
+        let base: [UTType] = [.audio, .movie]
+        let dynamic = supportedAudioFileExtensions.compactMap { UTType(filenameExtension: $0) }
+        return base + dynamic
+    }()
 
     private let library = SpeechModelLibrary(
         root: SpeechModelStorage.modelsDirectory(appSupportFolderName: "CLSSmoke")
@@ -127,15 +146,18 @@ private struct CLSSmokeRootView: View {
                 Divider()
                 sessionStatus
                 Divider()
+                fileTranscriptionPanel
+                Divider()
                 LiveTranscriptDebugView(eventDescriptions: eventDescriptions, snapshot: transcriptSnapshot)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 980, minHeight: 600)
+        .frame(minWidth: 980, minHeight: 650)
         .task {
             systemOptions = await LocalSpeechEngine.systemModelOptions(locale: .current)
         }
         .onDisappear {
+            cancelFileTranscription(updateStatus: false)
             stopListening()
         }
     }
@@ -151,7 +173,7 @@ private struct CLSSmokeRootView: View {
     }
 
     private var isConfirmDisabled: Bool {
-        isStarting || isForcedVADUnavailable
+        isStarting || isFileTranscribing || isForcedVADUnavailable
     }
 
     private var selectedSelection: SpeechModelSelection? {
@@ -247,7 +269,7 @@ private struct CLSSmokeRootView: View {
                 .labelsHidden()
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 300)
-                .disabled(isStarting || isListening)
+                .disabled(isStarting || isListening || isFileTranscribing)
             }
 
             HStack(spacing: 10) {
@@ -263,13 +285,154 @@ private struct CLSSmokeRootView: View {
                 .labelsHidden()
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 240)
-                .disabled(isStarting || isListening || selectedVADMode == .disabled)
+                .disabled(isStarting || isListening || isFileTranscribing || selectedVADMode == .disabled)
             }
 
             Text(selectedVADAvailability.message)
                 .font(.caption)
                 .foregroundStyle(isForcedVADUnavailable ? .orange : .secondary)
                 .lineLimit(2)
+        }
+    }
+
+    private var fileTranscriptionPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Label("File Transcription", systemImage: "doc.text.magnifyingglass")
+                    .font(.headline)
+
+                if isFileTranscribing {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+
+                Spacer()
+
+                Button {
+                    chooseAudioFile()
+                } label: {
+                    Label("Pick File", systemImage: "folder")
+                }
+                .disabled(isFileTranscribing || isStarting)
+
+                if isFileTranscribing {
+                    Button {
+                        cancelFileTranscription()
+                    } label: {
+                        Label("Cancel", systemImage: "xmark.circle")
+                    }
+                } else {
+                    Button {
+                        startFileTranscription()
+                    } label: {
+                        Label("Transcribe", systemImage: "text.quote")
+                    }
+                    .disabled(selectedFileURL == nil || isStarting)
+                }
+            }
+
+            fileDropTarget
+
+            Label(fileStatusMessage, systemImage: fileStatusTone.systemImageName)
+                .font(.callout)
+                .foregroundStyle(fileStatusTone.color)
+                .lineLimit(2)
+
+            if let fileTranscript {
+                fileTranscriptResult(fileTranscript)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var fileDropTarget: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Image(systemName: "waveform")
+                    .font(.title3)
+                    .foregroundStyle(isFileDropTargeted ? Color.accentColor : Color.secondary)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(selectedFileURL?.lastPathComponent ?? "No file selected")
+                        .font(.callout.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                    Text("MP3, WAV, M4A, MP4, MOV, CAF, AIFF, FLAC")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, minHeight: 62, alignment: .leading)
+        .background(isFileDropTargeted ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(
+                    isFileDropTargeted ? Color.accentColor : Color.secondary.opacity(0.35),
+                    style: StrokeStyle(lineWidth: 1, dash: [6, 4])
+                )
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            chooseAudioFile()
+        }
+        .onDrop(
+            of: [UTType.fileURL.identifier],
+            isTargeted: $isFileDropTargeted,
+            perform: handleFileDrop
+        )
+    }
+
+    private func fileTranscriptResult(_ transcript: Transcript) -> some View {
+        let transcriptText = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 14) {
+                fileMetric("Segments", "\(transcript.segments.count)")
+                if let duration = transcript.duration {
+                    fileMetric("Audio", Self.formatDuration(duration))
+                }
+                if let processingDuration = fileProcessingDuration {
+                    fileMetric("Elapsed", Self.formatDuration(processingDuration))
+                    if let audioDuration = transcript.duration, audioDuration > 0 {
+                        fileMetric("RTF", String(format: "%.2f", processingDuration / audioDuration))
+                    }
+                }
+                Spacer()
+            }
+
+            ScrollView {
+                Text(transcriptText.isEmpty ? "No transcript text returned." : transcript.text)
+                    .font(.system(size: 15))
+                    .lineSpacing(3)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .foregroundStyle(transcriptText.isEmpty ? Color.secondary : Color.primary)
+                    .padding(10)
+            }
+            .frame(minHeight: 72, maxHeight: 130)
+            .background(Color(nsColor: .textBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+    }
+
+    private func fileMetric(_ title: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption.monospaced())
+                .lineLimit(1)
         }
     }
 
@@ -283,14 +446,13 @@ private struct CLSSmokeRootView: View {
             return
         }
 
+        cancelFileTranscription(updateStatus: false)
         stopListening(updateStatus: false, unloadProvider: false)
 
         let sessionID = UUID()
         activeSessionID = sessionID
         loadedInfo = nil
-        eventDescriptions.removeAll(keepingCapacity: true)
-        transcriptSnapshot = LiveTranscriptDebugSnapshot()
-        resetDiagnosticThrottleState()
+        resetTranscriptDiagnostics()
         isStarting = true
         isListening = false
         statusTone = .secondary
@@ -411,6 +573,211 @@ private struct CLSSmokeRootView: View {
             await LocalSpeechEngine.shared.unload()
             finishSession(id: id, message: error.localizedDescription, tone: .error)
         }
+    }
+
+    private func chooseAudioFile() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Audio or Movie File"
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = Self.supportedAudioFileTypes
+
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+        selectFile(url, startImmediately: true)
+    }
+
+    private func handleFileDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first(where: {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }) else {
+            return false
+        }
+
+        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, error in
+            let url = Self.fileURL(from: item)
+            Task { @MainActor in
+                if let error {
+                    fileStatusTone = .error
+                    fileStatusMessage = error.localizedDescription
+                    return
+                }
+                guard let url else {
+                    fileStatusTone = .error
+                    fileStatusMessage = "Could not read the dropped file URL."
+                    return
+                }
+                selectFile(url, startImmediately: true)
+            }
+        }
+        return true
+    }
+
+    private func selectFile(_ url: URL, startImmediately: Bool) {
+        guard Self.isSupportedAudioFile(url) else {
+            selectedFileURL = url
+            fileTranscript = nil
+            fileProcessingDuration = nil
+            fileStatusTone = .error
+            fileStatusMessage = "Unsupported file extension: \(url.lastPathComponent)"
+            return
+        }
+
+        selectedFileURL = url
+        fileTranscript = nil
+        fileProcessingDuration = nil
+        fileStatusTone = .secondary
+        fileStatusMessage = "Selected \(url.lastPathComponent)."
+
+        if startImmediately {
+            startFileTranscription()
+        }
+    }
+
+    private func startFileTranscription() {
+        guard let selectedFileURL else {
+            fileStatusTone = .error
+            fileStatusMessage = "Choose an audio or movie file first."
+            return
+        }
+        guard let selection = selectedSelection else {
+            fileStatusTone = .error
+            fileStatusMessage = "Choose a speech provider first."
+            return
+        }
+
+        let vadMode = selectedVADMode
+        let vadSensitivity = selectedVADSensitivity
+        let vadAvailability = vadAvailability(for: selection)
+        guard vadMode != .enabled || vadAvailability.isAvailable else {
+            fileStatusTone = .error
+            fileStatusMessage = "Model VAD is not available for the selected provider."
+            return
+        }
+
+        cancelFileTranscription(updateStatus: false)
+        stopListening(updateStatus: false, unloadProvider: false)
+        statusTone = .secondary
+        statusMessage = "Live listening stopped for file transcription."
+
+        let sessionID = UUID()
+        activeFileTranscriptionID = sessionID
+        fileTranscript = nil
+        fileProcessingDuration = nil
+        resetTranscriptDiagnostics()
+        isFileTranscribing = true
+        fileStatusTone = .listening
+        fileStatusMessage = "Preparing \(selectedFileURL.lastPathComponent)..."
+
+        fileTranscriptionTask = Task {
+            await runFileTranscriptionSession(
+                id: sessionID,
+                fileURL: selectedFileURL,
+                selection: selection,
+                vadMode: vadMode,
+                vadSensitivity: vadSensitivity,
+                vadAvailability: vadAvailability
+            )
+        }
+    }
+
+    private func cancelFileTranscription(updateStatus: Bool = true) {
+        activeFileTranscriptionID = nil
+        fileTranscriptionTask?.cancel()
+        fileTranscriptionTask = nil
+        isFileTranscribing = false
+
+        if updateStatus {
+            fileStatusTone = .secondary
+            fileStatusMessage = "File transcription cancelled."
+        }
+    }
+
+    private func runFileTranscriptionSession(
+        id: UUID,
+        fileURL: URL,
+        selection: SpeechModelSelection,
+        vadMode: CLSSmokeVADMode,
+        vadSensitivity: CLSSmokeVADSensitivity,
+        vadAvailability: CLSSmokeVADAvailability
+    ) async {
+        do {
+            guard activeFileTranscriptionID == id else { return }
+            fileStatusMessage = "Loading selected provider..."
+
+            let loaded = try await LocalSpeechEngine.shared.load(
+                selection: selection,
+                from: library,
+                options: SpeechLoadOptions(
+                    locale: .current,
+                    installSystemAssetsIfNeeded: true
+                )
+            )
+
+            guard activeFileTranscriptionID == id else { return }
+            loadedInfo = loaded
+            appendEvent(.started(loaded.backend))
+            appendEvent(.diagnostic(TranscriptionDiagnostic(
+                source: "smoke.file",
+                message: "file=\(fileURL.lastPathComponent) provider=\(loaded.backend.displayName) vad=\(vadMode.diagnosticValue) sensitivity=\(vadSensitivity.diagnosticValue) availability=\(vadAvailability.diagnosticValue)"
+            )))
+
+            fileStatusMessage = "Transcribing \(fileURL.lastPathComponent) with \(loaded.displayName)..."
+            let startedAt = Date()
+            let transcript = try await LocalSpeechEngine.shared.transcribe(
+                file: fileURL,
+                options: TranscriptionOptions(
+                    useCase: .general,
+                    language: Locale.current.language.languageCode?.identifier,
+                    voiceActivityDetection: VoiceActivityDetectionOptions(
+                        mode: vadMode.runtimeMode,
+                        sensitivity: vadSensitivity.runtimeSensitivity
+                    )
+                )
+            )
+            let processingDuration = Date().timeIntervalSince(startedAt)
+
+            guard activeFileTranscriptionID == id else { return }
+            fileTranscript = transcript
+            fileProcessingDuration = processingDuration
+
+            let audioDuration = transcript.duration ?? transcript.segments.last?.endTime ?? 0
+            appendEvent(.progress(TranscriptionProgress(
+                processedDuration: audioDuration,
+                totalDuration: audioDuration > 0 ? audioDuration : nil,
+                fractionComplete: 1
+            )))
+            appendEvent(.stats(TranscriptionStats(
+                audioDuration: audioDuration,
+                processingDuration: processingDuration,
+                realTimeFactor: audioDuration > 0 ? processingDuration / audioDuration : nil,
+                segmentCount: transcript.segments.count
+            )))
+            appendEvent(.completed(transcript))
+
+            finishFileTranscription(
+                id: id,
+                message: "Transcribed \(fileURL.lastPathComponent) with \(loaded.displayName).",
+                tone: .secondary
+            )
+        } catch is CancellationError {
+            finishFileTranscription(id: id, message: "File transcription cancelled.", tone: .secondary)
+        } catch {
+            guard activeFileTranscriptionID == id else { return }
+            finishFileTranscription(id: id, message: error.localizedDescription, tone: .error)
+        }
+    }
+
+    private func finishFileTranscription(id: UUID, message: String, tone: CLSSmokeStatusTone) {
+        guard activeFileTranscriptionID == id else { return }
+
+        fileTranscriptionTask = nil
+        activeFileTranscriptionID = nil
+        isFileTranscribing = false
+        fileStatusMessage = message
+        fileStatusTone = tone
     }
 
     private func ensureMicrophoneAccess() async -> Bool {
@@ -584,6 +951,12 @@ private struct CLSSmokeRootView: View {
         lastTranscriptProgressDuration = nil
     }
 
+    private func resetTranscriptDiagnostics() {
+        eventDescriptions.removeAll(keepingCapacity: true)
+        transcriptSnapshot = LiveTranscriptDebugSnapshot()
+        resetDiagnosticThrottleState()
+    }
+
     private func finishSession(id: UUID, message: String, tone: CLSSmokeStatusTone) {
         guard activeSessionID == id else { return }
 
@@ -595,6 +968,53 @@ private struct CLSSmokeRootView: View {
         isListening = false
         statusMessage = message
         statusTone = tone
+    }
+
+    private static func isSupportedAudioFile(_ url: URL) -> Bool {
+        let pathExtension = url.pathExtension.lowercased()
+        guard !pathExtension.isEmpty else {
+            return false
+        }
+        return supportedAudioFileExtensions.contains(pathExtension)
+    }
+
+    nonisolated private static func fileURL(from item: NSSecureCoding?) -> URL? {
+        if let url = item as? URL {
+            return url
+        }
+
+        if let data = item as? Data,
+           let string = String(data: data, encoding: .utf8) {
+            return fileURL(fromString: string)
+        }
+
+        if let string = item as? String {
+            return fileURL(fromString: string)
+        }
+
+        return nil
+    }
+
+    nonisolated private static func fileURL(fromString string: String) -> URL? {
+        if let url = URL(string: string), url.isFileURL {
+            return url
+        }
+
+        return URL(fileURLWithPath: string)
+    }
+
+    private static func formatDuration(_ duration: TimeInterval) -> String {
+        guard duration.isFinite else {
+            return "n/a"
+        }
+
+        if duration < 60 {
+            return String(format: "%.2fs", duration)
+        }
+
+        let minutes = Int(duration / 60)
+        let seconds = duration - Double(minutes * 60)
+        return String(format: "%d:%04.1f", minutes, seconds)
     }
 }
 

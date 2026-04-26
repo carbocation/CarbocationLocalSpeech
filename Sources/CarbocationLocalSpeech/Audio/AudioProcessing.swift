@@ -1,4 +1,6 @@
+import AudioToolbox
 import AVFoundation
+import CoreMedia
 import Foundation
 
 public enum AudioPreparationError: Error, LocalizedError, Sendable {
@@ -19,6 +21,14 @@ public struct AVAssetAudioFileReader: Sendable {
     public init() {}
 
     public func prepareFile(at url: URL) async throws -> PreparedAudio {
+        do {
+            return try await prepareWithAssetReader(at: url)
+        } catch {
+            return try prepareWithAudioFile(at: url)
+        }
+    }
+
+    private func prepareWithAudioFile(at url: URL) throws -> PreparedAudio {
         let audioFile = try AVAudioFile(forReading: url)
         let frameCount = AVAudioFrameCount(max(0, min(Int64(UInt32.max), audioFile.length)))
         guard let buffer = AVAudioPCMBuffer(
@@ -50,6 +60,113 @@ public struct AVAssetAudioFileReader: Sendable {
             duration: Double(frames) / buffer.format.sampleRate
         )
     }
+
+    private func prepareWithAssetReader(at url: URL) async throws -> PreparedAudio {
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        guard let track = tracks.first else {
+            throw AudioPreparationError.unsupportedFormat("No audio track.")
+        }
+
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: Self.assetReaderOutputSettings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else {
+            throw AudioPreparationError.unsupportedFormat("Could not create an audio track reader.")
+        }
+        reader.add(output)
+
+        guard reader.startReading() else {
+            throw reader.error ?? AudioPreparationError.unreadableAudio(url)
+        }
+
+        var mono: [Float] = []
+        var sampleRate: Double?
+        while let sampleBuffer = output.copyNextSampleBuffer() {
+            try appendMonoSamples(from: sampleBuffer, to: &mono, sampleRate: &sampleRate)
+        }
+
+        if reader.status == .failed {
+            throw reader.error ?? AudioPreparationError.unreadableAudio(url)
+        }
+        guard let sampleRate, sampleRate > 0 else {
+            throw AudioPreparationError.unsupportedFormat("Missing audio sample rate.")
+        }
+
+        return PreparedAudio(
+            samples: mono,
+            sampleRate: sampleRate,
+            duration: Double(mono.count) / sampleRate
+        )
+    }
+
+    private func appendMonoSamples(
+        from sampleBuffer: CMSampleBuffer,
+        to mono: inout [Float],
+        sampleRate: inout Double?
+    ) throws {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let streamDescriptionPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)
+        else {
+            throw AudioPreparationError.unsupportedFormat("Missing audio stream description.")
+        }
+
+        let streamDescription = streamDescriptionPointer.pointee
+        guard streamDescription.mFormatID == kAudioFormatLinearPCM,
+              streamDescription.mBitsPerChannel == 32,
+              streamDescription.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              streamDescription.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        else {
+            throw AudioPreparationError.unsupportedFormat("Expected interleaved 32-bit float PCM.")
+        }
+
+        let channelCount = max(1, Int(streamDescription.mChannelsPerFrame))
+        if sampleRate == nil {
+            sampleRate = streamDescription.mSampleRate
+        }
+
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+            return
+        }
+
+        let byteCount = CMBlockBufferGetDataLength(blockBuffer)
+        guard byteCount > 0 else { return }
+
+        var data = Data(count: byteCount)
+        try data.withUnsafeMutableBytes { bytes in
+            guard let destination = bytes.baseAddress else { return }
+            let status = CMBlockBufferCopyDataBytes(
+                blockBuffer,
+                atOffset: 0,
+                dataLength: byteCount,
+                destination: destination
+            )
+            guard status == noErr else {
+                throw AudioPreparationError.unsupportedFormat("Could not copy decoded audio sample buffer.")
+            }
+        }
+
+        data.withUnsafeBytes { bytes in
+            let floatSamples = bytes.bindMemory(to: Float.self)
+            let frameCount = floatSamples.count / channelCount
+            mono.reserveCapacity(mono.count + frameCount)
+            for frame in 0..<frameCount {
+                var sample: Float = 0
+                for channel in 0..<channelCount {
+                    sample += floatSamples[frame * channelCount + channel]
+                }
+                mono.append(sample / Float(channelCount))
+            }
+        }
+    }
+
+    private static let assetReaderOutputSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVLinearPCMIsFloatKey: true,
+        AVLinearPCMBitDepthKey: 32,
+        AVLinearPCMIsBigEndianKey: false,
+        AVLinearPCMIsNonInterleaved: false
+    ]
 }
 
 public struct AudioResampler16kMono: AudioPreparing {
