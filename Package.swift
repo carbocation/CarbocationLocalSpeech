@@ -10,6 +10,7 @@ let whisperBinaryArtifactChecksum = ""
 let whisperBinaryArtifactPath = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH"] ?? ""
 let forceSourceWhisper = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_SOURCE_WHISPER"] == "1"
 let sourceWhisperLibraryExists = FileManager.default.fileExists(atPath: whisperCombinedLibrary)
+let clsSmokeInfoPlist = "\(packageRoot)/Sources/CLSSmoke/Info.plist"
 
 let whisperTarget: Target
 let whisperUnsafeLinkerSettings: [LinkerSetting]
@@ -98,6 +99,15 @@ let package = Package(
             dependencies: [
                 "CarbocationLocalSpeechUI",
                 "CarbocationLocalSpeechRuntime"
+            ],
+            exclude: ["Info.plist"],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", clsSmokeInfoPlist
+                ])
             ]
         ),
         .testTarget(

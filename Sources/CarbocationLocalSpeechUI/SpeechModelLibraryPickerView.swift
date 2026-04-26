@@ -68,9 +68,13 @@ public struct SpeechModelLibraryPickerView: View {
                     ForEach(library.partials) { partial in
                         HStack {
                             Label(partial.displayName, systemImage: "arrow.down.circle")
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .layoutPriority(1)
                             Spacer()
                             Text(partial.fractionComplete, format: .percent.precision(.fractionLength(0)))
                                 .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: true, vertical: false)
                             Button(role: .destructive) {
                                 library.deletePartial(partial)
                             } label: {
@@ -178,24 +182,34 @@ public struct SpeechModelLibraryPickerView: View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Image(systemName: "arrow.down.circle")
                 .foregroundStyle(.secondary)
+                .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.displayName)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 Text(model.subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+                    .truncationMode(.tail)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(1)
             Spacer(minLength: 8)
-            Text(ByteCountFormatter.string(fromByteCount: model.approxSizeBytes, countStyle: .file))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Button {
-                onDownloadCuratedModel(model)
-            } label: {
-                Image(systemName: "arrow.down")
+            VStack(alignment: .trailing, spacing: 4) {
+                Text(ByteCountFormatter.string(fromByteCount: model.approxSizeBytes, countStyle: .file))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: true, vertical: false)
+                Button {
+                    onDownloadCuratedModel(model)
+                } label: {
+                    Image(systemName: "arrow.down")
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.sourceURL == nil && model.hfRepo == nil)
             }
-            .buttonStyle(.borderless)
-            .disabled(model.sourceURL == nil && model.hfRepo == nil)
         }
     }
 
@@ -212,20 +226,27 @@ public struct SpeechModelLibraryPickerView: View {
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 if !subtitle.isEmpty {
                     Text(subtitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
+                        .truncationMode(.tail)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(1)
             Spacer(minLength: 8)
             if let statusLabel {
                 status(statusLabel)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             if isSelected {
                 Image(systemName: "checkmark")
                     .foregroundStyle(.tint)
+                    .fixedSize(horizontal: true, vertical: false)
             }
         }
         .contentShape(Rectangle())

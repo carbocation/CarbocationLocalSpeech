@@ -9,9 +9,18 @@ public struct LiveTranscriptDebugView: View {
     }
 
     public var body: some View {
-        List(events.indices, id: \.self) { index in
-            Text(Self.describe(events[index]))
-                .font(.system(.caption, design: .monospaced))
+        if events.isEmpty {
+            ContentUnavailableView {
+                Label("No Transcript Events", systemImage: "waveform.path.ecg")
+            } description: {
+                Text("Provider activity will appear here.")
+            }
+        } else {
+            List(events.indices, id: \.self) { index in
+                Text(Self.describe(events[index]))
+                    .font(.system(.caption, design: .monospaced))
+            }
+            .listStyle(.inset)
         }
     }
 
