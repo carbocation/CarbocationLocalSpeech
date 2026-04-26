@@ -1,232 +1,369 @@
 # CarbocationLocalSpeech
 
-Shared local speech infrastructure for Carbocation macOS apps.
+`CarbocationLocalSpeech` is a Swift package for local speech transcription in Carbocation macOS apps. It provides shared model storage, Whisper model management, provider selection, transcription types, a unified runtime facade, and SwiftUI settings surfaces.
 
-This package should do for local speech what `CarbocationLocalLLM` now does for local text generation: provide neutral model storage, model library management, provider-aware runtime selection, shared SwiftUI management UI, and a smoke-test app. Host apps should keep product-specific dictation policy, prompts, hotkeys, Accessibility paste/type behavior, onboarding, migrations, and workflows in the host app.
+Host apps remain responsible for product behavior: hotkeys, paste/type behavior, dictation policy, command parsing, prompts, onboarding, and post-transcription cleanup.
 
-## Scope
+## For App Developers
 
-`CarbocationLocalSpeech` is the durable abstraction. Whisper and Apple Speech are providers.
+### Requirements
 
-The package should centralize:
+- macOS 14 or newer for the package.
+- Swift 5.9 or newer.
+- Xcode command line tools.
+- `NSMicrophoneUsageDescription` if your app captures microphone audio.
+- `NSSpeechRecognitionUsageDescription` if your app offers Apple Speech.
+- Outgoing network access if a sandboxed app downloads Whisper models.
+- An App Group entitlement if you want multiple apps to share the same installed speech models.
 
-- speech model download, import, deletion, and metadata for user-managed models
-- Apple system speech availability and asset readiness
-- provider-aware model selection for installed and system speech providers
-- microphone capture and file-audio preparation
-- sample-rate conversion to provider-ready audio
-- voice activity detection and emulated streaming windowing
-- file transcription
-- streaming transcription for dictation and live capture
-- stable transcript, word timestamp, and speaker-attribution types
-- optional diarization interfaces and merge utilities
-- SwiftUI model/provider and speech settings surfaces
-- diagnostics, smoke tests, and benchmark hooks
+Apple Speech is exposed only when the current SDK, operating system, locale, permissions, and system speech assets support it. The package reports that state through `LocalSpeechEngine.systemModelOptions(locale:)`.
 
-The package should not own:
+Whisper model weights are not bundled with the package. Apps can import local whisper.cpp `.bin` files, use the curated Hugging Face downloads, or provide their own download UI.
 
-- app-specific prompts or LLM cleanup
-- command parsing policy
-- global hotkeys
-- paste/type behavior through Accessibility APIs
-- meeting, memo, or dictation UX policy
-- product-specific onboarding text
-- entitlement decisions beyond documenting requirements
+### Install
 
-Apple Intelligence belongs in the post-transcription LLM step through `CarbocationLocalLLMRuntime`. Transcription should use speech providers: `whisper.cpp` for user-managed local models and Apple Speech for system-managed speech recognition.
+For app integration, prefer a tagged GitHub release. Release tags are expected to have `Package.swift` stamped with a SwiftPM binary artifact URL and checksum for the `whisper` XCFramework, so consumers do not need to build `whisper.cpp` locally.
 
-## Planned Products
+In Xcode:
 
-The package should follow the current `CarbocationLocalLLM` product split:
+1. Open `File > Add Package Dependencies...`.
+2. Add `https://github.com/carbocation/CarbocationLocalSpeech.git`.
+3. Select a release tag.
+4. Add `CarbocationLocalSpeechRuntime` to your app target.
+5. Add `CarbocationLocalSpeechUI` if you want the shared SwiftUI picker/settings views.
 
-```text
-CarbocationLocalSpeech
-  Core Swift models, model library, provider selection, audio pipeline,
-  transcript types, protocols, and mock backends.
+In `Package.swift`:
 
-CarbocationWhisperRuntime
-  Lower-level whisper.cpp-backed runtime and model probing.
-
-CarbocationAppleSpeechRuntime
-  Lower-level Apple Speech runtime backed by SpeechAnalyzer,
-  SpeechTranscriber, and AssetInventory.
-
-CarbocationLocalSpeechRuntime
-  Preferred unified facade for installed Whisper models and available
-  Apple system speech providers.
-
-CarbocationLocalSpeechUI
-  Shared SwiftUI provider picker, model picker, permission/status surfaces,
-  settings, and diagnostics.
-
-CLSSmoke
-  Xcode-friendly smoke app for provider selection, model download/import,
-  file transcription, and mic capture diagnostics.
+```swift
+dependencies: [
+    .package(
+        url: "https://github.com/carbocation/CarbocationLocalSpeech.git",
+        from: "<release-version>"
+    )
+],
+targets: [
+    .target(
+        name: "YourApp",
+        dependencies: [
+            .product(name: "CarbocationLocalSpeechRuntime", package: "CarbocationLocalSpeech"),
+            .product(name: "CarbocationLocalSpeechUI", package: "CarbocationLocalSpeech")
+        ]
+    )
+]
 ```
 
-Later adapters can be added as separate runtime products if they prove useful:
+For unreleased development, you can point at `branch: "main"`, but Whisper inference requires either a stamped binary artifact, a local binary artifact, or a locally built source artifact. Apple Speech and the core APIs can still be developed without a Whisper artifact when the runtime reports Whisper as unavailable.
 
-```text
-CarbocationWhisperKitRuntime
-CarbocationSpeakerKitRuntime
+### Products
+
+- `CarbocationLocalSpeech`: core model-library, provider-selection, audio, transcript, streaming, VAD, and diarization types.
+- `CarbocationLocalSpeechRuntime`: preferred facade for apps. It routes provider-aware selections to Whisper or Apple Speech.
+- `CarbocationLocalSpeechUI`: SwiftUI settings, provider picker, model picker, permission/status, and diagnostics surfaces.
+- `CarbocationWhisperRuntime`: lower-level whisper.cpp runtime.
+- `CarbocationAppleSpeechRuntime`: lower-level Apple Speech runtime.
+- `CLSSmoke`: local smoke-test app for package development.
+
+Most apps should depend on `CarbocationLocalSpeechRuntime` and optionally `CarbocationLocalSpeechUI`.
+
+### Create a Model Library
+
+Use an App Group if multiple apps should see the same installed Whisper models. Each app target must have the same App Group entitlement, and each app must pass that same identifier to `SpeechModelStorage.modelsDirectory(sharedGroupIdentifier:appSupportFolderName:)`.
+
+If the group identifier is omitted, the helper defaults to Carbocation's shared group (`group.com.carbocation.shared`). If the app is not entitled for that group, or for the group you pass, macOS returns no group container and the package falls back to a per-app Application Support folder.
+
+```swift
+import CarbocationLocalSpeech
+
+@MainActor
+func makeSpeechModelLibrary() -> SpeechModelLibrary {
+    let modelsRoot = SpeechModelStorage.modelsDirectory(
+        sharedGroupIdentifier: "group.com.example.shared",
+        appSupportFolderName: "YourApp"
+    )
+    return SpeechModelLibrary(root: modelsRoot)
+}
 ```
 
-## Target Package Shape
+Installed Whisper models are stored as UUID directories under `SpeechModels/` with a `metadata.json` file and one or more assets.
 
-```text
-Package.swift
-Sources/
-  CarbocationLocalSpeech/
-    Audio/
-    Diarization/
-    Models/
-    Providers/
-    Transcription/
-  CarbocationWhisperRuntime/
-  CarbocationAppleSpeechRuntime/
-  CarbocationLocalSpeechRuntime/
-  CarbocationLocalSpeechUI/
-  CLSSmoke/
-  whisper/
-    module.modulemap
-Tests/
-  CarbocationLocalSpeechTests/
-  CarbocationWhisperRuntimeTests/
-  CarbocationAppleSpeechRuntimeTests/
-  CarbocationLocalSpeechRuntimeTests/
-  CarbocationLocalSpeechUITests/
-Scripts/
-  build-whisper-macos.sh
-  build-whisper-xcframework.sh
-  build-whisper-from-xcode.sh
-  set-whisper-binary-artifact.sh
-  test-binary-release.sh
-Vendor/
-  whisper.cpp/
+For a completely custom location, bypass the helper and construct the library with the root URL you want:
+
+```swift
+let speechModelLibrary = SpeechModelLibrary(root: customModelsRoot)
 ```
 
-`Package.swift` should support the same whisper runtime modes as `CarbocationLocalLLM` uses for llama:
+### Choose a Provider
 
-- source-build mode from `Vendor/whisper-artifacts/current`
-- local binary validation mode via `CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH`
-- published binary mode via stamped artifact URL and checksum constants on release tags
-
-Apple Speech has no package-owned model artifact. It is exposed as a system provider when the app is built with an SDK that includes the newer Speech APIs and the current device/locale can run them.
-
-## Runtime Strategy
-
-Host apps should use `CarbocationLocalSpeechRuntime` by default.
+Persist `SpeechModelSelection.storageValue`, not just a model filename. Installed Whisper models use UUID storage values; system providers use stable strings such as `system.apple-speech`.
 
 ```swift
 import CarbocationLocalSpeech
 import CarbocationLocalSpeechRuntime
 
-let selection = try LocalSpeechEngine.selection(from: storedSelectionID)
+let systemOptions = await LocalSpeechEngine.systemModelOptions(locale: .current)
+let installedModel = await MainActor.run { speechModelLibrary.models.first }
+
+let selection: SpeechModelSelection
+if let appleSpeech = systemOptions.first(where: { $0.availability.isAvailable }) {
+    selection = appleSpeech.selection
+} else if let installed = installedModel {
+    selection = .installed(installed.id)
+} else {
+    throw LocalSpeechEngineError.invalidSelection("No speech provider is available.")
+}
+
+let valueToPersist = selection.storageValue
+```
+
+Restore a saved selection like this:
+
+```swift
+let selection = try LocalSpeechEngine.selection(from: valueFromPreferences)
+```
+
+### Transcribe a File
+
+Load the selection once, then transcribe files or prepared audio through the shared engine:
+
+```swift
+import CarbocationLocalSpeech
+import CarbocationLocalSpeechRuntime
+
 let loaded = try await LocalSpeechEngine.shared.load(
     selection: selection,
     from: speechModelLibrary,
-    options: SpeechLoadOptions(locale: Locale.current)
+    options: SpeechLoadOptions(
+        locale: .current,
+        preload: true,
+        installSystemAssetsIfNeeded: true
+    )
 )
 
 let transcript = try await LocalSpeechEngine.shared.transcribe(
     file: audioURL,
-    options: TranscriptionOptions(useCase: .general)
+    options: TranscriptionOptions(
+        useCase: .dictation,
+        language: "en",
+        timestampMode: .segments
+    )
 )
+
+print(loaded.displayName)
+print(transcript.text)
 ```
 
-`CarbocationWhisperRuntime` should expose `WhisperEngine` for lower-level control over a loaded whisper.cpp model. `CarbocationAppleSpeechRuntime` should expose `AppleSpeechEngine` for lower-level control over Apple Speech availability, asset installation, and transcription behavior.
+Apple Speech does not support every Whisper option. For example, translation and word timestamps are rejected for Apple Speech. Check `LocalSpeechEngine.capabilities(for:in:)` before exposing provider-specific controls.
 
-Live dictation should remain a shared audio pipeline over provider transcription, VAD, overlap windows, and partial/final text events. Do not promise true token streaming semantics: speech providers do not behave like LLM token streams.
+### Install a Whisper Model
 
-## Provider Selection
-
-Persist a provider-aware selection string, not just a UUID:
+The SwiftUI picker can import local `.bin` files, download curated Whisper models, resume interrupted downloads, and delete installed models. Use it directly in a settings surface:
 
 ```swift
-public enum SpeechModelSelection: Codable, Hashable, Sendable {
-    case installed(UUID)
-    case system(SpeechSystemModelID)
+import CarbocationLocalSpeech
+import CarbocationLocalSpeechRuntime
+import CarbocationLocalSpeechUI
+import SwiftUI
+
+@MainActor
+struct SpeechSettingsPane: View {
+    let library: SpeechModelLibrary
+    @Binding var selectionStorageValue: String
+    @State private var systemOptions: [SpeechSystemModelOption] = []
+
+    var body: some View {
+        SpeechSettingsView(
+            library: library,
+            selectionStorageValue: $selectionStorageValue,
+            systemOptions: systemOptions
+        )
+        .task {
+            systemOptions = await LocalSpeechEngine.systemModelOptions(locale: .current)
+        }
+    }
 }
 ```
 
-Installed selections point at user-managed model directories in `SpeechModelLibrary`. System selections point at provider options returned by:
+If you are building your own UI, download and install a curated model with the core APIs:
 
 ```swift
-await LocalSpeechEngine.systemModelOptions(locale: Locale.current)
+let catalogModel = CuratedSpeechModelCatalog.entry(id: "base.en")!
+
+let downloaded = try await SpeechModelDownloader.download(
+    hfRepo: catalogModel.hfRepo!,
+    hfFilename: catalogModel.hfFilename!,
+    modelsRoot: speechModelLibrary.root,
+    displayName: catalogModel.displayName,
+    expectedSHA256: catalogModel.sha256
+)
+
+let installed = try await MainActor.run {
+    try speechModelLibrary.add(
+        primaryAssetAt: downloaded.tempURL,
+        displayName: catalogModel.displayName,
+        filename: catalogModel.hfFilename,
+        source: .curated,
+        sourceURL: catalogModel.downloadURL,
+        hfRepo: catalogModel.hfRepo,
+        hfFilename: catalogModel.hfFilename,
+        sha256: downloaded.sha256,
+        capabilities: catalogModel.capabilities
+    )
+}
+
+let selection = SpeechModelSelection.installed(installed.id)
 ```
 
-The first system provider is:
+### App Architecture
 
-```swift
-SpeechSystemModelID.appleSpeech // storage value: "system.apple-speech"
-```
-
-Apple Speech should be labeled as built in, not as a model download. If it is unavailable, host apps should either hide it or show the availability reason in diagnostics/settings.
-
-## Storage Model
-
-Use the shared Carbocation App Group when available and fall back to per-app Application Support, mirroring `ModelStorage` from `CarbocationLocalLLM`.
-
-Default root:
-
-```text
-~/Library/Group Containers/group.com.carbocation.shared/SpeechModels
-```
-
-Fallback root:
-
-```text
-~/Library/Application Support/<AppName>/SpeechModels
-```
-
-Each installed speech model should live in its own UUID directory:
-
-```text
-SpeechModels/
-  <UUID>/
-    metadata.json
-    ggml-base.en.bin
-    ggml-base.en-encoder.mlmodelc/       # optional
-```
-
-The metadata format must support multi-file model assets because whisper.cpp can use a primary GGML model plus optional acceleration assets. Apple Speech assets are system-managed through `AssetInventory` and must not be represented as installed speech models.
-
-## Recommended App Wiring
-
-Dictation-style host apps should compose this package with `CarbocationLocalLLMRuntime`:
+Dictation apps usually compose this package with an LLM cleanup step:
 
 ```text
 CarbocationLocalSpeechRuntime
-  Apple Speech or Whisper -> partial/final transcript
+  Apple Speech or Whisper -> transcript
 
 CarbocationLocalLLMRuntime
-  final transcript -> cleanup, formatting, command classification
+  transcript -> cleanup, formatting, command classification
 
 Host app
-  hotkeys, paste/type, product UX, prompts, settings policy
+  hotkeys, Accessibility paste/type, settings policy, product UX
 ```
 
-Meeting or file-transcription host apps can add diarization after transcription:
+Meeting and file-transcription apps can add diarization after transcription:
 
 ```text
-file audio
+audio file
   -> provider transcription
   -> optional diarization
   -> speaker attribution merge
   -> host-owned notes/export workflow
 ```
 
-## Implementation Plan
+## For Package Developers
 
-The first useful version should include both provider abstraction and Apple Speech support:
+### Clone and Build
 
-1. Core transcript, audio, provider-selection, and model-library types.
-2. `CarbocationAppleSpeechRuntime` with availability, asset readiness, and transcription through Apple Speech.
-3. `CarbocationWhisperRuntime` with whisper.cpp source-build file transcription.
-4. `CarbocationLocalSpeechRuntime` unified facade for installed and system providers.
-5. SwiftUI provider/model picker and provider-aware smoke app.
-6. Mic capture, resampling, VAD, native/emulated streaming, and transcript events.
-7. Binary XCFramework release path for whisper.cpp.
-8. Optional diarization interfaces and delayed speaker merge.
+Clone with the `whisper.cpp` submodule:
 
-See [API Design](docs/API_DESIGN.md) and [Implementation Plan](docs/IMPLEMENTATION_PLAN.md) for the fuller design.
+```sh
+git clone --recurse-submodules https://github.com/carbocation/CarbocationLocalSpeech.git
+cd CarbocationLocalSpeech
+```
+
+If you already cloned the repo:
+
+```sh
+git submodule update --init --recursive
+```
+
+Run the Swift tests:
+
+```sh
+swift test
+```
+
+The default test suite does not require a real Whisper model. Live inference tests are skipped unless `CARBOCATION_LOCAL_SPEECH_TEST_MODEL` points at an installed whisper.cpp `.bin` model.
+
+### Build the Local Whisper Source Artifact
+
+For local Whisper inference from this checkout, build the static source artifact:
+
+```sh
+Scripts/build-whisper-macos.sh
+swift build
+```
+
+The script writes:
+
+```text
+Vendor/whisper-artifacts/current/lib/libwhisper-combined.a
+Vendor/whisper-artifacts/current/include/whisper.h
+```
+
+Those files are intentionally ignored by git.
+
+Useful build overrides:
+
+```sh
+WHISPER_COREML=ON Scripts/build-whisper-macos.sh
+MACOSX_DEPLOYMENT_TARGET=14.0 Scripts/build-whisper-macos.sh
+```
+
+### Use a Local Binary Artifact
+
+To test the package as a binary-target consumer before publishing:
+
+```sh
+Scripts/build-whisper-xcframework.sh
+CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH=Vendor/whisper-artifacts/whisper.xcframework swift test
+```
+
+`Package.swift` switches to a local `.binaryTarget` when `CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH` is set.
+
+### Prepare a GitHub Release Artifact
+
+Build and zip the XCFramework:
+
+```sh
+Scripts/build-whisper-xcframework.sh
+ditto -c -k --sequesterRsrc --keepParent Vendor/whisper-artifacts/whisper.xcframework CarbocationLocalSpeech-whisper.xcframework.zip
+swift package compute-checksum CarbocationLocalSpeech-whisper.xcframework.zip
+```
+
+Upload the zip to the GitHub release, then stamp `Package.swift` with the release asset URL and checksum:
+
+```sh
+Scripts/set-whisper-binary-artifact.sh <artifact-url> <swiftpm-checksum>
+```
+
+Commit that stamped manifest on the release tag. Consumers that depend on that tag will have SwiftPM download the GitHub release artifact automatically.
+
+### Runtime Modes
+
+`Package.swift` supports these Whisper runtime modes:
+
+- Source artifact: uses `Vendor/whisper-artifacts/current/lib/libwhisper-combined.a` when present.
+- Forced source mode: set `CARBOCATION_LOCAL_SPEECH_FORCE_SOURCE_WHISPER=1`.
+- Local binary validation: set `CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH`.
+- Published binary release: use non-empty `whisperBinaryArtifactURL` and `whisperBinaryArtifactChecksum`.
+- No Whisper artifact: the package builds, but Whisper inference reports the missing source artifact at runtime.
+
+### Package Layout
+
+```text
+Sources/
+  CarbocationLocalSpeech/         Core models, audio, transcript, provider, VAD, diarization APIs
+  CarbocationLocalSpeechRuntime/  Unified facade over Whisper and Apple Speech
+  CarbocationWhisperRuntime/      whisper.cpp-backed runtime
+  CarbocationAppleSpeechRuntime/  Apple Speech-backed runtime
+  CarbocationLocalSpeechUI/       SwiftUI settings and picker views
+  CLSSmoke/                       Xcode-friendly smoke app
+  whisper/                        module map and C header for whisper.cpp
+Tests/
+Scripts/
+Vendor/
+  whisper.cpp/                    git submodule
+```
+
+### Ownership Boundaries
+
+Keep shared speech infrastructure in this package:
+
+- speech model download, import, deletion, and metadata
+- provider-aware model selection
+- Apple Speech availability and asset readiness
+- microphone capture and file-audio preparation
+- sample-rate conversion
+- VAD, chunking, and emulated streaming windows
+- stable transcript, word timestamp, and speaker-attribution types
+- SwiftUI provider/model management surfaces
+- smoke tests and diagnostics hooks
+
+Keep product-specific behavior in host apps:
+
+- app-specific prompts and LLM cleanup
+- command parsing policy
+- global hotkeys
+- paste/type behavior through Accessibility APIs
+- meeting, memo, or dictation UX policy
+- onboarding text and migrations
+- entitlement choices beyond documenting requirements
