@@ -1,5 +1,5 @@
 import AVFoundation
-import CarbocationLocalSpeech
+@_spi(Internal) import CarbocationLocalSpeech
 import CoreMedia
 import Foundation
 
@@ -43,6 +43,24 @@ public enum AppleSpeechEngineError: Error, LocalizedError, Sendable {
         case .audioEncodingFailed:
             return "Could not encode audio for Apple Speech."
         }
+    }
+}
+
+struct AppleAnalyzerInputClock {
+    private var nextStartTime: TimeInterval?
+
+    mutating func claimStartTime(
+        sourceStartTime: TimeInterval,
+        frameCount: Int,
+        sampleRate: Double
+    ) -> TimeInterval {
+        let startTime = max(sourceStartTime, nextStartTime ?? sourceStartTime)
+        if sampleRate > 0 {
+            nextStartTime = startTime + Double(frameCount) / sampleRate
+        } else {
+            nextStartTime = startTime
+        }
+        return startTime
     }
 }
 
@@ -336,17 +354,41 @@ extension AppleSpeechEngine {
     private nonisolated static func assetModules(for supportedLocale: Locale) -> [any Speech.SpeechModule] {
         [
             Speech.SpeechTranscriber(locale: supportedLocale, preset: .transcription),
-            Speech.SpeechTranscriber(locale: supportedLocale, preset: .timeIndexedProgressiveTranscription),
-            Speech.DictationTranscriber(locale: supportedLocale, preset: liveDictationPreset())
+            Speech.DictationTranscriber(locale: supportedLocale, preset: liveDictationPreset(strategy: .automatic))
         ]
     }
 
     @available(macOS 26.0, *)
-    private nonisolated static func liveDictationPreset() -> Speech.DictationTranscriber.Preset {
-        var preset = Speech.DictationTranscriber.Preset.progressiveLongDictation
+    private nonisolated static func liveDictationPreset(
+        strategy: StreamingTranscriptionStrategy
+    ) -> Speech.DictationTranscriber.Preset {
+        var preset: Speech.DictationTranscriber.Preset
+        switch strategy {
+        case .accurate, .fileQuality:
+            preset = .progressiveLongDictation
+        case .automatic, .lowestLatency, .balanced:
+            preset = .progressiveShortDictation
+        }
+        preset.reportingOptions.insert(.volatileResults)
         preset.reportingOptions.insert(.frequentFinalization)
         preset.attributeOptions.insert(.audioTimeRange)
         return preset
+    }
+
+    private nonisolated static func liveDictationPresetName(
+        strategy: StreamingTranscriptionStrategy
+    ) -> String {
+        switch strategy {
+        case .accurate, .fileQuality:
+            return "progressiveLongDictation"
+        case .automatic, .lowestLatency, .balanced:
+            return "progressiveShortDictation"
+        }
+    }
+
+    @available(macOS 26.0, *)
+    private nonisolated static func liveAnalyzerOptions() -> Speech.SpeechAnalyzer.Options {
+        Speech.SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .whileInUse)
     }
 
     @available(macOS 26.0, *)
@@ -488,24 +530,30 @@ extension AppleSpeechEngine {
                         throw AppleSpeechEngineError.unavailable(.unavailable(.localeUnsupported))
                     }
 
-                    let transcriber = Speech.DictationTranscriber(locale: supportedLocale, preset: liveDictationPreset())
+                    let transcriber = Speech.DictationTranscriber(locale: supportedLocale, preset: liveDictationPreset(strategy: options.strategy))
                     var speechDetector: Speech.SpeechDetector?
+                    var reportedSpeechDetector: Speech.SpeechDetector?
                     var modules: [any Speech.SpeechModule] = [transcriber]
                     if shouldUseModelVAD(options: options.transcription, isStreaming: true) {
+                        let reportDetectorResults = options.transcription.voiceActivityDetection.mode == .enabled
                         let candidate = Speech.SpeechDetector(
                             detectionOptions: speechDetectionOptions(for: options.transcription.voiceActivityDetection),
-                            reportResults: true
+                            reportResults: reportDetectorResults
                         )
                         let candidateModules: [any Speech.SpeechModule] = [candidate, transcriber]
                         switch options.transcription.voiceActivityDetection.mode {
                         case .enabled:
                             try await ensureAssetsInstalled(supporting: candidateModules)
                             speechDetector = candidate
+                            reportedSpeechDetector = candidate
                             modules = candidateModules
                         case .automatic:
                             let availability = await availabilityForAssets(supporting: candidateModules)
                             if availability.isAvailable {
                                 speechDetector = candidate
+                                if reportDetectorResults {
+                                    reportedSpeechDetector = candidate
+                                }
                                 modules = candidateModules
                             } else {
                                 continuation.yield(.diagnostic(TranscriptionDiagnostic(
@@ -521,7 +569,7 @@ extension AppleSpeechEngine {
                     guard let analysisFormat = await Speech.SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: modules) else {
                         throw AppleSpeechEngineError.audioEncodingFailed
                     }
-                    let analyzer = Speech.SpeechAnalyzer(modules: modules)
+                    let analyzer = Speech.SpeechAnalyzer(modules: modules, options: liveAnalyzerOptions())
                     let context = Speech.AnalysisContext()
                     if !options.transcription.contextualStrings.isEmpty {
                         context.contextualStrings[.general] = options.transcription.contextualStrings
@@ -534,14 +582,20 @@ extension AppleSpeechEngine {
                     }
 
                     var inputContinuation: AsyncThrowingStream<Speech.AnalyzerInput, Error>.Continuation?
-                    let inputStream = AsyncThrowingStream<Speech.AnalyzerInput, Error> { continuation in
+                    let inputStream = AsyncThrowingStream<Speech.AnalyzerInput, Error>(
+                        bufferingPolicy: .bufferingNewest(50)
+                    ) { continuation in
                         inputContinuation = continuation
                     }
+                    let coordinator = AppleLiveResultCoordinator(
+                        language: SpeechLanguage(code: supportedLocale.identifier),
+                        backend: backend
+                    )
 
                     continuation.yield(.started(backend))
                     continuation.yield(.diagnostic(TranscriptionDiagnostic(
                         source: "apple.analyzer",
-                        message: "modules=\(speechDetector == nil ? "DictationTranscriber" : "SpeechDetector,DictationTranscriber") locale=\(supportedLocale.identifier) format=\(describe(format: analysisFormat))"
+                        message: "modules=\(speechDetector == nil ? "DictationTranscriber" : "SpeechDetector,DictationTranscriber") preset=\(liveDictationPresetName(strategy: options.strategy)) locale=\(supportedLocale.identifier) format=\(describe(format: analysisFormat)) timestamps=implicit"
                     )))
                     try await analyzer.prepareToAnalyze(in: analysisFormat)
                     continuation.yield(.diagnostic(TranscriptionDiagnostic(
@@ -550,63 +604,33 @@ extension AppleSpeechEngine {
                     )))
 
                     let collector = Task<[TranscriptSegment], Error> {
-                        var committedSegments: [TranscriptSegment] = []
-                        var pendingPartialID: UUID?
                         var resultCount = 0
 
                         for try await result in transcriber.results {
                             try Task.checkCancellation()
                             resultCount += 1
                             let segment = segment(from: result)
-                            continuation.yield(.diagnostic(TranscriptionDiagnostic(
-                                source: "apple.results",
-                                message: "result #\(resultCount) final=\(result.isFinal) range=\(describe(range: result.range)) text=\(segment.text)"
-                            )))
+                            if shouldLogLiveResult(number: resultCount, isFinal: result.isFinal) {
+                                continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                                    source: "apple.results",
+                                    message: "result #\(resultCount) final=\(result.isFinal) range=\(describe(range: result.range)) textLength=\(segment.text.count) text=\(diagnosticPreview(segment.text))"
+                                )))
+                            }
                             guard !segment.text.isEmpty else { continue }
 
-                            if result.isFinal {
-                                committedSegments.append(segment)
-                                pendingPartialID = nil
-                                continuation.yield(.committed(segment))
-                                continuation.yield(.snapshot(StreamingTranscriptSnapshot(
-                                    committed: Transcript(
-                                        segments: committedSegments,
-                                        language: SpeechLanguage(code: supportedLocale.identifier),
-                                        backend: backend
-                                    )
-                                )))
-                            } else {
-                                let partial = TranscriptPartial(
-                                    text: segment.text,
-                                    startTime: segment.startTime,
-                                    endTime: segment.endTime
-                                )
-                                if let previousID = pendingPartialID {
-                                    continuation.yield(.revision(TranscriptRevision(
-                                        replacesPartialID: previousID,
-                                        replacement: partial
-                                    )))
-                                } else {
-                                    continuation.yield(.partial(partial))
-                                }
-                                pendingPartialID = partial.id
-
-                                continuation.yield(.snapshot(StreamingTranscriptSnapshot(
-                                    committed: Transcript(
-                                        segments: committedSegments,
-                                        language: SpeechLanguage(code: supportedLocale.identifier),
-                                        backend: backend
-                                    ),
-                                    unconfirmed: partial,
-                                    volatileRange: TranscriptTimeRange(startTime: segment.startTime, endTime: segment.endTime)
-                                )))
+                            let update = await coordinator.recordResult(
+                                segment,
+                                isFinal: result.isFinal
+                            )
+                            for event in update.events {
+                                continuation.yield(event)
                             }
                         }
 
-                        return committedSegments
+                        return await coordinator.committedSegments()
                     }
 
-                    let detectorCollector: Task<Void, Error>? = speechDetector.map { detector in
+                    let detectorCollector: Task<Void, Error>? = reportedSpeechDetector.map { detector in
                         Task {
                             for try await result in detector.results {
                                 try Task.checkCancellation()
@@ -633,11 +657,17 @@ extension AppleSpeechEngine {
                                 source: "apple.analyzer",
                                 message: "analyzeSequence finished"
                             )))
+                        } catch is CancellationError {
+                            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                                source: "apple.analyzer",
+                                message: "analyzeSequence cancelled"
+                            )))
                         } catch {
                             continuation.yield(.diagnostic(TranscriptionDiagnostic(
                                 source: "apple.analyzer",
                                 message: "analyzeSequence failed: \(error.localizedDescription)"
                             )))
+                            continuation.finish(throwing: error)
                         }
                     }
                     let collectorMonitor = Task {
@@ -647,11 +677,17 @@ extension AppleSpeechEngine {
                                 source: "apple.results",
                                 message: "result stream finished segments=\(segments.count)"
                             )))
+                        } catch is CancellationError {
+                            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                                source: "apple.results",
+                                message: "result stream cancelled"
+                            )))
                         } catch {
                             continuation.yield(.diagnostic(TranscriptionDiagnostic(
                                 source: "apple.results",
                                 message: "result stream failed: \(error.localizedDescription)"
                             )))
+                            continuation.finish(throwing: error)
                         }
                     }
                     defer {
@@ -665,23 +701,33 @@ extension AppleSpeechEngine {
 
                     var processedDuration: TimeInterval = 0
                     var inputCount = 0
+                    var inputClock = AppleAnalyzerInputClock()
                     let fallbackDetector = EnergyVoiceActivityDetector()
+                    let shouldReportFallbackVAD = reportedSpeechDetector == nil
+                        && options.transcription.voiceActivityDetection.mode != .disabled
                     for try await chunk in audio {
                         try Task.checkCancellation()
 
                         continuation.yield(.audioLevel(AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)))
-                        if speechDetector == nil {
+                        if shouldReportFallbackVAD {
                             continuation.yield(.voiceActivity(try fallbackDetector.analyze(chunk)))
                         }
                         let converted = try buffer(from: chunk, outputFormat: analysisFormat)
-                        processedDuration = max(processedDuration, converted.startTime + Double(converted.buffer.frameLength) / converted.buffer.format.sampleRate)
+                        let analyzerStartTime = inputClock.claimStartTime(
+                            sourceStartTime: converted.startTime,
+                            frameCount: Int(converted.buffer.frameLength),
+                            sampleRate: converted.buffer.format.sampleRate
+                        )
+                        let analyzerEndTime = analyzerStartTime + Double(converted.buffer.frameLength) / converted.buffer.format.sampleRate
+                        processedDuration = max(processedDuration, analyzerEndTime)
                         continuation.yield(.progress(TranscriptionProgress(processedDuration: processedDuration)))
                         inputCount += 1
                         if inputCount <= 5 || inputCount.isMultiple(of: 20) {
+                            let adjusted = analyzerStartTime > converted.startTime + 0.000_001
                             continuation.yield(.diagnostic(TranscriptionDiagnostic(
                                 source: "apple.input",
-                                message: "chunk #\(inputCount) start=\(converted.startTime.formattedDebug) frames=\(converted.buffer.frameLength) format=\(describe(format: converted.buffer.format))",
-                                time: converted.startTime
+                                message: "chunk #\(inputCount) start=\(analyzerStartTime.formattedDebug)\(adjusted ? " sourceStart=\(converted.startTime.formattedDebug)" : "") frames=\(converted.buffer.frameLength) format=\(describe(format: converted.buffer.format))",
+                                time: analyzerStartTime
                             )))
                         }
                         let input = Speech.AnalyzerInput(buffer: converted.buffer)
@@ -691,7 +737,7 @@ extension AppleSpeechEngine {
                             continuation.yield(.diagnostic(TranscriptionDiagnostic(
                                 source: "apple.input",
                                 message: "input continuation missing",
-                                time: converted.startTime
+                                time: analyzerStartTime
                             )))
                         }
                     }
@@ -701,7 +747,12 @@ extension AppleSpeechEngine {
                     if let detectorCollector {
                         try await detectorCollector.value
                     }
-                    let committedSegments = try await collector.value
+                    _ = try await collector.value
+                    let finalUpdate = await coordinator.finish()
+                    for event in finalUpdate.events {
+                        continuation.yield(event)
+                    }
+                    let committedSegments = await coordinator.committedSegments()
                     continuation.yield(.completed(Transcript(
                         segments: committedSegments,
                         language: SpeechLanguage(code: supportedLocale.identifier),
@@ -752,6 +803,206 @@ extension AppleSpeechEngine {
         )
     }
 
+    fileprivate nonisolated static func uncommittedSegment(
+        from segment: TranscriptSegment,
+        after committedSegments: [TranscriptSegment]
+    ) -> TranscriptSegment? {
+        let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+
+        let trimResult = trimPreviouslyCommittedText(
+            in: text,
+            after: committedSegments,
+            segmentStartTime: segment.startTime
+        )
+        let finalText = (trimResult.removedTokenCount > 0 ? trimResult.text : text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !finalText.isEmpty else { return nil }
+
+        let startTime: TimeInterval
+        if trimResult.removedTokenCount > 0 {
+            startTime = max(segment.startTime, committedSegments.last?.endTime ?? segment.startTime)
+        } else {
+            startTime = segment.startTime
+        }
+
+        return TranscriptSegment(
+            id: segment.id,
+            text: finalText,
+            startTime: startTime,
+            endTime: max(startTime, segment.endTime),
+            words: [],
+            speaker: segment.speaker,
+            confidence: segment.confidence
+        )
+    }
+
+    private nonisolated static func trimPreviouslyCommittedText(
+        in text: String,
+        after committedSegments: [TranscriptSegment],
+        segmentStartTime: TimeInterval
+    ) -> (text: String, removedTokenCount: Int) {
+        guard !committedSegments.isEmpty else {
+            return (text, 0)
+        }
+
+        if let firstCommittedStart = committedSegments.first?.startTime,
+           segmentStartTime <= firstCommittedStart + 0.25 {
+            let committedText = committedSegments.map(\.text).joined(separator: " ")
+            let trimResult = trimCommonPrefix(in: text, after: committedText)
+            if trimResult.removedTokenCount > 0 {
+                return trimResult
+            }
+        }
+
+        let committedOverlap = committedOverlapText(from: committedSegments)
+        return trimDuplicatePrefix(in: text, after: committedOverlap)
+    }
+
+    private nonisolated static func trimCommonPrefix(
+        in text: String,
+        after committedText: String
+    ) -> (text: String, removedTokenCount: Int) {
+        let committedTokens = tokens(in: committedText)
+        let newTokens = tokens(in: text)
+        guard !committedTokens.isEmpty, !newTokens.isEmpty else {
+            return (text, 0)
+        }
+
+        let committedNormalized = committedTokens.map(\.normalized)
+        let newNormalized = newTokens.map(\.normalized)
+        var commonTokenCount = 0
+        while commonTokenCount < committedNormalized.count,
+              commonTokenCount < newNormalized.count,
+              committedNormalized[commonTokenCount] == newNormalized[commonTokenCount] {
+            commonTokenCount += 1
+        }
+
+        guard commonTokenCount > 0 else {
+            return (text, 0)
+        }
+
+        let cutIndex = newTokens[commonTokenCount - 1].range.upperBound
+        let trimmed = trimLeadingSeparators(String(text[cutIndex...]))
+        return (trimmed, commonTokenCount)
+    }
+
+    private nonisolated static func committedOverlapText(from segments: [TranscriptSegment]) -> String {
+        let maximumOverlapTokenCount = 12
+        var collectedTexts: [String] = []
+        var collectedTokenCount = 0
+
+        for segment in segments.reversed() {
+            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+
+            let textTokens = tokens(in: text)
+            guard !textTokens.isEmpty else { continue }
+
+            let neededTokenCount = maximumOverlapTokenCount - collectedTokenCount
+            if textTokens.count > neededTokenCount {
+                let suffixStart = textTokens[textTokens.count - neededTokenCount].range.lowerBound
+                collectedTexts.append(String(text[suffixStart...]).trimmingCharacters(in: .whitespacesAndNewlines))
+                break
+            }
+
+            collectedTexts.append(text)
+            collectedTokenCount += textTokens.count
+            if collectedTokenCount >= maximumOverlapTokenCount { break }
+        }
+
+        return collectedTexts.reversed().joined(separator: " ")
+    }
+
+    private nonisolated static func trimDuplicatePrefix(
+        in text: String,
+        after committedText: String
+    ) -> (text: String, removedTokenCount: Int) {
+        let committedTokens = tokens(in: committedText)
+        let newTokens = tokens(in: text)
+        guard !committedTokens.isEmpty, !newTokens.isEmpty else {
+            return (text, 0)
+        }
+
+        let maximumOverlap = min(committedTokens.count, newTokens.count, 12)
+        var duplicateTokenCount = 0
+        for count in stride(from: maximumOverlap, through: 1, by: -1) {
+            let committedSuffix = committedTokens.suffix(count).map(\.normalized)
+            let newPrefix = newTokens.prefix(count).map(\.normalized)
+            if Array(committedSuffix) == Array(newPrefix) {
+                duplicateTokenCount = count
+                break
+            }
+        }
+
+        guard duplicateTokenCount > 0 else {
+            return (text, 0)
+        }
+
+        let cutIndex = newTokens[duplicateTokenCount - 1].range.upperBound
+        let trimmed = trimLeadingSeparators(String(text[cutIndex...]))
+        return (trimmed, duplicateTokenCount)
+    }
+
+    private nonisolated static func trimLeadingSeparators(_ text: String) -> String {
+        let separators = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
+        var startIndex = text.startIndex
+
+        while startIndex < text.endIndex,
+              text[startIndex].unicodeScalars.allSatisfy({ separators.contains($0) }) {
+            startIndex = text.index(after: startIndex)
+        }
+
+        return String(text[startIndex...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private nonisolated static func tokens(in text: String) -> [TranscriptTextToken] {
+        var tokens: [TranscriptTextToken] = []
+        var tokenStart: String.Index?
+
+        for index in text.indices {
+            let character = text[index]
+            if character.isLetter || character.isNumber || character == "'" {
+                if tokenStart == nil {
+                    tokenStart = index
+                }
+            } else if let start = tokenStart {
+                appendToken(from: start, to: index, in: text, tokens: &tokens)
+                tokenStart = nil
+            }
+        }
+
+        if let start = tokenStart {
+            appendToken(from: start, to: text.endIndex, in: text, tokens: &tokens)
+        }
+
+        return tokens
+    }
+
+    private nonisolated static func appendToken(
+        from start: String.Index,
+        to end: String.Index,
+        in text: String,
+        tokens: inout [TranscriptTextToken]
+    ) {
+        let value = String(text[start..<end])
+        tokens.append(TranscriptTextToken(
+            normalized: value.lowercased(),
+            range: start..<end
+        ))
+    }
+
+    private nonisolated static func shouldLogLiveResult(number: Int, isFinal: Bool) -> Bool {
+        isFinal || number <= 5 || number.isMultiple(of: 20)
+    }
+
+    private nonisolated static func diagnosticPreview(_ text: String, limit: Int = 120) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > limit else { return trimmed }
+        return "\(trimmed.prefix(limit))..."
+    }
+
     private nonisolated static func describe(format: AVAudioFormat) -> String {
         "\(describe(commonFormat: format.commonFormat)) \(format.sampleRate.formattedDebug)Hz channels=\(format.channelCount) interleaved=\(format.isInterleaved)"
     }
@@ -776,6 +1027,118 @@ extension AppleSpeechEngine {
     private nonisolated static func describe(range: CMTimeRange) -> String {
         "\(range.start.seconds.finiteOrZero.formattedDebug)-\(range.end.seconds.finiteOrZero.formattedDebug)"
     }
+
+}
+
+private struct AppleLiveResultUpdate: Sendable {
+    var events: [TranscriptEvent] = []
+}
+
+@available(macOS 26.0, *)
+private actor AppleLiveResultCoordinator {
+    private let language: SpeechLanguage
+    private let backend: SpeechBackendDescriptor
+    private var committed: [TranscriptSegment] = []
+    private var volatile: TranscriptSegment?
+    private var lastVolatileEmission = Date.distantPast
+
+    private let volatileEmissionInterval: TimeInterval = 0.25
+
+    init(language: SpeechLanguage, backend: SpeechBackendDescriptor) {
+        self.language = language
+        self.backend = backend
+    }
+
+    func committedSegments() -> [TranscriptSegment] {
+        committed
+    }
+
+    func recordResult(_ segment: TranscriptSegment, isFinal: Bool) -> AppleLiveResultUpdate {
+        if isFinal {
+            volatile = nil
+            _ = appendCommitted(segment)
+            return update(events: [.snapshot(snapshot(volatile: nil))])
+        }
+
+        volatile = AppleSpeechEngine.uncommittedSegment(from: segment, after: committed)
+        return update(events: volatileStateEvents(force: false))
+    }
+
+    func finish() -> AppleLiveResultUpdate {
+        if let volatile {
+            _ = appendCommitted(volatile)
+            self.volatile = nil
+        }
+        return update(events: [.snapshot(snapshot(volatile: nil))])
+    }
+
+    private func volatileStateEvents(force: Bool) -> [TranscriptEvent] {
+        guard let volatile else {
+            guard force else { return [] }
+            return [.snapshot(snapshot(volatile: nil))]
+        }
+
+        let now = Date()
+        let shouldEmit = force
+            || now.timeIntervalSince(lastVolatileEmission) >= volatileEmissionInterval
+        guard shouldEmit else { return [] }
+
+        lastVolatileEmission = now
+        let volatileTranscript = Transcript(
+            segments: [volatile],
+            language: language,
+            backend: backend
+        )
+        return [.snapshot(snapshot(volatile: volatileTranscript))]
+    }
+
+    private func snapshot(volatile: Transcript?) -> StreamingTranscriptSnapshot {
+        StreamingTranscriptSnapshot(
+            stable: Transcript(
+                segments: committed,
+                language: language,
+                backend: backend
+            ),
+            volatile: volatile,
+            volatileRange: volatileRange(for: volatile)
+        )
+    }
+
+    private func update(events: [TranscriptEvent]) -> AppleLiveResultUpdate {
+        AppleLiveResultUpdate(events: events)
+    }
+
+    private func appendCommitted(_ segment: TranscriptSegment) -> Bool {
+        guard let committedSegment = AppleSpeechEngine.uncommittedSegment(
+            from: segment,
+            after: committed
+        ) else {
+            return false
+        }
+
+        if committed.contains(where: { sameRange($0, committedSegment) && $0.text == committedSegment.text }) {
+            return false
+        }
+
+        committed.append(committedSegment)
+        return true
+    }
+
+    private func sameRange(_ lhs: TranscriptSegment, _ rhs: TranscriptSegment) -> Bool {
+        abs(lhs.startTime - rhs.startTime) < 0.01
+            && abs(lhs.endTime - rhs.endTime) < 0.01
+    }
+
+    private func volatileRange(for transcript: Transcript?) -> TranscriptTimeRange? {
+        guard let first = transcript?.segments.first,
+              let last = transcript?.segments.last else {
+            return nil
+        }
+        return TranscriptTimeRange(
+            startTime: first.startTime,
+            endTime: max(first.startTime, last.endTime)
+        )
+    }
 }
 
 private extension Double {
@@ -786,5 +1149,10 @@ private extension Double {
     var formattedDebug: String {
         String(format: "%.3f", self)
     }
+}
+
+private struct TranscriptTextToken {
+    var normalized: String
+    var range: Range<String.Index>
 }
 #endif

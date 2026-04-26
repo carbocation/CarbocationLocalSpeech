@@ -68,8 +68,8 @@ private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.vadMode") private var vadModeStorageValue = CLSSmokeVADMode.disabled.rawValue
     @AppStorage("CLSSmoke.vadSensitivity") private var vadSensitivityStorageValue = CLSSmokeVADSensitivity.medium.rawValue
     @State private var systemOptions: [SpeechSystemModelOption] = []
-    @State private var events: [TranscriptEvent] = []
-    @State private var transcriptEvents: [TranscriptEvent] = []
+    @State private var eventDescriptions: [String] = []
+    @State private var transcriptSnapshot = LiveTranscriptDebugSnapshot()
     @State private var microphoneStatus = MicrophonePermissionHelper.authorizationStatus()
     @State private var loadedInfo: LocalSpeechLoadedModelInfo?
     @State private var statusMessage = "Select a provider, then start listening."
@@ -79,8 +79,15 @@ private struct CLSSmokeRootView: View {
     @State private var captureSession: AVAudioEngineCaptureSession?
     @State private var transcriptionTask: Task<Void, Never>?
     @State private var activeSessionID: UUID?
+    @State private var lastLoggedAudioLevelTime: TimeInterval?
+    @State private var lastLoggedVoiceActivityTime: TimeInterval?
+    @State private var lastLoggedVoiceActivityState: VoiceActivityState?
+    @State private var lastLoggedProgressDuration: TimeInterval?
+    @State private var lastTranscriptProgressDuration: TimeInterval?
 
     private let maximumDisplayedEvents = 500
+    private let diagnosticLogThrottleInterval: TimeInterval = 1.0
+    private let transcriptMetricThrottleInterval: TimeInterval = 1.0
 
     private let library = SpeechModelLibrary(
         root: SpeechModelStorage.modelsDirectory(appSupportFolderName: "CLSSmoke")
@@ -120,7 +127,7 @@ private struct CLSSmokeRootView: View {
                 Divider()
                 sessionStatus
                 Divider()
-                LiveTranscriptDebugView(events: events, transcriptEvents: transcriptEvents)
+                LiveTranscriptDebugView(eventDescriptions: eventDescriptions, snapshot: transcriptSnapshot)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -281,8 +288,9 @@ private struct CLSSmokeRootView: View {
         let sessionID = UUID()
         activeSessionID = sessionID
         loadedInfo = nil
-        events.removeAll(keepingCapacity: true)
-        transcriptEvents.removeAll(keepingCapacity: true)
+        eventDescriptions.removeAll(keepingCapacity: true)
+        transcriptSnapshot = LiveTranscriptDebugSnapshot()
+        resetDiagnosticThrottleState()
         isStarting = true
         isListening = false
         statusTone = .secondary
@@ -301,10 +309,12 @@ private struct CLSSmokeRootView: View {
 
     private func stopListening(updateStatus: Bool = true, unloadProvider: Bool = true) {
         activeSessionID = nil
-        transcriptionTask?.cancel()
-        transcriptionTask = nil
-        captureSession?.stop()
+        let capture = captureSession
         captureSession = nil
+        let task = transcriptionTask
+        transcriptionTask = nil
+        capture?.stop()
+        task?.cancel()
         isStarting = false
         isListening = false
 
@@ -381,9 +391,7 @@ private struct CLSSmokeRootView: View {
                             sensitivity: vadSensitivity.runtimeSensitivity
                         )
                     ),
-                    implementation: .automatic,
-                    commitment: .automatic,
-                    latencyPreset: .balancedDictation
+                    strategy: .balanced
                 )
             )
 
@@ -473,15 +481,107 @@ private struct CLSSmokeRootView: View {
     }
 
     private func appendEvent(_ event: TranscriptEvent) {
-        events.append(event)
-        if event.isTranscriptPanelEvent {
-            transcriptEvents.append(event)
+        if shouldLogEvent(event) {
+            eventDescriptions.append(LiveTranscriptDebugView.describe(event))
+            trimEventDescriptions()
         }
 
-        let overflow = events.count - maximumDisplayedEvents
-        if overflow > 0 {
-            events.removeFirst(overflow)
+        if shouldApplyToTranscriptPanel(event) {
+            transcriptSnapshot.apply(event)
         }
+    }
+
+    private func trimEventDescriptions() {
+        let overflow = eventDescriptions.count - maximumDisplayedEvents
+        if overflow > 0 {
+            eventDescriptions.removeFirst(overflow)
+        }
+    }
+
+    private func shouldLogEvent(_ event: TranscriptEvent) -> Bool {
+        switch event {
+        case .audioLevel(let level):
+            return shouldLogAudioLevel(at: level.time)
+        case .voiceActivity(let activity):
+            return shouldLogVoiceActivity(activity)
+        case .progress(let progress):
+            return shouldLogProgress(processedDuration: progress.processedDuration)
+        case .started, .diagnostic, .snapshot, .stats, .completed:
+            return true
+        }
+    }
+
+    private func shouldApplyToTranscriptPanel(_ event: TranscriptEvent) -> Bool {
+        switch event {
+        case .progress(let progress):
+            return shouldUpdateTranscriptProgress(processedDuration: progress.processedDuration)
+        case .snapshot, .stats, .completed:
+            return true
+        case .started, .audioLevel, .voiceActivity, .diagnostic:
+            return false
+        }
+    }
+
+    private func shouldLogAudioLevel(at time: TimeInterval) -> Bool {
+        guard let lastTime = lastLoggedAudioLevelTime else {
+            lastLoggedAudioLevelTime = time
+            return true
+        }
+
+        guard time - lastTime >= diagnosticLogThrottleInterval else {
+            return false
+        }
+
+        lastLoggedAudioLevelTime = time
+        return true
+    }
+
+    private func shouldLogVoiceActivity(_ activity: VoiceActivityEvent) -> Bool {
+        let stateChanged = lastLoggedVoiceActivityState != activity.state
+        let elapsed = lastLoggedVoiceActivityTime.map { activity.endTime - $0 } ?? diagnosticLogThrottleInterval
+        guard stateChanged || elapsed >= diagnosticLogThrottleInterval else {
+            return false
+        }
+
+        lastLoggedVoiceActivityState = activity.state
+        lastLoggedVoiceActivityTime = activity.endTime
+        return true
+    }
+
+    private func shouldLogProgress(processedDuration: TimeInterval) -> Bool {
+        guard let lastDuration = lastLoggedProgressDuration else {
+            lastLoggedProgressDuration = processedDuration
+            return true
+        }
+
+        guard processedDuration - lastDuration >= diagnosticLogThrottleInterval else {
+            return false
+        }
+
+        lastLoggedProgressDuration = processedDuration
+        return true
+    }
+
+    private func shouldUpdateTranscriptProgress(processedDuration: TimeInterval) -> Bool {
+        guard let lastDuration = lastTranscriptProgressDuration else {
+            lastTranscriptProgressDuration = processedDuration
+            return true
+        }
+
+        guard processedDuration - lastDuration >= transcriptMetricThrottleInterval else {
+            return false
+        }
+
+        lastTranscriptProgressDuration = processedDuration
+        return true
+    }
+
+    private func resetDiagnosticThrottleState() {
+        lastLoggedAudioLevelTime = nil
+        lastLoggedVoiceActivityTime = nil
+        lastLoggedVoiceActivityState = nil
+        lastLoggedProgressDuration = nil
+        lastTranscriptProgressDuration = nil
     }
 
     private func finishSession(id: UUID, message: String, tone: CLSSmokeStatusTone) {
@@ -569,17 +669,6 @@ private enum CLSSmokeVADSensitivity: String, CaseIterable, Identifiable {
 
     var diagnosticValue: String {
         rawValue
-    }
-}
-
-private extension TranscriptEvent {
-    var isTranscriptPanelEvent: Bool {
-        switch self {
-        case .snapshot, .partial, .revision, .committed, .progress, .stats, .completed:
-            return true
-        case .started, .audioLevel, .voiceActivity, .diagnostic:
-            return false
-        }
     }
 }
 

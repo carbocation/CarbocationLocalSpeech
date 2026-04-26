@@ -144,13 +144,17 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
         let events: [TranscriptEvent] = [
             .progress(TranscriptionProgress(processedDuration: 0.8)),
             .stats(TranscriptionStats(audioDuration: 0.8, processingDuration: 0.2, realTimeFactor: 0.25, segmentCount: 2)),
-            .committed(TranscriptSegment(text: " hello ", startTime: 0.0, endTime: 0.4)),
-            .committed(TranscriptSegment(text: "world", startTime: 0.4, endTime: 0.8))
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(text: " hello ", startTime: 0.0, endTime: 0.4),
+                TranscriptSegment(text: "world", startTime: 0.4, endTime: 0.8)
+            ])))
         ]
 
         let snapshot = LiveTranscriptDebugSnapshot(events: events)
 
         XCTAssertEqual(snapshot.transcriptText, "hello world")
+        XCTAssertEqual(snapshot.stableText, "hello world")
+        XCTAssertEqual(snapshot.volatileText, "")
         XCTAssertEqual(snapshot.latestText, "world")
         XCTAssertEqual(snapshot.latestTimeRange, "0.40-0.80")
         XCTAssertEqual(snapshot.segmentCount, 2)
@@ -159,48 +163,56 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
     }
 
     func testLiveTranscriptDebugSnapshotShowsPartialUntilCommit() {
-        let partialID = UUID()
         let events: [TranscriptEvent] = [
-            .partial(TranscriptPartial(id: partialID, text: "hel", startTime: 0.0, endTime: 0.2)),
-            .revision(TranscriptRevision(
-                replacesPartialID: partialID,
-                replacement: TranscriptPartial(text: "hello wor", startTime: 0.0, endTime: 0.6)
-            ))
+            .snapshot(StreamingTranscriptSnapshot(volatile: Transcript(segments: [
+                TranscriptSegment(text: "hel", startTime: 0.0, endTime: 0.2)
+            ]))),
+            .snapshot(StreamingTranscriptSnapshot(volatile: Transcript(segments: [
+                TranscriptSegment(text: "hello wor", startTime: 0.0, endTime: 0.6)
+            ])))
         ]
 
         let partialSnapshot = LiveTranscriptDebugSnapshot(events: events)
 
         XCTAssertEqual(partialSnapshot.transcriptText, "hello wor")
+        XCTAssertEqual(partialSnapshot.stableText, "")
+        XCTAssertEqual(partialSnapshot.volatileText, "hello wor")
         XCTAssertEqual(partialSnapshot.latestText, "hello wor")
         XCTAssertEqual(partialSnapshot.latestTimeRange, "0.00-0.60")
-        XCTAssertTrue(partialSnapshot.hasPendingPartial)
+        XCTAssertTrue(partialSnapshot.hasVolatileText)
         XCTAssertEqual(partialSnapshot.segmentCount, 0)
 
         let committedSnapshot = LiveTranscriptDebugSnapshot(events: events + [
-            .committed(TranscriptSegment(text: "hello world", startTime: 0.0, endTime: 0.8))
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(text: "hello world", startTime: 0.0, endTime: 0.8)
+            ])))
         ])
 
         XCTAssertEqual(committedSnapshot.transcriptText, "hello world")
+        XCTAssertEqual(committedSnapshot.stableText, "hello world")
+        XCTAssertEqual(committedSnapshot.volatileText, "")
         XCTAssertEqual(committedSnapshot.latestText, "hello world")
-        XCTAssertFalse(committedSnapshot.hasPendingPartial)
+        XCTAssertFalse(committedSnapshot.hasVolatileText)
         XCTAssertEqual(committedSnapshot.segmentCount, 1)
     }
 
     func testLiveTranscriptDebugSnapshotUsesProviderSnapshot() {
         let committed = TranscriptSegment(text: "hello", startTime: 0.0, endTime: 0.4)
-        let unconfirmed = TranscriptPartial(text: "world", startTime: 0.4, endTime: 0.8)
+        let volatile = TranscriptSegment(text: "world", startTime: 0.4, endTime: 0.8)
 
         let snapshot = LiveTranscriptDebugSnapshot(events: [
             .snapshot(StreamingTranscriptSnapshot(
-                committed: Transcript(segments: [committed]),
-                unconfirmed: unconfirmed,
+                stable: Transcript(segments: [committed]),
+                volatile: Transcript(segments: [volatile]),
                 volatileRange: TranscriptTimeRange(startTime: 0.4, endTime: 0.8)
             ))
         ])
 
         XCTAssertEqual(snapshot.transcriptText, "hello world")
+        XCTAssertEqual(snapshot.stableText, "hello")
+        XCTAssertEqual(snapshot.volatileText, "world")
         XCTAssertEqual(snapshot.latestText, "world")
-        XCTAssertTrue(snapshot.hasPendingPartial)
+        XCTAssertTrue(snapshot.hasVolatileText)
         XCTAssertEqual(snapshot.segmentCount, 1)
     }
 }

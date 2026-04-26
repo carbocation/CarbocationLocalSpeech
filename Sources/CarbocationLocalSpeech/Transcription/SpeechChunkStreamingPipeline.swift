@@ -1,6 +1,6 @@
 import Foundation
 
-public enum SpeechChunkStreamingPipeline {
+@_spi(Internal) public enum SpeechChunkStreamingPipeline {
     public typealias ChunkTranscription = @Sendable (PreparedAudio, TranscriptionOptions) async throws -> Transcript
     @_spi(Internal) public typealias TimedChunkTranscription = @Sendable (SpeechAudioChunk, TranscriptionOptions) async throws -> Transcript
 
@@ -32,7 +32,6 @@ public enum SpeechChunkStreamingPipeline {
 
                 let detector = EnergyVoiceActivityDetector()
                 var committedSegments: [TranscriptSegment] = []
-                var pendingPartialID: UUID?
                 var agreementState = LocalAgreementState(policy: Self.resolvedCommitmentPolicy(options))
 
                 do {
@@ -53,7 +52,6 @@ public enum SpeechChunkStreamingPipeline {
                                     options: options,
                                     transcribe: transcribe,
                                     committedSegments: &committedSegments,
-                                    pendingPartialID: &pendingPartialID,
                                     agreementState: &agreementState,
                                     continuation: continuation
                                 )
@@ -67,7 +65,6 @@ public enum SpeechChunkStreamingPipeline {
                                 options: options,
                                 transcribe: transcribe,
                                 committedSegments: &committedSegments,
-                                pendingPartialID: &pendingPartialID,
                                 agreementState: &agreementState,
                                 continuation: continuation
                             )
@@ -92,7 +89,6 @@ public enum SpeechChunkStreamingPipeline {
                                     options: options,
                                     transcribe: transcribe,
                                     committedSegments: &committedSegments,
-                                    pendingPartialID: &pendingPartialID,
                                     agreementState: &agreementState,
                                     continuation: continuation
                                 )
@@ -106,13 +102,19 @@ public enum SpeechChunkStreamingPipeline {
                                 options: options,
                                 transcribe: transcribe,
                                 committedSegments: &committedSegments,
-                                pendingPartialID: &pendingPartialID,
                                 agreementState: &agreementState,
                                 continuation: continuation
                             )
                         }
                     }
 
+                    flushPendingLocalAgreementIfNeeded(
+                        backend: backend,
+                        options: options,
+                        committedSegments: &committedSegments,
+                        agreementState: &agreementState,
+                        continuation: continuation
+                    )
                     continuation.yield(.completed(Transcript(
                         segments: committedSegments,
                         backend: backend
@@ -134,7 +136,6 @@ public enum SpeechChunkStreamingPipeline {
         options: StreamingTranscriptionOptions,
         transcribe: TimedChunkTranscription,
         committedSegments: inout [TranscriptSegment],
-        pendingPartialID: inout UUID?,
         agreementState: inout LocalAgreementState,
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) async throws {
@@ -178,90 +179,164 @@ public enum SpeechChunkStreamingPipeline {
 
         switch resolvedCommitmentPolicy(options) {
         case .immediate:
-            commit(candidateSegments, backend: backend, committedSegments: &committedSegments, pendingPartialID: &pendingPartialID, continuation: continuation)
+            commit(candidateSegments, backend: backend, committedSegments: &committedSegments, continuation: continuation)
             agreementState.reset()
         case .providerFinals, .silence:
             if emitted.isFinal {
-                commit(candidateSegments, backend: backend, committedSegments: &committedSegments, pendingPartialID: &pendingPartialID, continuation: continuation)
+                commit(candidateSegments, backend: backend, committedSegments: &committedSegments, continuation: continuation)
                 agreementState.reset()
             } else {
                 publishPartial(
                     candidateSegments,
                     backend: backend,
                     committedSegments: committedSegments,
-                    pendingPartialID: &pendingPartialID,
                     continuation: continuation
                 )
             }
         case .localAgreement:
             if emitted.isFinal {
-                commit(candidateSegments, backend: backend, committedSegments: &committedSegments, pendingPartialID: &pendingPartialID, continuation: continuation)
+                commitFinalLocalAgreement(
+                    candidateSegments,
+                    backend: backend,
+                    committedSegments: &committedSegments,
+                    agreementState: &agreementState,
+                    continuation: continuation
+                )
                 agreementState.reset()
             } else {
                 processLocalAgreement(
                     candidateSegments,
                     backend: backend,
                     committedSegments: &committedSegments,
-                    pendingPartialID: &pendingPartialID,
                     agreementState: &agreementState,
                     continuation: continuation
                 )
             }
         case .automatic:
             if emitted.isFinal {
-                commit(candidateSegments, backend: backend, committedSegments: &committedSegments, pendingPartialID: &pendingPartialID, continuation: continuation)
+                commit(candidateSegments, backend: backend, committedSegments: &committedSegments, continuation: continuation)
                 agreementState.reset()
             } else {
                 publishPartial(
                     candidateSegments,
                     backend: backend,
                     committedSegments: committedSegments,
-                    pendingPartialID: &pendingPartialID,
                     continuation: continuation
                 )
             }
         }
     }
 
+    private static func commitFinalLocalAgreement(
+        _ segments: [TranscriptSegment],
+        backend: SpeechBackendDescriptor,
+        committedSegments: inout [TranscriptSegment],
+        agreementState: inout LocalAgreementState,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) {
+        let finalHypothesis = removeCommittedTextPrefix(
+            in: segments.map(\.text).joined(separator: " "),
+            after: committedSegments
+        )
+        let mergedFinalText = agreementState.flush(currentHypothesis: finalHypothesis)
+        let finalText = removeCommittedTextPrefix(
+            in: mergedFinalText,
+            after: committedSegments
+        )
+
+        guard !finalText.isEmpty,
+              let firstSegment = segments.first,
+              let lastSegment = segments.last else {
+            continuation.yield(.snapshot(StreamingTranscriptSnapshot(
+                stable: Transcript(segments: committedSegments, backend: backend)
+            )))
+            return
+        }
+
+        commit(
+            [TranscriptSegment(
+                text: finalText,
+                startTime: firstSegment.startTime,
+                endTime: max(firstSegment.startTime, lastSegment.endTime)
+            )],
+            backend: backend,
+            committedSegments: &committedSegments,
+            continuation: continuation
+        )
+    }
+
     private static func commit(
         _ segments: [TranscriptSegment],
         backend: SpeechBackendDescriptor,
         committedSegments: inout [TranscriptSegment],
-        pendingPartialID: inout UUID?,
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) {
         for segment in segments {
             committedSegments.append(segment)
-            continuation.yield(.committed(segment))
         }
-        pendingPartialID = nil
         continuation.yield(.snapshot(StreamingTranscriptSnapshot(
-            committed: Transcript(segments: committedSegments, backend: backend)
+            stable: Transcript(segments: committedSegments, backend: backend)
         )))
+    }
+
+    private static func flushPendingLocalAgreementIfNeeded(
+        backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
+        committedSegments: inout [TranscriptSegment],
+        agreementState: inout LocalAgreementState,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) {
+        guard case .localAgreement = resolvedCommitmentPolicy(options) else {
+            return
+        }
+
+        let finalText = removeCommittedTextPrefix(
+            in: agreementState.flushPending(),
+            after: committedSegments
+        )
+        guard !finalText.isEmpty else { return }
+
+        let startTime = committedSegments.last?.endTime ?? 0
+        commit(
+            [TranscriptSegment(
+                text: finalText,
+                startTime: startTime,
+                endTime: startTime
+            )],
+            backend: backend,
+            committedSegments: &committedSegments,
+            continuation: continuation
+        )
     }
 
     private static func processLocalAgreement(
         _ segments: [TranscriptSegment],
         backend: SpeechBackendDescriptor,
         committedSegments: inout [TranscriptSegment],
-        pendingPartialID: inout UUID?,
         agreementState: inout LocalAgreementState,
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) {
-        let hypothesis = segments.map(\.text).joined(separator: " ")
+        let hypothesis = removeCommittedTextPrefix(
+            in: segments.map(\.text).joined(separator: " "),
+            after: committedSegments
+        )
         let agreement = agreementState.accept(hypothesis: hypothesis)
 
         if !agreement.confirmedPrefix.isEmpty,
            let firstSegment = segments.first,
            let lastSegment = segments.last {
-            let segment = TranscriptSegment(
-                text: agreement.confirmedPrefix,
-                startTime: firstSegment.startTime,
-                endTime: max(firstSegment.startTime, lastSegment.endTime)
+            let confirmedPrefix = removeCommittedTextPrefix(
+                in: agreement.confirmedPrefix,
+                after: committedSegments
             )
-            committedSegments.append(segment)
-            continuation.yield(.committed(segment))
-            pendingPartialID = nil
+            if !confirmedPrefix.isEmpty {
+                let segment = TranscriptSegment(
+                    text: confirmedPrefix,
+                    startTime: firstSegment.startTime,
+                    endTime: max(firstSegment.startTime, lastSegment.endTime)
+                )
+                committedSegments.append(segment)
+            }
         }
 
         guard !agreement.unconfirmedText.isEmpty,
@@ -269,7 +344,7 @@ public enum SpeechChunkStreamingPipeline {
               let lastSegment = segments.last
         else {
             continuation.yield(.snapshot(StreamingTranscriptSnapshot(
-                committed: Transcript(segments: committedSegments, backend: backend)
+                stable: Transcript(segments: committedSegments, backend: backend)
             )))
             return
         }
@@ -282,7 +357,6 @@ public enum SpeechChunkStreamingPipeline {
             )],
             backend: backend,
             committedSegments: committedSegments,
-            pendingPartialID: &pendingPartialID,
             continuation: continuation
         )
     }
@@ -291,7 +365,6 @@ public enum SpeechChunkStreamingPipeline {
         _ segments: [TranscriptSegment],
         backend: SpeechBackendDescriptor,
         committedSegments: [TranscriptSegment],
-        pendingPartialID: inout UUID?,
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) {
         guard let firstSegment = segments.first,
@@ -299,25 +372,35 @@ public enum SpeechChunkStreamingPipeline {
             return
         }
 
-        let partial = TranscriptPartial(
-            text: segments.map(\.text).joined(separator: " "),
-            startTime: firstSegment.startTime,
-            endTime: lastSegment.endTime
+        let volatile = Transcript(
+            segments: [TranscriptSegment(
+                text: segments.map(\.text).joined(separator: " "),
+                startTime: firstSegment.startTime,
+                endTime: lastSegment.endTime
+            )],
+            backend: backend
         )
-        if let previousID = pendingPartialID {
-            continuation.yield(.revision(TranscriptRevision(
-                replacesPartialID: previousID,
-                replacement: partial
-            )))
-        } else {
-            continuation.yield(.partial(partial))
-        }
-        pendingPartialID = partial.id
         continuation.yield(.snapshot(StreamingTranscriptSnapshot(
-            committed: Transcript(segments: committedSegments, backend: backend),
-            unconfirmed: partial,
-            volatileRange: TranscriptTimeRange(startTime: partial.startTime, endTime: partial.endTime)
+            stable: Transcript(segments: committedSegments, backend: backend),
+            volatile: volatile,
+            volatileRange: TranscriptTimeRange(startTime: firstSegment.startTime, endTime: lastSegment.endTime)
         )))
+    }
+
+    private static func removeCommittedTextPrefix(
+        in text: String,
+        after committedSegments: [TranscriptSegment]
+    ) -> String {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return "" }
+
+        let committedText = committedOverlapText(from: committedSegments)
+        let trimResult = trimDuplicatePrefix(in: text, after: committedText)
+        guard trimResult.removedTokenCount > 0 else {
+            return text
+        }
+
+        return trimResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func resolvedCommitmentPolicy(_ options: StreamingTranscriptionOptions) -> TranscriptCommitmentPolicy {
@@ -394,6 +477,24 @@ public enum SpeechChunkStreamingPipeline {
             }
 
             let confirmedTokenCount = SpeechChunkStreamingPipeline.commonPrefixTokenCount(in: hypotheses)
+            if confirmedTokenCount == 0,
+               let previousHypothesis = hypotheses.dropLast().last {
+                let expired = SpeechChunkStreamingPipeline.expiredPrefixBeforeWindowShift(
+                    previous: previousHypothesis,
+                    current: trimmedHypothesis
+                )
+                if !expired.prefix.isEmpty {
+                    hypotheses = [trimmedHypothesis]
+                    return (expired.prefix, trimmedHypothesis)
+                }
+
+                let previous = previousHypothesis.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !previous.isEmpty {
+                    hypotheses = [trimmedHypothesis]
+                    return (previous, trimmedHypothesis)
+                }
+            }
+
             let split = SpeechChunkStreamingPipeline.splitConfirmedPrefix(
                 in: trimmedHypothesis,
                 tokenCount: confirmedTokenCount
@@ -402,9 +503,109 @@ public enum SpeechChunkStreamingPipeline {
             return (split.prefix, split.remainder)
         }
 
+        mutating func flush(currentHypothesis: String) -> String {
+            let pendingHypothesis = hypotheses.last ?? ""
+            hypotheses.removeAll(keepingCapacity: true)
+            return SpeechChunkStreamingPipeline.mergeOverlappingText(
+                pendingHypothesis,
+                currentHypothesis
+            )
+        }
+
+        mutating func flushPending() -> String {
+            let pendingHypothesis = hypotheses.last ?? ""
+            hypotheses.removeAll(keepingCapacity: true)
+            return pendingHypothesis
+        }
+
         mutating func reset() {
             hypotheses.removeAll(keepingCapacity: true)
         }
+    }
+
+    private static func expiredPrefixBeforeWindowShift(
+        previous: String,
+        current: String
+    ) -> (prefix: String, remainder: String) {
+        let previousTokens = tokens(in: previous)
+        let currentTokens = tokens(in: current)
+        let overlapTokenCount = suffixPrefixOverlapTokenCount(
+            previousTokens: previousTokens.map(\.normalized),
+            currentTokens: currentTokens.map(\.normalized)
+        )
+
+        guard overlapTokenCount > 0, overlapTokenCount < previousTokens.count else {
+            return ("", current.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+
+        let expiredTokenCount = previousTokens.count - overlapTokenCount
+        let split = splitConfirmedPrefix(in: previous, tokenCount: expiredTokenCount)
+        return (split.prefix, current.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private static func mergeOverlappingText(_ first: String, _ second: String) -> String {
+        let first = first.trimmingCharacters(in: .whitespacesAndNewlines)
+        let second = second.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !first.isEmpty else { return second }
+        guard !second.isEmpty else { return first }
+
+        let firstTokens = tokens(in: first)
+        let secondTokens = tokens(in: second)
+        let firstNormalized = firstTokens.map(\.normalized)
+        let secondNormalized = secondTokens.map(\.normalized)
+
+        if isPrefix(firstNormalized, of: secondNormalized) {
+            return second
+        }
+
+        if isPrefix(secondNormalized, of: firstNormalized) {
+            return first
+        }
+
+        let overlapTokenCount = suffixPrefixOverlapTokenCount(
+            previousTokens: firstNormalized,
+            currentTokens: secondNormalized
+        )
+
+        guard overlapTokenCount > 0 else {
+            return "\(first) \(second)"
+        }
+
+        let secondRemainder = dropPrefixTokens(overlapTokenCount, from: second)
+        guard !secondRemainder.isEmpty else { return first }
+        return "\(first) \(secondRemainder)"
+    }
+
+    private static func isPrefix(_ prefix: [String], of tokens: [String]) -> Bool {
+        guard !prefix.isEmpty, prefix.count <= tokens.count else { return false }
+        return Array(tokens.prefix(prefix.count)) == prefix
+    }
+
+    private static func suffixPrefixOverlapTokenCount(
+        previousTokens: [String],
+        currentTokens: [String]
+    ) -> Int {
+        let maximumOverlap = min(previousTokens.count, currentTokens.count)
+        guard maximumOverlap > 0 else { return 0 }
+
+        for count in stride(from: maximumOverlap, through: 1, by: -1) {
+            if Array(previousTokens.suffix(count)) == Array(currentTokens.prefix(count)) {
+                return count
+            }
+        }
+
+        return 0
+    }
+
+    private static func dropPrefixTokens(_ count: Int, from text: String) -> String {
+        let textTokens = tokens(in: text)
+        guard count > 0, count <= textTokens.count else {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let startIndex = textTokens[count - 1].range.upperBound
+        return trimLeadingOverlapSeparators(String(text[startIndex...]))
     }
 
     private static func removeCommittedOverlap(
@@ -419,7 +620,7 @@ public enum SpeechChunkStreamingPipeline {
             return segment
         }
 
-        let committedText = committedSegments.map(\.text).joined(separator: " ")
+        let committedText = committedOverlapText(from: committedSegments)
         let trimResult = trimDuplicatePrefix(in: segment.text, after: committedText)
         guard trimResult.removedTokenCount > 0 else {
             return segment
@@ -447,6 +648,33 @@ public enum SpeechChunkStreamingPipeline {
             speaker: segment.speaker,
             confidence: segment.confidence
         )
+    }
+
+    private static func committedOverlapText(from segments: [TranscriptSegment]) -> String {
+        let maximumOverlapTokenCount = 12
+        var collectedTexts: [String] = []
+        var collectedTokenCount = 0
+
+        for segment in segments.reversed() {
+            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+
+            let textTokens = tokens(in: text)
+            guard !textTokens.isEmpty else { continue }
+
+            let neededTokenCount = maximumOverlapTokenCount - collectedTokenCount
+            if textTokens.count > neededTokenCount {
+                let suffixStart = textTokens[textTokens.count - neededTokenCount].range.lowerBound
+                collectedTexts.append(String(text[suffixStart...]).trimmingCharacters(in: .whitespacesAndNewlines))
+                break
+            }
+
+            collectedTexts.append(text)
+            collectedTokenCount += textTokens.count
+            if collectedTokenCount >= maximumOverlapTokenCount { break }
+        }
+
+        return collectedTexts.reversed().joined(separator: " ")
     }
 
     private static func trimDuplicatePrefix(

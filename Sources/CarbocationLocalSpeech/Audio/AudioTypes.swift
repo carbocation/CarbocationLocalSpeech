@@ -18,7 +18,7 @@ public struct AudioChunk: Hashable, Sendable {
         self.sampleRate = sampleRate
         self.channelCount = max(1, channelCount)
         self.startTime = startTime
-        self.duration = duration ?? Double(samples.count / max(1, channelCount)) / sampleRate
+        self.duration = duration ?? Double(samples.count) / Double(self.channelCount) / sampleRate
     }
 }
 

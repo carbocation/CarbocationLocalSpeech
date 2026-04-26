@@ -284,6 +284,134 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(final.first?.audio.duration), 0.25, accuracy: 0.000_1)
     }
 
+    func testSpeechChunkerResetsAfterInputGap() throws {
+        var chunker = SpeechChunker(configuration: SpeechChunkingConfiguration(
+            maximumChunkDuration: 2.0,
+            overlapDuration: 0.25,
+            silenceCommitDelay: 0.5,
+            minimumSpeechDuration: 0.1
+        ))
+
+        let first = AudioChunk(
+            samples: Array(repeating: 0.1, count: 500),
+            sampleRate: 1_000,
+            channelCount: 1,
+            startTime: 0,
+            duration: 0.5
+        )
+        XCTAssertTrue(chunker.append(
+            first,
+            activity: VoiceActivityEvent(state: .speech, startTime: 0, endTime: 0.5)
+        ).isEmpty)
+
+        let afterGap = AudioChunk(
+            samples: Array(repeating: 0.1, count: 1_000),
+            sampleRate: 1_000,
+            channelCount: 1,
+            startTime: 10,
+            duration: 1.0
+        )
+        XCTAssertTrue(chunker.append(
+            afterGap,
+            activity: VoiceActivityEvent(state: .speech, startTime: 10, endTime: 11)
+        ).isEmpty)
+
+        let final = try XCTUnwrap(chunker.finish().first)
+        XCTAssertEqual(final.startTime, 10, accuracy: 0.000_1)
+        XCTAssertEqual(final.audio.duration, 1.0, accuracy: 0.000_1)
+    }
+
+    func testSpeechRollingWindowEmitsOnlyNewAudioPlusOverlap() {
+        var window = SpeechRollingWindow(
+            maximumBufferDuration: 4.0,
+            updateInterval: 1.0,
+            overlapDuration: 0.25
+        )
+
+        func chunk(index: Int) -> AudioChunk {
+            AudioChunk(
+                samples: Array(repeating: 0.05, count: 500),
+                sampleRate: 1_000,
+                channelCount: 1,
+                startTime: TimeInterval(index) * 0.5,
+                duration: 0.5
+            )
+        }
+
+        XCTAssertTrue(window.append(chunk(index: 0)).isEmpty)
+
+        let first = window.append(chunk(index: 1))
+        XCTAssertEqual(first.count, 1)
+        XCTAssertEqual(first[0].startTime, 0, accuracy: 0.000_1)
+        XCTAssertEqual(first[0].audio.duration, 1.0, accuracy: 0.000_1)
+
+        XCTAssertTrue(window.append(chunk(index: 2)).isEmpty)
+
+        let second = window.append(chunk(index: 3))
+        XCTAssertEqual(second.count, 1)
+        XCTAssertEqual(second[0].startTime, 0.75, accuracy: 0.000_1)
+        XCTAssertEqual(second[0].audio.duration, 1.25, accuracy: 0.000_1)
+    }
+
+    func testSpeechRollingWindowResetsAfterInputGap() {
+        var window = SpeechRollingWindow(
+            maximumBufferDuration: 4.0,
+            updateInterval: 1.0,
+            overlapDuration: 0.25
+        )
+
+        let first = AudioChunk(
+            samples: Array(repeating: 0.05, count: 1_000),
+            sampleRate: 1_000,
+            channelCount: 1,
+            startTime: 0,
+            duration: 1.0
+        )
+        XCTAssertEqual(window.append(first).count, 1)
+
+        let afterGap = AudioChunk(
+            samples: Array(repeating: 0.05, count: 500),
+            sampleRate: 1_000,
+            channelCount: 1,
+            startTime: 10,
+            duration: 0.5
+        )
+        XCTAssertTrue(window.append(afterGap).isEmpty)
+
+        let continuation = AudioChunk(
+            samples: Array(repeating: 0.05, count: 500),
+            sampleRate: 1_000,
+            channelCount: 1,
+            startTime: 10.5,
+            duration: 0.5
+        )
+        let emitted = window.append(continuation)
+        XCTAssertEqual(emitted.count, 1)
+        XCTAssertEqual(emitted[0].startTime, 10, accuracy: 0.000_1)
+        XCTAssertEqual(emitted[0].audio.duration, 1.0, accuracy: 0.000_1)
+    }
+
+    func testSpeechRollingWindowDownmixesMultichannelInput() {
+        var window = SpeechRollingWindow(
+            maximumBufferDuration: 4.0,
+            updateInterval: 1.0,
+            overlapDuration: 0
+        )
+
+        let stereoFrames = Array(repeating: [Float(1), Float(0)], count: 1_000).flatMap { $0 }
+        let emitted = window.append(AudioChunk(
+            samples: stereoFrames,
+            sampleRate: 1_000,
+            channelCount: 2,
+            startTime: 0
+        ))
+
+        XCTAssertEqual(emitted.count, 1)
+        XCTAssertEqual(emitted[0].audio.samples.count, 1_000)
+        XCTAssertEqual(emitted[0].audio.duration, 1.0, accuracy: 0.000_1)
+        XCTAssertEqual(emitted[0].audio.samples.first ?? 0, 0.5, accuracy: 0.000_1)
+    }
+
     func testSpeakerAttributionMergerUsesLargestOverlap() {
         let transcript = Transcript(segments: [
             TranscriptSegment(text: "hello", startTime: 0, endTime: 1),
@@ -303,10 +431,10 @@ final class CarbocationLocalSpeechTests: XCTestCase {
     }
 
     func testMockTranscriberEmitsConfiguredEventsAndCompletion() async throws {
-        let partial = TranscriptPartial(text: "hel", startTime: 0, endTime: 0.2)
+        let volatile = Transcript(segments: [TranscriptSegment(text: "hel", startTime: 0, endTime: 0.2)])
         let transcriber = MockSpeechTranscriber(
             transcript: Transcript(segments: [TranscriptSegment(text: "hello", startTime: 0, endTime: 0.5)]),
-            streamEvents: [.partial(partial)]
+            streamEvents: [.snapshot(StreamingTranscriptSnapshot(volatile: volatile))]
         )
         let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
             continuation.finish()
@@ -317,7 +445,12 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             events.append(event)
         }
 
-        XCTAssertTrue(events.contains(.partial(partial)))
+        XCTAssertTrue(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.volatile?.text == "hel"
+            }
+            return false
+        })
         XCTAssertTrue(events.contains { event in
             if case .completed = event { return true }
             return false
@@ -339,7 +472,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let options = StreamingTranscriptionOptions(
             transcription: TranscriptionOptions(useCase: .dictation),
             commitment: .immediate,
-            latencyPreset: .lowestLatency,
+            strategy: .lowestLatency,
             emulation: EmulatedStreamingOptions(
                 window: .vadUtterances(SpeechChunkingConfiguration(
                     maximumChunkDuration: 0.1,
@@ -366,8 +499,8 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         }
 
         XCTAssertTrue(events.contains { event in
-            if case .committed(let segment) = event {
-                return segment.text == "hello"
+            if case .snapshot(let snapshot) = event {
+                return snapshot.stable.text == "hello"
             }
             return false
         })
@@ -393,7 +526,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
         let options = StreamingTranscriptionOptions(
             commitment: .immediate,
-            latencyPreset: .lowestLatency,
+            strategy: .lowestLatency,
             emulation: EmulatedStreamingOptions(
                 window: .vadUtterances(SpeechChunkingConfiguration(
                     maximumChunkDuration: 0.1,
@@ -446,7 +579,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let options = StreamingTranscriptionOptions(
             transcription: TranscriptionOptions(useCase: .dictation),
             commitment: .immediate,
-            latencyPreset: .lowestLatency,
+            strategy: .lowestLatency,
             emulation: EmulatedStreamingOptions(
                 window: .vadUtterances(SpeechChunkingConfiguration(
                     maximumChunkDuration: 1.0,
@@ -480,11 +613,11 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         }
 
         let committedText = events.compactMap { event -> String? in
-            if case .committed(let segment) = event {
-                return segment.text
+            if case .snapshot(let snapshot) = event {
+                return snapshot.stable.text
             }
             return nil
-        }.joined(separator: " ")
+        }.last ?? ""
 
         XCTAssertEqual(committedText, "apple speech. provider.")
         XCTAssertTrue(events.contains { event in
@@ -517,7 +650,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let options = StreamingTranscriptionOptions(
             transcription: TranscriptionOptions(useCase: .dictation),
             commitment: .localAgreement(iterations: 2),
-            latencyPreset: .lowestLatency,
+            strategy: .lowestLatency,
             emulation: EmulatedStreamingOptions(
                 window: .rollingBuffer(maxDuration: 4.0, updateInterval: 0.5, overlap: 0.25)
             )
@@ -542,17 +675,259 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         }
 
         let committedText = events.compactMap { event -> String? in
-            if case .committed(let segment) = event {
-                return segment.text
+            if case .completed(let transcript) = event {
+                return transcript.text
             }
             return nil
-        }.joined(separator: " ")
+        }.last ?? ""
 
         XCTAssertEqual(committedText, "hello speech provider")
         XCTAssertTrue(events.contains { event in
             if case .snapshot(let snapshot) = event {
-                return snapshot.committed.text == "hello speech"
-                    && snapshot.unconfirmed?.text == "provider"
+                return snapshot.stable.text == "hello speech"
+                    && snapshot.volatile?.text == "provider"
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineFlushesPendingLocalAgreementOnFinalWindow() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 8_000),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 0.5
+            ))
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 8_000),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0.5,
+                duration: 0.5
+            ))
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(useCase: .dictation),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 1.0, updateInterval: 0.5, overlap: 0.25)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribe: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1:
+                    text = "alpha beta"
+                case 2:
+                    text = "alpha beta gamma delta epsilon"
+                default:
+                    text = "epsilon zeta"
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            })
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == "alpha beta gamma delta epsilon zeta"
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineCommitsExpiredLocalAgreementPrefix() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            for index in 0..<3 {
+                continuation.yield(AudioChunk(
+                    samples: Array(repeating: 0.05, count: 8_000),
+                    sampleRate: 16_000,
+                    channelCount: 1,
+                    startTime: TimeInterval(index) * 0.5,
+                    duration: 0.5
+                ))
+            }
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(useCase: .dictation),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 1.0, updateInterval: 0.5, overlap: 0.25)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribe: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1:
+                    text = "alpha beta"
+                case 2:
+                    text = "alpha beta gamma delta epsilon"
+                case 3:
+                    text = "delta epsilon zeta"
+                default:
+                    text = "zeta eta"
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            })
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.stable.text.split(separator: " ").contains("gamma")
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineCommitsPreviousLocalAgreementWhenWindowTextDoesNotOverlap() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            for index in 0..<2 {
+                continuation.yield(AudioChunk(
+                    samples: Array(repeating: 0.05, count: 8_000),
+                    sampleRate: 16_000,
+                    channelCount: 1,
+                    startTime: TimeInterval(index) * 0.5,
+                    duration: 0.5
+                ))
+            }
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(useCase: .dictation),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 1.0, updateInterval: 0.5, overlap: 0.25)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribe: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1:
+                    text = "alpha beta"
+                case 2:
+                    text = "gamma delta"
+                default:
+                    text = "delta epsilon"
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            })
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == "alpha beta gamma delta epsilon"
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineDoesNotDuplicateCommittedPrefixAfterRevision() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            for index in 0..<3 {
+                continuation.yield(AudioChunk(
+                    samples: Array(repeating: 0.05, count: 8_000),
+                    sampleRate: 16_000,
+                    channelCount: 1,
+                    startTime: TimeInterval(index) * 0.5,
+                    duration: 0.5
+                ))
+            }
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(useCase: .dictation),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 1.0, updateInterval: 0.5, overlap: 0.25)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribe: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                let startTime: TimeInterval
+                switch callIndex {
+                case 1:
+                    text = "alpha beta"
+                    startTime = 0
+                case 2:
+                    text = "alpha beta gamma"
+                    startTime = 0
+                case 3:
+                    text = "alpha beta gamma delta"
+                    startTime = 10
+                default:
+                    text = "alpha beta gamma delta epsilon"
+                    startTime = 10
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: startTime, endTime: startTime + 0.1)
+                ])
+            })
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == "alpha beta gamma delta epsilon"
             }
             return false
         })

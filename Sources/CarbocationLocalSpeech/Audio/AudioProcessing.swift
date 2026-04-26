@@ -169,13 +169,17 @@ private final class CaptureTiming: @unchecked Sendable {
 
 public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Sendable {
     private let lock = NSLock()
+    private let stopQueue = DispatchQueue(
+        label: "CarbocationLocalSpeech.AVAudioEngineCaptureSession.stop",
+        qos: .userInitiated
+    )
     private var engine: AVAudioEngine?
     private var continuation: AsyncThrowingStream<AudioChunk, Error>.Continuation?
 
     public init() {}
 
     public func start(configuration: AudioCaptureConfiguration = AudioCaptureConfiguration()) -> AsyncThrowingStream<AudioChunk, Error> {
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(8)) { continuation in
             stop()
 
             lock.lock()
@@ -187,6 +191,7 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
             let inputNode = audioEngine.inputNode
             let format = inputNode.outputFormat(forBus: 0)
             let frames = max(256, AVAudioFrameCount(configuration.frameDuration * format.sampleRate))
+            let targetChannelCount = max(1, configuration.preferredChannelCount)
             let timing = CaptureTiming()
 
             inputNode.installTap(onBus: 0, bufferSize: frames, format: format) { buffer, _ in
@@ -194,17 +199,31 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
                 let channelCount = Int(buffer.format.channelCount)
                 let frameLength = Int(buffer.frameLength)
                 var samples: [Float] = []
-                samples.reserveCapacity(frameLength * channelCount)
-                for frame in 0..<frameLength {
-                    for channel in 0..<channelCount {
-                        samples.append(channels[channel][frame])
+                let emittedChannelCount: Int
+                if targetChannelCount == 1 {
+                    emittedChannelCount = 1
+                    samples.reserveCapacity(frameLength)
+                    for frame in 0..<frameLength {
+                        var sample: Float = 0
+                        for channel in 0..<channelCount {
+                            sample += channels[channel][frame]
+                        }
+                        samples.append(sample / Float(max(1, channelCount)))
+                    }
+                } else {
+                    emittedChannelCount = channelCount
+                    samples.reserveCapacity(frameLength * channelCount)
+                    for frame in 0..<frameLength {
+                        for channel in 0..<channelCount {
+                            samples.append(channels[channel][frame])
+                        }
                     }
                 }
                 let duration = Double(frameLength) / buffer.format.sampleRate
                 continuation.yield(AudioChunk(
                     samples: samples,
                     sampleRate: buffer.format.sampleRate,
-                    channelCount: channelCount,
+                    channelCount: emittedChannelCount,
                     startTime: timing.claim(duration: duration),
                     duration: duration
                 ))
@@ -233,11 +252,14 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
         self.continuation = nil
         lock.unlock()
 
-        if let audioEngine {
-            audioEngine.inputNode.removeTap(onBus: 0)
-            audioEngine.stop()
-        }
         continuation?.finish()
+
+        if let audioEngine {
+            stopQueue.async {
+                audioEngine.stop()
+                audioEngine.inputNode.removeTap(onBus: 0)
+            }
+        }
     }
 
     private func clear(audioEngine expectedEngine: AVAudioEngine) {

@@ -3,15 +3,26 @@ import SwiftUI
 
 public struct LiveTranscriptDebugView: View {
     public var events: [TranscriptEvent]
+    private var eventDescriptions: [String]?
     private var transcriptEvents: [TranscriptEvent]
+    private var snapshot: LiveTranscriptDebugSnapshot?
 
     public init(events: [TranscriptEvent], transcriptEvents: [TranscriptEvent]? = nil) {
         self.events = events
+        self.eventDescriptions = nil
         self.transcriptEvents = transcriptEvents ?? events
+        self.snapshot = nil
+    }
+
+    public init(eventDescriptions: [String], snapshot: LiveTranscriptDebugSnapshot) {
+        self.events = []
+        self.eventDescriptions = eventDescriptions
+        self.transcriptEvents = []
+        self.snapshot = snapshot
     }
 
     public var body: some View {
-        let snapshot = LiveTranscriptDebugSnapshot(events: transcriptEvents)
+        let snapshot = snapshot ?? LiveTranscriptDebugSnapshot(events: transcriptEvents)
 
         VStack(spacing: 0) {
             transcriptPanel(snapshot)
@@ -40,9 +51,8 @@ public struct LiveTranscriptDebugView: View {
             }
 
             ScrollView {
-                Text(snapshot.transcriptText.isEmpty ? "Waiting for speech..." : snapshot.transcriptText)
+                transcriptText(snapshot)
                     .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(snapshot.transcriptText.isEmpty ? .secondary : .primary)
                     .lineSpacing(4)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -53,9 +63,9 @@ public struct LiveTranscriptDebugView: View {
             if let latestText = snapshot.latestText {
                 Divider()
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Label(snapshot.hasPendingPartial ? "Live" : "Latest", systemImage: snapshot.hasPendingPartial ? "waveform" : "checkmark.circle")
+                    Label(snapshot.hasVolatileText ? "Live" : "Latest", systemImage: snapshot.hasVolatileText ? "waveform" : "checkmark.circle")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(snapshot.hasPendingPartial ? Color.accentColor : Color.secondary)
+                        .foregroundStyle(snapshot.hasVolatileText ? Color.accentColor : Color.secondary)
                         .labelStyle(.titleAndIcon)
 
                     Text(latestText)
@@ -79,6 +89,40 @@ public struct LiveTranscriptDebugView: View {
         .background(Color(nsColor: .textBackgroundColor))
     }
 
+    @ViewBuilder private func transcriptText(_ snapshot: LiveTranscriptDebugSnapshot) -> some View {
+        let stableText = snapshot.stableText
+        let volatileText = snapshot.volatileText
+
+        if stableText.isEmpty && volatileText.isEmpty {
+            Text("Waiting for speech...")
+                .foregroundStyle(.secondary)
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                if !stableText.isEmpty {
+                    transcriptRun(
+                        stableText,
+                        backgroundColor: Color.green.opacity(0.16)
+                    )
+                }
+
+                if !volatileText.isEmpty {
+                    transcriptRun(
+                        volatileText,
+                        backgroundColor: Color.accentColor.opacity(0.18)
+                    )
+                }
+            }
+        }
+    }
+
+    private func transcriptRun(_ text: String, backgroundColor: Color) -> some View {
+        Text(text)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .background(backgroundColor)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+    }
+
     private func metric(_ title: String, _ value: String) -> some View {
         VStack(alignment: .trailing, spacing: 2) {
             Text(title)
@@ -91,7 +135,7 @@ public struct LiveTranscriptDebugView: View {
     }
 
     @ViewBuilder private var eventStream: some View {
-        if events.isEmpty {
+        if eventLogText.isEmpty {
             ContentUnavailableView {
                 Label("No Transcript Events", systemImage: "waveform.path.ecg")
             } description: {
@@ -99,7 +143,7 @@ public struct LiveTranscriptDebugView: View {
             }
         } else {
             ScrollView {
-                Text(events.map(Self.describe).joined(separator: "\n"))
+                Text(eventLogText)
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -108,7 +152,14 @@ public struct LiveTranscriptDebugView: View {
         }
     }
 
-    private static func describe(_ event: TranscriptEvent) -> String {
+    private var eventLogText: String {
+        if let eventDescriptions {
+            return eventDescriptions.joined(separator: "\n")
+        }
+        return events.map(Self.describe).joined(separator: "\n")
+    }
+
+    public static func describe(_ event: TranscriptEvent) -> String {
         switch event {
         case .started(let backend):
             return "started \(backend.displayName)"
@@ -120,17 +171,11 @@ public struct LiveTranscriptDebugView: View {
             let time = diagnostic.time.map { " \(format($0))" } ?? ""
             return "debug \(diagnostic.source)\(time) \(diagnostic.message)"
         case .snapshot(let snapshot):
-            let committedCount = snapshot.committed.segments.count
-            if let unconfirmed = snapshot.unconfirmed, !unconfirmed.text.isEmpty {
-                return "snapshot committed=\(committedCount) live \(unconfirmed.text)"
+            let stableCount = snapshot.stable.segments.count
+            if let volatileText = snapshot.volatile?.text, !volatileText.isEmpty {
+                return "snapshot stable=\(stableCount) volatile \(volatileText)"
             }
-            return "snapshot committed=\(committedCount)"
-        case .partial(let partial):
-            return "partial \(partial.text)"
-        case .revision(let revision):
-            return "revision \(revision.replacesPartialID.uuidString) -> \(revision.replacement.text)"
-        case .committed(let segment):
-            return "committed \(segment.text)"
+            return "snapshot stable=\(stableCount)"
         case .progress(let progress):
             return "progress \(format(progress.processedDuration))"
         case .stats(let stats):
@@ -149,100 +194,131 @@ public struct LiveTranscriptDebugView: View {
     }
 }
 
-struct LiveTranscriptDebugSnapshot: Equatable {
-    var committedSegments: [TranscriptSegment] = []
-    var pendingPartial: TranscriptPartial?
-    var processedDuration: TimeInterval?
-    var realTimeFactor: Double?
+public struct LiveTranscriptDebugSnapshot: Equatable {
+    public private(set) var stableText = ""
+    public private(set) var volatileText = ""
+    public private(set) var processedDuration: TimeInterval?
+    public private(set) var realTimeFactor: Double?
+    public private(set) var segmentCount = 0
 
-    init(events: [TranscriptEvent]) {
+    private var stableSnapshotSignature = ""
+    private var latestStableText: String?
+    private var latestStableTimeRange: String?
+    private var volatileTimeRange: String?
+
+    public init(events: [TranscriptEvent] = []) {
         for event in events {
             apply(event)
         }
     }
 
-    var transcriptText: String {
-        let committedText = committedSegments
-            .map(\.text)
-            .map(Self.trim)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-
-        guard let partialText = pendingPartial.map({ Self.trim($0.text) }), !partialText.isEmpty else {
-            return committedText
+    public var transcriptText: String {
+        guard !volatileText.isEmpty else {
+            return stableText
         }
 
-        guard !committedText.isEmpty else {
-            return partialText
+        guard !stableText.isEmpty else {
+            return volatileText
         }
 
-        return "\(committedText) \(partialText)"
+        return "\(stableText) \(volatileText)"
     }
 
-    var latestText: String? {
-        if let partialText = pendingPartial.map({ Self.trim($0.text) }), !partialText.isEmpty {
-            return partialText
+    public var latestText: String? {
+        if !volatileText.isEmpty {
+            return volatileText
         }
 
-        if let segmentText = committedSegments.last.map({ Self.trim($0.text) }), !segmentText.isEmpty {
-            return segmentText
+        return latestStableText
+    }
+
+    public var latestTimeRange: String? {
+        if !volatileText.isEmpty {
+            return volatileTimeRange
         }
 
-        return nil
+        return latestStableTimeRange
     }
 
-    var latestTimeRange: String? {
-        if let pendingPartial {
-            return Self.formatTimeRange(start: pendingPartial.startTime, end: pendingPartial.endTime)
-        }
-
-        if let lastSegment = committedSegments.last {
-            return Self.formatTimeRange(start: lastSegment.startTime, end: lastSegment.endTime)
-        }
-
-        return nil
+    public var hasVolatileText: Bool {
+        !volatileText.isEmpty
     }
 
-    var hasPendingPartial: Bool {
-        guard let pendingPartial else { return false }
-        return !Self.trim(pendingPartial.text).isEmpty
-    }
-
-    var segmentCount: Int {
-        committedSegments.count
-    }
-
-    private mutating func apply(_ event: TranscriptEvent) {
+    public mutating func apply(_ event: TranscriptEvent) {
         switch event {
         case .snapshot(let snapshot):
-            committedSegments = snapshot.committed.segments.filter { !Self.trim($0.text).isEmpty }
-            pendingPartial = snapshot.unconfirmed
-        case .partial(let partial):
-            pendingPartial = partial
-        case .revision(let revision):
-            pendingPartial = revision.replacement
-        case .committed(let segment):
-            if !Self.trim(segment.text).isEmpty {
-                committedSegments.append(segment)
+            let signature = Self.stableSnapshotSignature(for: snapshot.stable.segments)
+            if signature != stableSnapshotSignature {
+                applyStableSegments(snapshot.stable.segments)
             }
-            pendingPartial = nil
+            applyVolatileTranscript(snapshot.volatile)
         case .progress(let progress):
             processedDuration = progress.processedDuration
         case .stats(let stats):
             realTimeFactor = stats.realTimeFactor
         case .completed(let transcript):
             let nonEmptySegments = transcript.segments.filter { !Self.trim($0.text).isEmpty }
-            if !nonEmptySegments.isEmpty {
-                committedSegments = nonEmptySegments
+            if !nonEmptySegments.isEmpty && nonEmptySegments.count != segmentCount {
+                applyStableSegments(nonEmptySegments)
             }
-            pendingPartial = nil
+            applyVolatileTranscript(nil)
         case .started, .audioLevel, .voiceActivity, .diagnostic:
             break
         }
     }
 
+    private mutating func applyStableSegments(_ segments: [TranscriptSegment]) {
+        let nonEmptySegments = segments.compactMap { segment -> (segment: TranscriptSegment, text: String)? in
+            let text = Self.trim(segment.text)
+            guard !text.isEmpty else { return nil }
+            return (segment, text)
+        }
+
+        stableText = nonEmptySegments.map(\.text).joined(separator: " ")
+        segmentCount = nonEmptySegments.count
+        stableSnapshotSignature = Self.stableSnapshotSignature(for: nonEmptySegments.map(\.segment))
+
+        if let latest = nonEmptySegments.last {
+            latestStableText = latest.text
+            latestStableTimeRange = Self.formatTimeRange(
+                start: latest.segment.startTime,
+                end: latest.segment.endTime
+            )
+        } else {
+            latestStableText = nil
+            latestStableTimeRange = nil
+        }
+    }
+
+    private mutating func applyVolatileTranscript(_ transcript: Transcript?) {
+        guard let transcript else {
+            volatileText = ""
+            volatileTimeRange = nil
+            return
+        }
+
+        let segments = transcript.segments.filter { !Self.trim($0.text).isEmpty }
+        guard let first = segments.first,
+              let last = segments.last else {
+            volatileText = ""
+            volatileTimeRange = nil
+            return
+        }
+
+        volatileText = segments.map { Self.trim($0.text) }.joined(separator: " ")
+        volatileTimeRange = Self.formatTimeRange(start: first.startTime, end: last.endTime)
+    }
+
     private static func trim(_ text: String) -> String {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func stableSnapshotSignature(for segments: [TranscriptSegment]) -> String {
+        segments
+            .map { segment in
+                "\(segment.id.uuidString)|\(trim(segment.text))|\(format(segment.startTime))|\(format(segment.endTime))"
+            }
+            .joined(separator: "\n")
     }
 
     private static func formatTimeRange(start: TimeInterval, end: TimeInterval) -> String {

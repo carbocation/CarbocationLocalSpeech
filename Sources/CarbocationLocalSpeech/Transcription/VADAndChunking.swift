@@ -1,5 +1,26 @@
 import Foundation
 
+private func monoSamples(from chunk: AudioChunk) -> [Float] {
+    let channelCount = max(1, chunk.channelCount)
+    guard channelCount > 1 else { return chunk.samples }
+
+    let frameCount = chunk.samples.count / channelCount
+    var mono: [Float] = []
+    mono.reserveCapacity(frameCount)
+    for frame in 0..<frameCount {
+        var sample: Float = 0
+        for channel in 0..<channelCount {
+            sample += chunk.samples[frame * channelCount + channel]
+        }
+        mono.append(sample / Float(channelCount))
+    }
+    return mono
+}
+
+private func audioContinuityTolerance(for chunk: AudioChunk) -> TimeInterval {
+    max(0.25, min(1.0, max(0.05, chunk.duration) * 2))
+}
+
 public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
     public var speechRMSThreshold: Float
     public var minimumPeakThreshold: Float
@@ -27,7 +48,7 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
     }
 }
 
-public struct SpeechChunker: Sendable {
+@_spi(Internal) public struct SpeechChunker: Sendable {
     public var configuration: SpeechChunkingConfiguration
 
     private var samples: [Float] = []
@@ -44,12 +65,9 @@ public struct SpeechChunker: Sendable {
         _ chunk: AudioChunk,
         activity: VoiceActivityEvent
     ) -> [SpeechAudioChunk] {
-        if sampleRate == nil {
-            sampleRate = chunk.sampleRate
-            startTime = chunk.startTime
-        }
+        prepareForAppend(chunk)
 
-        samples.append(contentsOf: chunk.samples)
+        samples.append(contentsOf: monoSamples(from: chunk))
         if activity.state == .speech {
             speechDuration += chunk.duration
             silenceDuration = 0
@@ -109,6 +127,35 @@ public struct SpeechChunker: Sendable {
         return emitted
     }
 
+    private mutating func prepareForAppend(_ chunk: AudioChunk) {
+        if sampleRate == nil || samples.isEmpty {
+            sampleRate = chunk.sampleRate
+            startTime = chunk.startTime
+            return
+        }
+
+        if let sampleRate, abs(sampleRate - chunk.sampleRate) > 0.0001 {
+            reset()
+            self.sampleRate = chunk.sampleRate
+            startTime = chunk.startTime
+            return
+        }
+
+        guard let startTime else {
+            self.startTime = chunk.startTime
+            return
+        }
+
+        let expectedStart = startTime + duration
+        let tolerance = audioContinuityTolerance(for: chunk)
+        if chunk.startTime > expectedStart + tolerance ||
+            chunk.startTime + chunk.duration < startTime - tolerance {
+            reset()
+            sampleRate = chunk.sampleRate
+            self.startTime = chunk.startTime
+        }
+    }
+
     private mutating func reset() {
         samples.removeAll(keepingCapacity: true)
         sampleRate = nil
@@ -118,7 +165,7 @@ public struct SpeechChunker: Sendable {
     }
 }
 
-public struct SpeechRollingWindow: Sendable {
+@_spi(Internal) public struct SpeechRollingWindow: Sendable {
     public var maximumBufferDuration: TimeInterval
     public var updateInterval: TimeInterval
     public var overlapDuration: TimeInterval
@@ -135,16 +182,13 @@ public struct SpeechRollingWindow: Sendable {
     ) {
         self.maximumBufferDuration = max(0.1, maximumBufferDuration)
         self.updateInterval = max(0.05, updateInterval)
-        self.overlapDuration = max(0, overlapDuration)
+        self.overlapDuration = min(max(0, overlapDuration), self.maximumBufferDuration)
     }
 
     public mutating func append(_ chunk: AudioChunk) -> [SpeechAudioChunk] {
-        if sampleRate == nil {
-            sampleRate = chunk.sampleRate
-            startTime = chunk.startTime
-        }
+        prepareForAppend(chunk)
 
-        samples.append(contentsOf: chunk.samples)
+        samples.append(contentsOf: monoSamples(from: chunk))
         trimIfNeeded()
 
         guard let startTime else { return [] }
@@ -154,12 +198,19 @@ public struct SpeechRollingWindow: Sendable {
             return []
         }
 
-        return [emitChunk(isFinal: false)]
+        guard let emitted = emitChunk(isFinal: false) else {
+            return []
+        }
+        return [emitted]
     }
 
     public mutating func finish() -> [SpeechAudioChunk] {
         guard !samples.isEmpty else { return [] }
-        return [emitChunk(isFinal: true)]
+        guard let emitted = emitChunk(isFinal: true) else {
+            reset()
+            return []
+        }
+        return [emitted]
     }
 
     private var duration: TimeInterval {
@@ -177,21 +228,69 @@ public struct SpeechRollingWindow: Sendable {
         self.startTime = startTime + Double(droppedSamples) / sampleRate
     }
 
-    private mutating func emitChunk(isFinal: Bool) -> SpeechAudioChunk {
+    private mutating func emitChunk(isFinal: Bool) -> SpeechAudioChunk? {
         let resolvedSampleRate = sampleRate ?? 16_000
-        let resolvedStart = startTime ?? 0
+        let bufferStart = startTime ?? 0
+        let bufferEnd = bufferStart + duration
+        let emissionStart: TimeInterval
+        if let lastEmissionEndTime {
+            emissionStart = max(bufferStart, lastEmissionEndTime - overlapDuration)
+        } else {
+            emissionStart = bufferStart
+        }
+        guard bufferEnd > emissionStart else {
+            if isFinal {
+                reset()
+            }
+            return nil
+        }
+
+        let startOffset = max(0, min(
+            samples.count,
+            Int(((emissionStart - bufferStart) * resolvedSampleRate).rounded(.down))
+        ))
+        let emittedSamples = Array(samples[startOffset...])
         let prepared = PreparedAudio(
-            samples: samples,
+            samples: emittedSamples,
             sampleRate: resolvedSampleRate,
-            duration: Double(samples.count) / resolvedSampleRate
+            duration: Double(emittedSamples.count) / resolvedSampleRate
         )
-        lastEmissionEndTime = resolvedStart + prepared.duration
+        lastEmissionEndTime = bufferEnd
 
         if isFinal {
             reset()
         }
 
-        return SpeechAudioChunk(audio: prepared, startTime: resolvedStart, isFinal: isFinal)
+        return SpeechAudioChunk(audio: prepared, startTime: emissionStart, isFinal: isFinal)
+    }
+
+    private mutating func prepareForAppend(_ chunk: AudioChunk) {
+        if sampleRate == nil || samples.isEmpty {
+            sampleRate = chunk.sampleRate
+            startTime = chunk.startTime
+            return
+        }
+
+        if let sampleRate, abs(sampleRate - chunk.sampleRate) > 0.0001 {
+            reset()
+            self.sampleRate = chunk.sampleRate
+            startTime = chunk.startTime
+            return
+        }
+
+        guard let startTime else {
+            self.startTime = chunk.startTime
+            return
+        }
+
+        let expectedStart = startTime + duration
+        let tolerance = audioContinuityTolerance(for: chunk)
+        if chunk.startTime > expectedStart + tolerance ||
+            chunk.startTime + chunk.duration < startTime - tolerance {
+            reset()
+            sampleRate = chunk.sampleRate
+            self.startTime = chunk.startTime
+        }
     }
 
     private mutating func reset() {
