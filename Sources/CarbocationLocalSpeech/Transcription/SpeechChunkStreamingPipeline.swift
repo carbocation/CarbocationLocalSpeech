@@ -2,12 +2,29 @@ import Foundation
 
 public enum SpeechChunkStreamingPipeline {
     public typealias ChunkTranscription = @Sendable (PreparedAudio, TranscriptionOptions) async throws -> Transcript
+    @_spi(Internal) public typealias TimedChunkTranscription = @Sendable (SpeechAudioChunk, TranscriptionOptions) async throws -> Transcript
 
     public static func stream(
         audio: AsyncThrowingStream<AudioChunk, Error>,
         backend: SpeechBackendDescriptor,
         options: StreamingTranscriptionOptions,
         transcribe: @escaping ChunkTranscription
+    ) -> AsyncThrowingStream<TranscriptEvent, Error> {
+        stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { chunk, options in
+                try await transcribe(chunk.audio, options)
+            }
+        )
+    }
+
+    @_spi(Internal) public static func stream(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
+        transcribeTimed transcribe: @escaping TimedChunkTranscription
     ) -> AsyncThrowingStream<TranscriptEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -115,7 +132,7 @@ public enum SpeechChunkStreamingPipeline {
         _ emitted: SpeechAudioChunk,
         backend: SpeechBackendDescriptor,
         options: StreamingTranscriptionOptions,
-        transcribe: ChunkTranscription,
+        transcribe: TimedChunkTranscription,
         committedSegments: inout [TranscriptSegment],
         pendingPartialID: inout UUID?,
         agreementState: inout LocalAgreementState,
@@ -124,7 +141,7 @@ public enum SpeechChunkStreamingPipeline {
         try Task.checkCancellation()
 
         let startedAt = Date()
-        let transcript = try await transcribe(emitted.audio, options.transcription)
+        let transcript = try await transcribe(emitted, options.transcription)
         let processingDuration = Date().timeIntervalSince(startedAt)
         let segments = transcript.segments
             .map { offset($0, by: emitted.startTime) }

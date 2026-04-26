@@ -1,5 +1,5 @@
 import CarbocationLocalSpeech
-import CarbocationWhisperRuntime
+@testable import CarbocationWhisperRuntime
 import Foundation
 import XCTest
 
@@ -39,6 +39,22 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
+    }
+
+    func testStreamingDecodeTuningFollowsLatencyPreset() {
+        let lowestLatency = WhisperStreamingDecodeTuning.resolve(for: StreamingTranscriptionOptions(
+            latencyPreset: .lowestLatency
+        ))
+        let fileQuality = WhisperStreamingDecodeTuning.resolve(for: StreamingTranscriptionOptions(
+            latencyPreset: .fileQuality
+        ))
+
+        XCTAssertTrue(lowestLatency.singleSegment)
+        XCTAssertGreaterThan(lowestLatency.maxTokens, 0)
+        XCTAssertGreaterThan(lowestLatency.audioContext, 0)
+        XCTAssertFalse(fileQuality.singleSegment)
+        XCTAssertEqual(fileQuality.maxTokens, 0)
+        XCTAssertEqual(fileQuality.audioContext, 0)
     }
 
     @MainActor

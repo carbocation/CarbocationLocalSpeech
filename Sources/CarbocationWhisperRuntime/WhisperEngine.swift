@@ -1,4 +1,4 @@
-import CarbocationLocalSpeech
+@_spi(Internal) import CarbocationLocalSpeech
 import Foundation
 #if CARBOCATION_HAS_WHISPER_C_API
 import whisper
@@ -90,6 +90,96 @@ public enum WhisperEngineError: Error, LocalizedError, Sendable {
             return "Whisper does not support \(implementation.rawValue) streaming."
         }
     }
+}
+
+struct WhisperStreamingDecodeTuning: Hashable, Sendable {
+    var singleSegment: Bool
+    var maxTokens: Int32
+    var audioContext: Int32
+
+    static func resolve(for options: StreamingTranscriptionOptions) -> WhisperStreamingDecodeTuning {
+        switch options.latencyPreset {
+        case .lowestLatency:
+            return WhisperStreamingDecodeTuning(singleSegment: true, maxTokens: 48, audioContext: 256)
+        case .balancedDictation:
+            return WhisperStreamingDecodeTuning(singleSegment: true, maxTokens: 96, audioContext: 512)
+        case .accuracy:
+            return WhisperStreamingDecodeTuning(singleSegment: false, maxTokens: 0, audioContext: 768)
+        case .fileQuality:
+            return WhisperStreamingDecodeTuning(singleSegment: false, maxTokens: 0, audioContext: 0)
+        }
+    }
+}
+
+private struct WhisperRunResult {
+    var transcript: Transcript
+#if CARBOCATION_HAS_WHISPER_C_API
+    var promptTokens: [whisper_token]
+#endif
+
+#if CARBOCATION_HAS_WHISPER_C_API
+    init(transcript: Transcript, promptTokens: [whisper_token] = []) {
+        self.transcript = transcript
+        self.promptTokens = promptTokens
+    }
+#else
+    init(transcript: Transcript) {
+        self.transcript = transcript
+    }
+#endif
+}
+
+private struct WhisperStreamingRunContext: Sendable {
+    var chunkStartTime: TimeInterval
+    var chunkDuration: TimeInterval
+    var tuning: WhisperStreamingDecodeTuning
+    var sessionState: WhisperStreamingSessionState
+    var eventSink: @Sendable (TranscriptEvent) -> Void
+}
+
+private final class WhisperStreamingSessionState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+#if CARBOCATION_HAS_WHISPER_C_API
+    private var promptTokens: [whisper_token] = []
+#endif
+
+    var promptTokenCount: Int {
+#if CARBOCATION_HAS_WHISPER_C_API
+        lock.lock()
+        defer { lock.unlock() }
+        return promptTokens.count
+#else
+        return 0
+#endif
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+#if CARBOCATION_HAS_WHISPER_C_API
+    func currentPromptTokens() -> [whisper_token] {
+        lock.lock()
+        defer { lock.unlock() }
+        return promptTokens
+    }
+
+    func updatePromptTokens(_ tokens: [whisper_token], limit: Int) {
+        guard !tokens.isEmpty else { return }
+        lock.lock()
+        promptTokens = Array(tokens.suffix(max(1, limit)))
+        lock.unlock()
+    }
+#endif
 }
 
 public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscriber {
@@ -195,17 +285,33 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
     }
 
     public func transcribe(audio: PreparedAudio, options: TranscriptionOptions) async throws -> Transcript {
+        try transcribePreparedAudio(audio, options: options, streamingContext: nil).transcript
+    }
+
+    private func transcribePreparedAudio(
+        _ audio: PreparedAudio,
+        options: TranscriptionOptions,
+        streamingContext: WhisperStreamingRunContext?
+    ) throws -> WhisperRunResult {
         guard let loadedInfo else {
             throw WhisperEngineError.noModelLoaded
         }
 
         if options.suppressBlankAudio,
            AudioLevelMeter.measure(samples: audio.samples).peak < 0.000_01 {
-            return Transcript(
+            let transcript = Transcript(
                 segments: [],
                 duration: audio.duration,
                 backend: loadedInfo.backend
             )
+            if let streamingContext {
+                streamingContext.eventSink(.diagnostic(TranscriptionDiagnostic(
+                    source: "whisper.streaming",
+                    message: "suppressed blank chunk",
+                    time: streamingContext.chunkStartTime
+                )))
+            }
+            return WhisperRunResult(transcript: transcript)
         }
 
         let status = WhisperBackend.ensureInitialized()
@@ -216,25 +322,26 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
 #if CARBOCATION_HAS_WHISPER_C_API
         let normalizedAudio = try normalizeAudio(audio)
         guard !normalizedAudio.samples.isEmpty else {
-            return Transcript(
+            return WhisperRunResult(transcript: Transcript(
                 segments: [],
                 duration: normalizedAudio.duration,
                 backend: loadedInfo.backend
-            )
+            ))
         }
         guard normalizedAudio.samples.count <= Int(Int32.max) else {
             throw WhisperEngineError.invalidSampleCount(normalizedAudio.samples.count)
         }
 
         let context = try ensureContext(for: loadedInfo)
-        let transcript = try runWhisper(
+        return try runWhisper(
             context: context,
             audio: normalizedAudio,
             options: options,
-            backend: loadedInfo.backend
+            backend: loadedInfo.backend,
+            streamingContext: streamingContext
         )
-        return transcript
 #else
+        _ = streamingContext
         throw WhisperEngineError.runtimeUnavailable(status)
 #endif
     }
@@ -260,19 +367,240 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
         if effectiveOptions.commitment == .automatic {
             effectiveOptions.commitment = .localAgreement(iterations: 2)
         }
+        let resolvedOptions = effectiveOptions
 
         let engine = self
-        return SpeechChunkStreamingPipeline.stream(
-            audio: audio,
-            backend: loadedInfo.backend,
-            options: effectiveOptions
-        ) { audio, transcriptionOptions in
-            try await engine.transcribe(audio: audio, options: transcriptionOptions)
+        let streamingState = WhisperStreamingSessionState()
+        let tuning = WhisperStreamingDecodeTuning.resolve(for: resolvedOptions)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                let pipelineStream = SpeechChunkStreamingPipeline.stream(
+                    audio: audio,
+                    backend: loadedInfo.backend,
+                    options: resolvedOptions,
+                    transcribeTimed: { emitted, transcriptionOptions in
+                        let context = WhisperStreamingRunContext(
+                            chunkStartTime: emitted.startTime,
+                            chunkDuration: emitted.audio.duration,
+                            tuning: tuning,
+                            sessionState: streamingState,
+                            eventSink: { event in
+                                continuation.yield(event)
+                            }
+                        )
+                        return try await engine.transcribeStreamingChunk(
+                            emitted.audio,
+                            options: transcriptionOptions,
+                            context: context
+                        )
+                    })
+
+                do {
+                    for try await event in pipelineStream {
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                streamingState.cancel()
+                task.cancel()
+            }
         }
+    }
+
+    private func transcribeStreamingChunk(
+        _ audio: PreparedAudio,
+        options: TranscriptionOptions,
+        context: WhisperStreamingRunContext
+    ) throws -> Transcript {
+        try Task.checkCancellation()
+        context.eventSink(.diagnostic(TranscriptionDiagnostic(
+            source: "whisper.streaming",
+            message: "chunk duration=\(audio.duration.formattedWhisperDebug)s audio_ctx=\(context.tuning.audioContext) max_tokens=\(context.tuning.maxTokens) single_segment=\(context.tuning.singleSegment) prompt_tokens=\(context.sessionState.promptTokenCount)",
+            time: context.chunkStartTime
+        )))
+        return try transcribePreparedAudio(audio, options: options, streamingContext: context).transcript
     }
 }
 
 #if CARBOCATION_HAS_WHISPER_C_API
+private final class WhisperStreamingCallbackBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private let chunkStartTime: TimeInterval
+    private let chunkDuration: TimeInterval
+    private let includeWords: Bool
+    private let eventSink: @Sendable (TranscriptEvent) -> Void
+    private var deliveredSegmentCount = 0
+    private var pendingPartialID: UUID?
+    private var lastProgressBucket = -1
+
+    init(
+        chunkStartTime: TimeInterval,
+        chunkDuration: TimeInterval,
+        includeWords: Bool,
+        eventSink: @escaping @Sendable (TranscriptEvent) -> Void
+    ) {
+        self.chunkStartTime = chunkStartTime
+        self.chunkDuration = chunkDuration
+        self.includeWords = includeWords
+        self.eventSink = eventSink
+    }
+
+    func emitNewSegments(context: OpaquePointer, state: OpaquePointer, nNew: Int32) {
+        let total = max(0, Int(whisper_full_n_segments_from_state(state)))
+        let requestedStart = max(0, total - max(0, Int(nNew)))
+
+        let event: TranscriptEvent?
+        lock.lock()
+        let start = max(deliveredSegmentCount, requestedStart)
+        guard start < total else {
+            lock.unlock()
+            return
+        }
+        let segments = (start..<total).compactMap { segmentIndex in
+            Self.segment(
+                context: context,
+                state: state,
+                index: segmentIndex,
+                includeWords: includeWords,
+                offset: chunkStartTime
+            )
+        }
+        deliveredSegmentCount = total
+        guard let first = segments.first,
+              let last = segments.last else {
+            lock.unlock()
+            return
+        }
+        let partial = TranscriptPartial(
+            text: segments.map(\.text).joined(separator: " "),
+            startTime: first.startTime,
+            endTime: last.endTime,
+            stability: 0.35
+        )
+        if let pendingPartialID {
+            event = .revision(TranscriptRevision(
+                replacesPartialID: pendingPartialID,
+                replacement: partial
+            ))
+        } else {
+            event = .partial(partial)
+        }
+        pendingPartialID = partial.id
+        lock.unlock()
+
+        if let event {
+            eventSink(event)
+        }
+    }
+
+    func emitProgress(_ progress: Int32) {
+        let bucket = Int(progress / 10)
+        let event: TranscriptEvent?
+        lock.lock()
+        guard bucket > lastProgressBucket || progress >= 100 else {
+            lock.unlock()
+            return
+        }
+        lastProgressBucket = bucket
+        let processed = chunkStartTime + chunkDuration * min(1, max(0, Double(progress) / 100))
+        event = .progress(TranscriptionProgress(processedDuration: processed))
+        lock.unlock()
+
+        if let event {
+            eventSink(event)
+        }
+    }
+
+    private static func segment(
+        context: OpaquePointer,
+        state: OpaquePointer,
+        index: Int,
+        includeWords: Bool,
+        offset: TimeInterval
+    ) -> TranscriptSegment? {
+        let textPointer = whisper_full_get_segment_text_from_state(state, Int32(index))
+        let text = textPointer.map { String(cString: $0) } ?? ""
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let startTime = whisperTimeToSeconds(whisper_full_get_segment_t0_from_state(state, Int32(index))) + offset
+        let endTime = whisperTimeToSeconds(whisper_full_get_segment_t1_from_state(state, Int32(index))) + offset
+        return TranscriptSegment(
+            text: text,
+            startTime: startTime,
+            endTime: max(startTime, endTime),
+            words: includeWords ? words(context: context, state: state, segmentIndex: index, offset: offset) : [],
+            confidence: averageConfidence(state: state, segmentIndex: index)
+        )
+    }
+
+    private static func words(
+        context: OpaquePointer,
+        state: OpaquePointer,
+        segmentIndex: Int,
+        offset: TimeInterval
+    ) -> [TranscriptWord] {
+        let count = max(0, Int(whisper_full_n_tokens_from_state(state, Int32(segmentIndex))))
+        var words: [TranscriptWord] = []
+        words.reserveCapacity(count)
+
+        for tokenIndex in 0..<count {
+            let data = whisper_full_get_token_data_from_state(state, Int32(segmentIndex), Int32(tokenIndex))
+            guard data.t0 >= 0, data.t1 >= data.t0 else { continue }
+
+            let textPointer = whisper_full_get_token_text_from_state(context, state, Int32(segmentIndex), Int32(tokenIndex))
+            let text = textPointer.map { String(cString: $0) } ?? ""
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+
+            words.append(TranscriptWord(
+                text: text,
+                startTime: whisperTimeToSeconds(data.t0) + offset,
+                endTime: whisperTimeToSeconds(data.t1) + offset,
+                confidence: Double(data.p)
+            ))
+        }
+
+        return words
+    }
+
+    private static func averageConfidence(state: OpaquePointer, segmentIndex: Int) -> Double? {
+        let count = max(0, Int(whisper_full_n_tokens_from_state(state, Int32(segmentIndex))))
+        guard count > 0 else { return nil }
+
+        var total: Float = 0
+        for tokenIndex in 0..<count {
+            total += whisper_full_get_token_p_from_state(state, Int32(segmentIndex), Int32(tokenIndex))
+        }
+        return Double(total / Float(count))
+    }
+
+    private static func whisperTimeToSeconds(_ value: Int64) -> TimeInterval {
+        Double(value) / 100
+    }
+}
+
+private let whisperStreamingNewSegmentCallback: whisper_new_segment_callback = { context, state, nNew, userData in
+    guard let context, let state, let userData else { return }
+    let box = Unmanaged<WhisperStreamingCallbackBox>.fromOpaque(userData).takeUnretainedValue()
+    box.emitNewSegments(context: context, state: state, nNew: nNew)
+}
+
+private let whisperStreamingProgressCallback: whisper_progress_callback = { _, _, progress, userData in
+    guard let userData else { return }
+    let box = Unmanaged<WhisperStreamingCallbackBox>.fromOpaque(userData).takeUnretainedValue()
+    box.emitProgress(progress)
+}
+
+private let whisperStreamingAbortCallback: ggml_abort_callback = { userData in
+    guard let userData else { return false }
+    let state = Unmanaged<WhisperStreamingSessionState>.fromOpaque(userData).takeUnretainedValue()
+    return state.isCancelled
+}
+
 private extension WhisperEngine {
     func ensureContext(for loadedInfo: WhisperLoadedModelInfo) throws -> OpaquePointer {
         if let context, contextModelPath == loadedInfo.modelPath {
@@ -335,47 +663,115 @@ private extension WhisperEngine {
         context: OpaquePointer,
         audio: PreparedAudio,
         options: TranscriptionOptions,
-        backend: SpeechBackendDescriptor
-    ) throws -> Transcript {
+        backend: SpeechBackendDescriptor,
+        streamingContext: WhisperStreamingRunContext?
+    ) throws -> WhisperRunResult {
         let language = normalizedLanguage(options.language ?? loadedConfiguration?.language)
         let prompt = normalizedPrompt(options)
+        let streamingPromptTokens = streamingContext.map {
+            promptTokens(
+                context: context,
+                prompt: prompt,
+                streamingContext: $0
+            )
+        }
 
         return try withOptionalCString(language) { languagePointer in
-            try withOptionalCString(prompt) { promptPointer in
-                var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
-                params.n_threads = threadCount()
-                params.translate = options.task == .translate
-                params.no_timestamps = false
-                params.token_timestamps = options.timestampMode == .words
-                params.print_special = false
-                params.print_progress = false
-                params.print_realtime = false
-                params.print_timestamps = false
-                params.suppress_blank = options.suppressBlankAudio
-                params.language = languagePointer
-                params.detect_language = languagePointer == nil
-                params.initial_prompt = promptPointer
-                if let temperature = options.temperature {
-                    params.temperature = Float(temperature)
-                }
-
-                let result = audio.samples.withUnsafeBufferPointer { buffer in
-                    whisper_full(context, params, buffer.baseAddress, Int32(buffer.count))
-                }
-                guard result == 0 else {
-                    throw WhisperEngineError.transcriptionFailed(result)
-                }
-
-                return Transcript(
-                    segments: transcriptSegments(
+            try withOptionalCString(streamingPromptTokens?.isEmpty == false ? nil : prompt) { promptPointer in
+                try withPromptTokens(streamingPromptTokens ?? []) { promptTokenPointer, promptTokenCount in
+                    var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
+                    params.n_threads = threadCount()
+                    params.translate = options.task == .translate
+                    params.no_timestamps = false
+                    params.token_timestamps = options.timestampMode == .words
+                    params.print_special = false
+                    params.print_progress = false
+                    params.print_realtime = false
+                    params.print_timestamps = false
+                    params.suppress_blank = options.suppressBlankAudio
+                    params.language = languagePointer
+                    params.detect_language = languagePointer == nil
+                    params.initial_prompt = promptPointer
+                    params.prompt_tokens = promptTokenPointer
+                    params.prompt_n_tokens = promptTokenCount
+                    if let temperature = options.temperature {
+                        params.temperature = Float(temperature)
+                    }
+                    applyStreamingContext(
+                        streamingContext,
+                        to: &params,
                         context: context,
                         includeWords: options.timestampMode == .words
-                    ),
-                    language: detectedLanguage(context: context),
-                    duration: audio.duration,
-                    backend: backend
-                )
+                    )
+
+                    let callbackBox = streamingContext.map {
+                        WhisperStreamingCallbackBox(
+                            chunkStartTime: $0.chunkStartTime,
+                            chunkDuration: audio.duration,
+                            includeWords: options.timestampMode == .words,
+                            eventSink: $0.eventSink
+                        )
+                    }
+                    if let callbackBox {
+                        params.new_segment_callback = whisperStreamingNewSegmentCallback
+                        params.new_segment_callback_user_data = Unmanaged.passUnretained(callbackBox).toOpaque()
+                        params.progress_callback = whisperStreamingProgressCallback
+                        params.progress_callback_user_data = Unmanaged.passUnretained(callbackBox).toOpaque()
+                    }
+                    if let sessionState = streamingContext?.sessionState {
+                        params.abort_callback = whisperStreamingAbortCallback
+                        params.abort_callback_user_data = Unmanaged.passUnretained(sessionState).toOpaque()
+                    }
+
+                    let result = withExtendedLifetime(callbackBox) {
+                        withExtendedLifetime(streamingContext?.sessionState) {
+                            audio.samples.withUnsafeBufferPointer { buffer in
+                                whisper_full(context, params, buffer.baseAddress, Int32(buffer.count))
+                            }
+                        }
+                    }
+                    guard result == 0 else {
+                        if streamingContext?.sessionState.isCancelled == true {
+                            throw CancellationError()
+                        }
+                        throw WhisperEngineError.transcriptionFailed(result)
+                    }
+
+                    let transcript = Transcript(
+                        segments: transcriptSegments(
+                            context: context,
+                            includeWords: options.timestampMode == .words
+                        ),
+                        language: detectedLanguage(context: context),
+                        duration: audio.duration,
+                        backend: backend
+                    )
+                    let promptTokens = decodedPromptTokens(context: context)
+                    streamingContext?.sessionState.updatePromptTokens(
+                        promptTokens,
+                        limit: promptTokenLimit(context: context)
+                    )
+                    return WhisperRunResult(transcript: transcript, promptTokens: promptTokens)
+                }
             }
+        }
+    }
+
+    func applyStreamingContext(
+        _ streamingContext: WhisperStreamingRunContext?,
+        to params: inout whisper_full_params,
+        context: OpaquePointer,
+        includeWords: Bool
+    ) {
+        guard let streamingContext else { return }
+        let tuning = streamingContext.tuning
+        params.single_segment = tuning.singleSegment
+        params.max_tokens = tuning.maxTokens
+        params.no_context = true
+        params.carry_initial_prompt = false
+        params.audio_ctx = clampedAudioContext(tuning.audioContext, context: context)
+        if includeWords {
+            params.single_segment = false
         }
     }
 
@@ -403,6 +799,23 @@ private extension WhisperEngine {
         }
 
         return segments
+    }
+
+    func decodedPromptTokens(context: OpaquePointer) -> [whisper_token] {
+        let segmentCount = max(0, Int(whisper_full_n_segments(context)))
+        let eot = whisper_token_eot(context)
+        var tokens: [whisper_token] = []
+
+        for segmentIndex in 0..<segmentCount {
+            let tokenCount = max(0, Int(whisper_full_n_tokens(context, Int32(segmentIndex))))
+            for tokenIndex in 0..<tokenCount {
+                let id = whisper_full_get_token_id(context, Int32(segmentIndex), Int32(tokenIndex))
+                guard id >= 0, id < eot else { continue }
+                tokens.append(id)
+            }
+        }
+
+        return tokens
     }
 
     func transcriptWords(context: OpaquePointer, segmentIndex: Int) -> [TranscriptWord] {
@@ -481,6 +894,47 @@ private extension WhisperEngine {
         return pieces.joined(separator: "\n")
     }
 
+    func promptTokens(
+        context: OpaquePointer,
+        prompt: String?,
+        streamingContext: WhisperStreamingRunContext
+    ) -> [whisper_token] {
+        let explicitPromptTokens = prompt.map { tokenizePrompt($0, context: context) } ?? []
+        let previousTokens = streamingContext.sessionState.currentPromptTokens()
+        let combined = explicitPromptTokens + previousTokens
+        guard !combined.isEmpty else { return [] }
+        return Array(combined.suffix(promptTokenLimit(context: context)))
+    }
+
+    func tokenizePrompt(_ prompt: String, context: OpaquePointer) -> [whisper_token] {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        func tokenize(capacity: Int) -> (needed: Int32, tokens: [whisper_token]) {
+            var tokens = Array(repeating: whisper_token(0), count: capacity)
+            let needed = trimmed.withCString { pointer in
+                whisper_tokenize(context, pointer, &tokens, Int32(tokens.count))
+            }
+            return (needed, tokens)
+        }
+
+        var result = tokenize(capacity: 256)
+        if result.needed < 0 {
+            result = tokenize(capacity: Int(-result.needed))
+        }
+        guard result.needed > 0 else { return [] }
+        return Array(result.tokens.prefix(Int(result.needed)))
+    }
+
+    func promptTokenLimit(context: OpaquePointer) -> Int {
+        max(1, Int(whisper_n_text_ctx(context)) / 2 - 1)
+    }
+
+    func clampedAudioContext(_ requested: Int32, context: OpaquePointer) -> Int32 {
+        guard requested > 0 else { return 0 }
+        return min(requested, Int32(max(0, whisper_n_audio_ctx(context))))
+    }
+
     func whisperTimeToSeconds(_ value: Int64) -> TimeInterval {
         Double(value) / 100
     }
@@ -496,5 +950,23 @@ private extension WhisperEngine {
             try body(pointer)
         }
     }
+
+    func withPromptTokens<Result>(
+        _ tokens: [whisper_token],
+        _ body: (UnsafePointer<whisper_token>?, Int32) throws -> Result
+    ) rethrows -> Result {
+        guard !tokens.isEmpty else {
+            return try body(nil, 0)
+        }
+        return try tokens.withUnsafeBufferPointer { buffer in
+            try body(buffer.baseAddress, Int32(buffer.count))
+        }
+    }
 }
 #endif
+
+private extension Double {
+    var formattedWhisperDebug: String {
+        String(format: "%.3f", self)
+    }
+}

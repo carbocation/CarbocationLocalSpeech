@@ -193,16 +193,29 @@ struct whisper_context * whisper_init_from_file_with_params(const char * path_mo
 void whisper_free(struct whisper_context * ctx);
 struct whisper_full_params whisper_full_default_params(enum whisper_sampling_strategy strategy);
 int whisper_full(struct whisper_context * ctx, struct whisper_full_params params, const float * samples, int n_samples);
+int whisper_tokenize(struct whisper_context * ctx, const char * text, whisper_token * tokens, int n_max_tokens);
+int whisper_n_text_ctx(struct whisper_context * ctx);
+int whisper_n_audio_ctx(struct whisper_context * ctx);
+whisper_token whisper_token_eot(struct whisper_context * ctx);
 int whisper_full_n_segments(struct whisper_context * ctx);
+int whisper_full_n_segments_from_state(struct whisper_state * state);
 int whisper_full_lang_id(struct whisper_context * ctx);
 const char * whisper_lang_str(int id);
 int64_t whisper_full_get_segment_t0(struct whisper_context * ctx, int i_segment);
+int64_t whisper_full_get_segment_t0_from_state(struct whisper_state * state, int i_segment);
 int64_t whisper_full_get_segment_t1(struct whisper_context * ctx, int i_segment);
+int64_t whisper_full_get_segment_t1_from_state(struct whisper_state * state, int i_segment);
 const char * whisper_full_get_segment_text(struct whisper_context * ctx, int i_segment);
+const char * whisper_full_get_segment_text_from_state(struct whisper_state * state, int i_segment);
 int whisper_full_n_tokens(struct whisper_context * ctx, int i_segment);
+int whisper_full_n_tokens_from_state(struct whisper_state * state, int i_segment);
 const char * whisper_full_get_token_text(struct whisper_context * ctx, int i_segment, int i_token);
+const char * whisper_full_get_token_text_from_state(struct whisper_context * ctx, struct whisper_state * state, int i_segment, int i_token);
+whisper_token whisper_full_get_token_id(struct whisper_context * ctx, int i_segment, int i_token);
 whisper_token_data whisper_full_get_token_data(struct whisper_context * ctx, int i_segment, int i_token);
+whisper_token_data whisper_full_get_token_data_from_state(struct whisper_state * state, int i_segment, int i_token);
 float whisper_full_get_token_p(struct whisper_context * ctx, int i_segment, int i_token);
+float whisper_full_get_token_p_from_state(struct whisper_state * state, int i_segment, int i_token);
 void whisper_log_set(ggml_log_callback log_callback, void * user_data);
 
 #ifdef __cplusplus

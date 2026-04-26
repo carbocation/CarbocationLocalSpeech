@@ -1,4 +1,5 @@
 import XCTest
+@_spi(Internal)
 @testable import CarbocationLocalSpeech
 
 final class CarbocationLocalSpeechTests: XCTestCase {
@@ -311,12 +312,12 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let stream = SpeechChunkStreamingPipeline.stream(
             audio: audio,
             backend: backend,
-            options: options
-        ) { audio, _ in
-            Transcript(segments: [
-                TranscriptSegment(text: "hello", startTime: 0, endTime: audio.duration)
-            ])
-        }
+            options: options,
+            transcribe: { audio, _ in
+                Transcript(segments: [
+                    TranscriptSegment(text: "hello", startTime: 0, endTime: audio.duration)
+                ])
+            })
 
         for try await event in stream {
             events.append(event)
@@ -334,6 +335,51 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             }
             return false
         })
+    }
+
+    func testSpeechChunkStreamingPipelineTimedTranscriptionReceivesChunkStartTime() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 1_600),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 2.0,
+                duration: 0.1
+            ))
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            commitment: .immediate,
+            latencyPreset: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .vadUtterances(SpeechChunkingConfiguration(
+                    maximumChunkDuration: 0.1,
+                    overlapDuration: 0,
+                    silenceCommitDelay: 0.2,
+                    minimumSpeechDuration: 0.01
+                ))
+            )
+        )
+        let observedStart = SpeechChunkStreamingPipelineStartRecorder()
+
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { chunk, _ in
+                await observedStart.record(chunk.startTime)
+                return Transcript(segments: [
+                    TranscriptSegment(text: "hello", startTime: 0, endTime: chunk.audio.duration)
+                ])
+            }
+        )
+
+        for try await _ in stream {}
+
+        let recordedStartValue = await observedStart.recordedValue()
+        let recordedStart = try XCTUnwrap(recordedStartValue)
+        XCTAssertEqual(recordedStart, 2.0, accuracy: 0.000_1)
     }
 
     func testSpeechChunkStreamingPipelineTrimsCommittedOverlap() async throws {
@@ -374,18 +420,18 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let stream = SpeechChunkStreamingPipeline.stream(
             audio: audio,
             backend: backend,
-            options: options
-        ) { audio, _ in
-            if audio.duration < 0.5 {
-                return Transcript()
-            }
+            options: options,
+            transcribe: { audio, _ in
+                if audio.duration < 0.5 {
+                    return Transcript()
+                }
 
-            let callIndex = await callCounter.next()
-            let text = callIndex == 1 ? "apple speech." : "speech provider."
-            return Transcript(segments: [
-                TranscriptSegment(text: text, startTime: 0, endTime: audio.duration)
-            ])
-        }
+                let callIndex = await callCounter.next()
+                let text = callIndex == 1 ? "apple speech." : "speech provider."
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: audio.duration)
+                ])
+            })
 
         for try await event in stream {
             events.append(event)
@@ -440,14 +486,14 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let stream = SpeechChunkStreamingPipeline.stream(
             audio: audio,
             backend: backend,
-            options: options
-        ) { _, _ in
-            let callIndex = await callCounter.next()
-            let text = callIndex == 1 ? "hello speech" : "hello speech provider"
-            return Transcript(segments: [
-                TranscriptSegment(text: text, startTime: 0, endTime: 1)
-            ])
-        }
+            options: options,
+            transcribe: { _, _ in
+                let callIndex = await callCounter.next()
+                let text = callIndex == 1 ? "hello speech" : "hello speech provider"
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            })
 
         for try await event in stream {
             events.append(event)
@@ -484,5 +530,17 @@ private actor SpeechChunkStreamingPipelineCallCounter {
     func next() -> Int {
         value += 1
         return value
+    }
+}
+
+private actor SpeechChunkStreamingPipelineStartRecorder {
+    private var value: TimeInterval?
+
+    func record(_ value: TimeInterval) {
+        self.value = value
+    }
+
+    func recordedValue() -> TimeInterval? {
+        value
     }
 }
