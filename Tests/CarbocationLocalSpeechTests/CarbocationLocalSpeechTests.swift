@@ -70,6 +70,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let bundle = root.appendingPathComponent("bundle", isDirectory: true)
         try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
         try Data("weights".utf8).write(to: bundle.appendingPathComponent("ggml-small.en.bin"))
+        try Data("vad".utf8).write(to: bundle.appendingPathComponent("ggml-silero-v6.2.0.bin"))
         let coreML = bundle.appendingPathComponent("ggml-small.en-encoder.mlmodelc", isDirectory: true)
         try FileManager.default.createDirectory(at: coreML, withIntermediateDirectories: true)
         try Data("coreml".utf8).write(to: coreML.appendingPathComponent("model"))
@@ -82,6 +83,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             languageScope: .englishOnly,
             assets: [
                 SpeechModelAsset(role: .primaryWeights, relativePath: "ggml-small.en.bin", sizeBytes: 7),
+                SpeechModelAsset(role: .vadWeights, relativePath: "ggml-silero-v6.2.0.bin", sizeBytes: 3),
                 SpeechModelAsset(role: .coreMLEncoder, relativePath: "ggml-small.en-encoder.mlmodelc", sizeBytes: 6)
             ],
             source: .imported
@@ -90,8 +92,24 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let installed = try library.add(assetBundleAt: bundle, metadata: metadata)
 
         XCTAssertEqual(installed.id, id)
-        XCTAssertEqual(library.models.first?.assets.count, 2)
-        XCTAssertEqual(library.totalDiskUsageBytes(), 13)
+        XCTAssertEqual(library.models.first?.assets.count, 3)
+        XCTAssertEqual(library.totalDiskUsageBytes(), 16)
+    }
+
+    @MainActor
+    func testModelLibrarySynthesizesVADAssetForMetadataFreeFolders() throws {
+        let root = try makeTemporaryDirectory()
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let modelDirectory = modelsRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        try Data("weights".utf8).write(to: modelDirectory.appendingPathComponent("ggml-base.en.bin"))
+        try Data("vad".utf8).write(to: modelDirectory.appendingPathComponent("ggml-silero-v6.2.0.bin"))
+
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let model = try XCTUnwrap(library.models.first)
+
+        XCTAssertEqual(model.primaryWeightsAsset?.relativePath, "ggml-base.en.bin")
+        XCTAssertEqual(model.vadWeightsAsset?.relativePath, "ggml-silero-v6.2.0.bin")
     }
 
     func testHuggingFaceSpeechURLParsesExpectedForms() {
@@ -124,6 +142,14 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             base.downloadURL?.absoluteString,
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
         )
+
+        let vad = CuratedSpeechModelCatalog.recommendedVADModel
+        XCTAssertEqual(vad.hfRepo, "ggml-org/whisper-vad")
+        XCTAssertEqual(vad.hfFilename, "ggml-silero-v6.2.0.bin")
+        XCTAssertEqual(
+            vad.downloadURL?.absoluteString,
+            "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin"
+        )
     }
 
     func testRecommendedCuratedModelPrefersLargerModelWhenRAMTierTies() throws {
@@ -154,11 +180,22 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(capped.parallelConnections, SpeechModelDownloadConfiguration.maximumParallelConnections)
     }
 
+    func testVoiceActivityDetectionOptionsDefaultToAutomaticMediumSensitivity() {
+        let defaults = TranscriptionOptions().voiceActivityDetection
+        XCTAssertEqual(defaults.mode, .automatic)
+        XCTAssertEqual(defaults.sensitivity, .medium)
+
+        let disabled = TranscriptionOptions(voiceActivityDetection: .disabled)
+        XCTAssertEqual(disabled.voiceActivityDetection.mode, .disabled)
+    }
+
     @MainActor
     func testModelLibraryAddsDownloadedPartialUsingRequestedFilename() throws {
         let root = try makeTemporaryDirectory()
         let partial = root.appendingPathComponent("cls-partial-abcdef.bin")
         try Data("downloaded whisper weights".utf8).write(to: partial)
+        let vadPartial = root.appendingPathComponent("cls-partial-vad.bin")
+        try Data("downloaded vad weights".utf8).write(to: vadPartial)
 
         let library = SpeechModelLibrary(root: root.appendingPathComponent("SpeechModels", isDirectory: true))
         let model = try library.add(
@@ -167,12 +204,17 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             filename: "ggml-base.en.bin",
             source: .curated,
             hfRepo: "ggerganov/whisper.cpp",
-            hfFilename: "ggml-base.en.bin"
+            hfFilename: "ggml-base.en.bin",
+            vadAssetAt: vadPartial,
+            vadFilename: "ggml-silero-v6.2.0.bin"
         )
 
         XCTAssertEqual(model.primaryWeightsAsset?.relativePath, "ggml-base.en.bin")
+        XCTAssertEqual(model.vadWeightsAsset?.relativePath, "ggml-silero-v6.2.0.bin")
         XCTAssertTrue(FileManager.default.fileExists(atPath: model.primaryWeightsURL(in: library.root)!.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: model.vadWeightsURL(in: library.root)!.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: vadPartial.path))
     }
 
     func testPartialDownloadListingAndDeletion() throws {

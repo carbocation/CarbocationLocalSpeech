@@ -41,6 +41,7 @@ public struct WhisperLoadConfiguration: Hashable, Sendable {
 public struct WhisperLoadedModelInfo: Hashable, Sendable {
     public var modelID: UUID?
     public var modelPath: String
+    public var vadModelPath: String?
     public var displayName: String?
     public var backend: SpeechBackendDescriptor
     public var capabilities: SpeechModelCapabilities
@@ -48,12 +49,14 @@ public struct WhisperLoadedModelInfo: Hashable, Sendable {
     public init(
         modelID: UUID?,
         modelPath: String,
+        vadModelPath: String? = nil,
         displayName: String?,
         backend: SpeechBackendDescriptor,
         capabilities: SpeechModelCapabilities
     ) {
         self.modelID = modelID
         self.modelPath = modelPath
+        self.vadModelPath = vadModelPath
         self.displayName = displayName
         self.backend = backend
         self.capabilities = capabilities
@@ -242,6 +245,10 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             throw WhisperEngineError.modelFileMissing(modelURL)
         }
+        let resolvedVADModelURL = model.vadWeightsURL(in: root)
+        let vadModelPath = resolvedVADModelURL.flatMap {
+            FileManager.default.fileExists(atPath: $0.path) ? $0.path : nil
+        }
 
         let backend = SpeechBackendDescriptor(
             kind: .whisperCpp,
@@ -252,6 +259,7 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
         let info = WhisperLoadedModelInfo(
             modelID: model.id,
             modelPath: modelURL.path,
+            vadModelPath: vadModelPath,
             displayName: model.displayName,
             backend: backend,
             capabilities: model.capabilities
@@ -338,6 +346,7 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
             audio: normalizedAudio,
             options: options,
             backend: loadedInfo.backend,
+            vadModelPath: loadedInfo.vadModelPath,
             streamingContext: streamingContext
         )
 #else
@@ -664,6 +673,7 @@ private extension WhisperEngine {
         audio: PreparedAudio,
         options: TranscriptionOptions,
         backend: SpeechBackendDescriptor,
+        vadModelPath: String?,
         streamingContext: WhisperStreamingRunContext?
     ) throws -> WhisperRunResult {
         let language = normalizedLanguage(options.language ?? loadedConfiguration?.language)
@@ -678,80 +688,87 @@ private extension WhisperEngine {
 
         return try withOptionalCString(language) { languagePointer in
             try withOptionalCString(streamingPromptTokens?.isEmpty == false ? nil : prompt) { promptPointer in
-                try withPromptTokens(streamingPromptTokens ?? []) { promptTokenPointer, promptTokenCount in
-                    var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
-                    params.n_threads = threadCount()
-                    params.translate = options.task == .translate
-                    params.no_timestamps = false
-                    params.token_timestamps = options.timestampMode == .words
-                    params.print_special = false
-                    params.print_progress = false
-                    params.print_realtime = false
-                    params.print_timestamps = false
-                    params.suppress_blank = options.suppressBlankAudio
-                    params.language = languagePointer
-                    params.detect_language = languagePointer == nil
-                    params.initial_prompt = promptPointer
-                    params.prompt_tokens = promptTokenPointer
-                    params.prompt_n_tokens = promptTokenCount
-                    if let temperature = options.temperature {
-                        params.temperature = Float(temperature)
-                    }
-                    applyStreamingContext(
-                        streamingContext,
-                        to: &params,
-                        context: context,
-                        includeWords: options.timestampMode == .words
-                    )
-
-                    let callbackBox = streamingContext.map {
-                        WhisperStreamingCallbackBox(
-                            chunkStartTime: $0.chunkStartTime,
-                            chunkDuration: audio.duration,
-                            includeWords: options.timestampMode == .words,
-                            eventSink: $0.eventSink
-                        )
-                    }
-                    if let callbackBox {
-                        params.new_segment_callback = whisperStreamingNewSegmentCallback
-                        params.new_segment_callback_user_data = Unmanaged.passUnretained(callbackBox).toOpaque()
-                        params.progress_callback = whisperStreamingProgressCallback
-                        params.progress_callback_user_data = Unmanaged.passUnretained(callbackBox).toOpaque()
-                    }
-                    if let sessionState = streamingContext?.sessionState {
-                        params.abort_callback = whisperStreamingAbortCallback
-                        params.abort_callback_user_data = Unmanaged.passUnretained(sessionState).toOpaque()
-                    }
-
-                    let result = withExtendedLifetime(callbackBox) {
-                        withExtendedLifetime(streamingContext?.sessionState) {
-                            audio.samples.withUnsafeBufferPointer { buffer in
-                                whisper_full(context, params, buffer.baseAddress, Int32(buffer.count))
-                            }
+                try withOptionalCString(vadModelPath) { vadModelPathPointer in
+                    try withPromptTokens(streamingPromptTokens ?? []) { promptTokenPointer, promptTokenCount in
+                        var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
+                        params.n_threads = threadCount()
+                        params.translate = options.task == .translate
+                        params.no_timestamps = false
+                        params.token_timestamps = options.timestampMode == .words
+                        params.print_special = false
+                        params.print_progress = false
+                        params.print_realtime = false
+                        params.print_timestamps = false
+                        params.suppress_blank = options.suppressBlankAudio
+                        params.language = languagePointer
+                        params.detect_language = languagePointer == nil
+                        params.initial_prompt = promptPointer
+                        params.prompt_tokens = promptTokenPointer
+                        params.prompt_n_tokens = promptTokenCount
+                        if let vadModelPathPointer,
+                           shouldUseModelVAD(options: options, isStreaming: streamingContext != nil) {
+                            params.vad = true
+                            params.vad_model_path = vadModelPathPointer
                         }
-                    }
-                    guard result == 0 else {
-                        if streamingContext?.sessionState.isCancelled == true {
-                            throw CancellationError()
+                        if let temperature = options.temperature {
+                            params.temperature = Float(temperature)
                         }
-                        throw WhisperEngineError.transcriptionFailed(result)
-                    }
-
-                    let transcript = Transcript(
-                        segments: transcriptSegments(
+                        applyStreamingContext(
+                            streamingContext,
+                            to: &params,
                             context: context,
                             includeWords: options.timestampMode == .words
-                        ),
-                        language: detectedLanguage(context: context),
-                        duration: audio.duration,
-                        backend: backend
-                    )
-                    let promptTokens = decodedPromptTokens(context: context)
-                    streamingContext?.sessionState.updatePromptTokens(
-                        promptTokens,
-                        limit: promptTokenLimit(context: context)
-                    )
-                    return WhisperRunResult(transcript: transcript, promptTokens: promptTokens)
+                        )
+
+                        let callbackBox = streamingContext.map {
+                            WhisperStreamingCallbackBox(
+                                chunkStartTime: $0.chunkStartTime,
+                                chunkDuration: audio.duration,
+                                includeWords: options.timestampMode == .words,
+                                eventSink: $0.eventSink
+                            )
+                        }
+                        if let callbackBox {
+                            params.new_segment_callback = whisperStreamingNewSegmentCallback
+                            params.new_segment_callback_user_data = Unmanaged.passUnretained(callbackBox).toOpaque()
+                            params.progress_callback = whisperStreamingProgressCallback
+                            params.progress_callback_user_data = Unmanaged.passUnretained(callbackBox).toOpaque()
+                        }
+                        if let sessionState = streamingContext?.sessionState {
+                            params.abort_callback = whisperStreamingAbortCallback
+                            params.abort_callback_user_data = Unmanaged.passUnretained(sessionState).toOpaque()
+                        }
+
+                        let result = withExtendedLifetime(callbackBox) {
+                            withExtendedLifetime(streamingContext?.sessionState) {
+                                audio.samples.withUnsafeBufferPointer { buffer in
+                                    whisper_full(context, params, buffer.baseAddress, Int32(buffer.count))
+                                }
+                            }
+                        }
+                        guard result == 0 else {
+                            if streamingContext?.sessionState.isCancelled == true {
+                                throw CancellationError()
+                            }
+                            throw WhisperEngineError.transcriptionFailed(result)
+                        }
+
+                        let transcript = Transcript(
+                            segments: transcriptSegments(
+                                context: context,
+                                includeWords: options.timestampMode == .words
+                            ),
+                            language: detectedLanguage(context: context),
+                            duration: audio.duration,
+                            backend: backend
+                        )
+                        let promptTokens = decodedPromptTokens(context: context)
+                        streamingContext?.sessionState.updatePromptTokens(
+                            promptTokens,
+                            limit: promptTokenLimit(context: context)
+                        )
+                        return WhisperRunResult(transcript: transcript, promptTokens: promptTokens)
+                    }
                 }
             }
         }
@@ -772,6 +789,17 @@ private extension WhisperEngine {
         params.audio_ctx = clampedAudioContext(tuning.audioContext, context: context)
         if includeWords {
             params.single_segment = false
+        }
+    }
+
+    func shouldUseModelVAD(options: TranscriptionOptions, isStreaming: Bool) -> Bool {
+        switch options.voiceActivityDetection.mode {
+        case .enabled:
+            return true
+        case .disabled:
+            return false
+        case .automatic:
+            return isStreaming && options.useCase == .dictation
         }
     }
 

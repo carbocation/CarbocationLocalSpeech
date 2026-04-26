@@ -154,6 +154,8 @@ print(transcript.text)
 
 Apple Speech does not support every Whisper option. For example, translation and word timestamps are rejected for Apple Speech. Check `LocalSpeechEngine.capabilities(for:in:)` before exposing provider-specific controls.
 
+Model-backed VAD is request-configurable with `TranscriptionOptions.voiceActivityDetection`. The default `.automatic` policy uses model VAD for live dictation-style streams and avoids it for file transcription; use `.enabled` or `.disabled` when the accuracy/power tradeoff should be explicit.
+
 ### Install a Whisper Model
 
 The SwiftUI picker can import local `.bin` files, download curated Whisper models, resume interrupted downloads, and delete installed models. Use it directly in a settings surface:
@@ -195,6 +197,14 @@ let downloaded = try await SpeechModelDownloader.download(
     displayName: catalogModel.displayName,
     expectedSHA256: catalogModel.sha256
 )
+let vadModel = CuratedSpeechModelCatalog.recommendedVADModel
+let downloadedVAD = try await SpeechModelDownloader.download(
+    hfRepo: vadModel.hfRepo,
+    hfFilename: vadModel.hfFilename,
+    modelsRoot: speechModelLibrary.root,
+    displayName: vadModel.displayName,
+    expectedSHA256: vadModel.sha256
+)
 
 let installed = try await MainActor.run {
     try speechModelLibrary.add(
@@ -206,7 +216,10 @@ let installed = try await MainActor.run {
         hfRepo: catalogModel.hfRepo,
         hfFilename: catalogModel.hfFilename,
         sha256: downloaded.sha256,
-        capabilities: catalogModel.capabilities
+        capabilities: catalogModel.capabilities,
+        vadAssetAt: downloadedVAD.tempURL,
+        vadFilename: vadModel.hfFilename,
+        vadSHA256: downloadedVAD.sha256
     )
 }
 

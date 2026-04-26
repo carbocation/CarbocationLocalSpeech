@@ -350,6 +350,31 @@ extension AppleSpeechEngine {
     }
 
     @available(macOS 26.0, *)
+    private nonisolated static func speechDetectionOptions(for options: VoiceActivityDetectionOptions) -> Speech.SpeechDetector.DetectionOptions {
+        let sensitivity: Speech.SpeechDetector.SensitivityLevel
+        switch options.sensitivity {
+        case .low:
+            sensitivity = .low
+        case .medium:
+            sensitivity = .medium
+        case .high:
+            sensitivity = .high
+        }
+        return Speech.SpeechDetector.DetectionOptions(sensitivityLevel: sensitivity)
+    }
+
+    private nonisolated static func shouldUseModelVAD(options: TranscriptionOptions, isStreaming: Bool) -> Bool {
+        switch options.voiceActivityDetection.mode {
+        case .enabled:
+            return true
+        case .disabled:
+            return false
+        case .automatic:
+            return isStreaming && options.useCase == .dictation
+        }
+    }
+
+    @available(macOS 26.0, *)
     private nonisolated static func availabilityForAssets(supporting modules: [any Speech.SpeechModule]) async -> SpeechProviderAvailability {
         let status = await Speech.AssetInventory.status(forModules: modules)
         switch status {
@@ -388,8 +413,16 @@ extension AppleSpeechEngine {
             ? .timeIndexedProgressiveTranscription
             : .transcription
         let transcriber = Speech.SpeechTranscriber(locale: supportedLocale, preset: preset)
-        try await ensureAssetsInstalled(supporting: [transcriber])
-        let analyzer = Speech.SpeechAnalyzer(modules: [transcriber])
+        var modules: [any Speech.SpeechModule] = [transcriber]
+        if shouldUseModelVAD(options: options, isStreaming: false) {
+            let speechDetector = Speech.SpeechDetector(
+                detectionOptions: speechDetectionOptions(for: options.voiceActivityDetection),
+                reportResults: false
+            )
+            modules = [speechDetector, transcriber]
+        }
+        try await ensureAssetsInstalled(supporting: modules)
+        let analyzer = Speech.SpeechAnalyzer(modules: modules)
         let context = Speech.AnalysisContext()
         if !options.contextualStrings.isEmpty {
             context.contextualStrings[.general] = options.contextualStrings
@@ -456,7 +489,34 @@ extension AppleSpeechEngine {
                     }
 
                     let transcriber = Speech.DictationTranscriber(locale: supportedLocale, preset: liveDictationPreset())
-                    let modules: [any Speech.SpeechModule] = [transcriber]
+                    var speechDetector: Speech.SpeechDetector?
+                    var modules: [any Speech.SpeechModule] = [transcriber]
+                    if shouldUseModelVAD(options: options.transcription, isStreaming: true) {
+                        let candidate = Speech.SpeechDetector(
+                            detectionOptions: speechDetectionOptions(for: options.transcription.voiceActivityDetection),
+                            reportResults: true
+                        )
+                        let candidateModules: [any Speech.SpeechModule] = [candidate, transcriber]
+                        switch options.transcription.voiceActivityDetection.mode {
+                        case .enabled:
+                            try await ensureAssetsInstalled(supporting: candidateModules)
+                            speechDetector = candidate
+                            modules = candidateModules
+                        case .automatic:
+                            let availability = await availabilityForAssets(supporting: candidateModules)
+                            if availability.isAvailable {
+                                speechDetector = candidate
+                                modules = candidateModules
+                            } else {
+                                continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                                    source: "apple.vad",
+                                    message: "SpeechDetector unavailable; falling back to energy voice activity events"
+                                )))
+                            }
+                        case .disabled:
+                            break
+                        }
+                    }
                     try await ensureAssetsInstalled(supporting: modules)
                     guard let analysisFormat = await Speech.SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: modules) else {
                         throw AppleSpeechEngineError.audioEncodingFailed
@@ -481,7 +541,7 @@ extension AppleSpeechEngine {
                     continuation.yield(.started(backend))
                     continuation.yield(.diagnostic(TranscriptionDiagnostic(
                         source: "apple.analyzer",
-                        message: "module=DictationTranscriber locale=\(supportedLocale.identifier) format=\(describe(format: analysisFormat))"
+                        message: "modules=\(speechDetector == nil ? "DictationTranscriber" : "SpeechDetector,DictationTranscriber") locale=\(supportedLocale.identifier) format=\(describe(format: analysisFormat))"
                     )))
                     try await analyzer.prepareToAnalyze(in: analysisFormat)
                     continuation.yield(.diagnostic(TranscriptionDiagnostic(
@@ -546,6 +606,19 @@ extension AppleSpeechEngine {
                         return committedSegments
                     }
 
+                    let detectorCollector: Task<Void, Error>? = speechDetector.map { detector in
+                        Task {
+                            for try await result in detector.results {
+                                try Task.checkCancellation()
+                                continuation.yield(.voiceActivity(VoiceActivityEvent(
+                                    state: result.speechDetected ? .speech : .silence,
+                                    startTime: result.range.start.seconds.finiteOrZero,
+                                    endTime: result.range.end.seconds.finiteOrZero
+                                )))
+                            }
+                        }
+                    }
+
                     let analyzerTask = Task {
                         if let lastSampleTime = try await analyzer.analyzeSequence(inputStream) {
                             try await analyzer.finalizeAndFinish(through: lastSampleTime)
@@ -585,18 +658,21 @@ extension AppleSpeechEngine {
                         inputContinuation?.finish()
                         analyzerTask.cancel()
                         collector.cancel()
+                        detectorCollector?.cancel()
                         analyzerMonitor.cancel()
                         collectorMonitor.cancel()
                     }
 
                     var processedDuration: TimeInterval = 0
                     var inputCount = 0
-                    let detector = EnergyVoiceActivityDetector()
+                    let fallbackDetector = EnergyVoiceActivityDetector()
                     for try await chunk in audio {
                         try Task.checkCancellation()
 
                         continuation.yield(.audioLevel(AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)))
-                        continuation.yield(.voiceActivity(try detector.analyze(chunk)))
+                        if speechDetector == nil {
+                            continuation.yield(.voiceActivity(try fallbackDetector.analyze(chunk)))
+                        }
                         let converted = try buffer(from: chunk, outputFormat: analysisFormat)
                         processedDuration = max(processedDuration, converted.startTime + Double(converted.buffer.frameLength) / converted.buffer.format.sampleRate)
                         continuation.yield(.progress(TranscriptionProgress(processedDuration: processedDuration)))
@@ -622,6 +698,9 @@ extension AppleSpeechEngine {
 
                     inputContinuation?.finish()
                     try await analyzerTask.value
+                    if let detectorCollector {
+                        try await detectorCollector.value
+                    }
                     let committedSegments = try await collector.value
                     continuation.yield(.completed(Transcript(
                         segments: committedSegments,

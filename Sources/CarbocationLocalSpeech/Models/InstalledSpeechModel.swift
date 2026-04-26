@@ -30,6 +30,7 @@ public struct SpeechModelAsset: Codable, Hashable, Sendable {
     public enum Role: String, Codable, Hashable, Sendable {
         case primaryWeights
         case coreMLEncoder
+        case vadWeights
         case vocabulary
         case configuration
         case diarizationWeights
@@ -113,6 +114,10 @@ public struct InstalledSpeechModel: Identifiable, Codable, Hashable, Sendable {
         assets.first { $0.role == .primaryWeights }
     }
 
+    public var vadWeightsAsset: SpeechModelAsset? {
+        assets.first { $0.role == .vadWeights }
+    }
+
     public func directory(in root: URL) -> URL {
         root.appendingPathComponent(id.uuidString, isDirectory: true)
     }
@@ -127,6 +132,10 @@ public struct InstalledSpeechModel: Identifiable, Codable, Hashable, Sendable {
 
     public func primaryWeightsURL(in root: URL) -> URL? {
         primaryWeightsAsset.map { assetURL($0, in: root) }
+    }
+
+    public func vadWeightsURL(in root: URL) -> URL? {
+        vadWeightsAsset.map { assetURL($0, in: root) }
     }
 
     public static func inferLanguageScope(from filename: String) -> SpeechLanguageScope {

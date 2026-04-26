@@ -62,8 +62,46 @@ public struct CuratedSpeechModel: Identifiable, Hashable, Sendable {
     }
 }
 
+public struct CuratedSpeechVADModel: Identifiable, Hashable, Sendable {
+    public var id: String
+    public var displayName: String
+    public var hfRepo: String
+    public var hfFilename: String
+    public var approxSizeBytes: Int64
+    public var sha256: String?
+
+    public init(
+        id: String,
+        displayName: String,
+        hfRepo: String,
+        hfFilename: String,
+        approxSizeBytes: Int64,
+        sha256: String? = nil
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.hfRepo = hfRepo
+        self.hfFilename = hfFilename
+        self.approxSizeBytes = approxSizeBytes
+        self.sha256 = sha256
+    }
+
+    public var downloadURL: URL? {
+        CuratedSpeechModel.huggingFaceResolveURL(repo: hfRepo, filename: hfFilename)
+    }
+}
+
 public enum CuratedSpeechModelCatalog {
     private static let whisperCppRepo = "ggerganov/whisper.cpp"
+    private static let whisperVADRepo = "ggml-org/whisper-vad"
+
+    public static let recommendedVADModel = CuratedSpeechVADModel(
+        id: "silero-v6.2.0",
+        displayName: "Silero VAD v6.2.0",
+        hfRepo: whisperVADRepo,
+        hfFilename: "ggml-silero-v6.2.0.bin",
+        approxSizeBytes: 885_000
+    )
 
     public static let all: [CuratedSpeechModel] = [
         CuratedSpeechModel(

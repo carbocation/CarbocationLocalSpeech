@@ -138,7 +138,10 @@ public final class SpeechModelLibrary {
         hfRepo: String? = nil,
         hfFilename: String? = nil,
         sha256: String? = nil,
-        capabilities: SpeechModelCapabilities = .whisperCppDefault
+        capabilities: SpeechModelCapabilities = .whisperCppDefault,
+        vadAssetAt temporaryVADURL: URL? = nil,
+        vadFilename requestedVADFilename: String? = nil,
+        vadSHA256: String? = nil
     ) throws -> InstalledSpeechModel {
         let filename = requestedFilename?.nilIfBlank ?? temporaryURL.lastPathComponent
         guard filename.lowercased().hasSuffix(".bin") else {
@@ -147,37 +150,67 @@ public final class SpeechModelLibrary {
         guard fileManager.fileExists(atPath: temporaryURL.path) else {
             throw SpeechModelLibraryError.sourceFileMissing(temporaryURL)
         }
+        if let temporaryVADURL {
+            let vadFilename = requestedVADFilename?.nilIfBlank ?? temporaryVADURL.lastPathComponent
+            guard vadFilename.lowercased().hasSuffix(".bin") else {
+                throw SpeechModelLibraryError.notAWhisperModel(vadFilename)
+            }
+            guard fileManager.fileExists(atPath: temporaryVADURL.path) else {
+                throw SpeechModelLibraryError.sourceFileMissing(temporaryVADURL)
+            }
+        }
 
         let id = UUID()
         let directory = root.appendingPathComponent(id.uuidString, isDirectory: true)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-        let destination = directory.appendingPathComponent(filename)
-        guard !fileManager.fileExists(atPath: destination.path) else {
-            throw SpeechModelLibraryError.destinationExists(destination)
-        }
-        try fileManager.moveItem(at: temporaryURL, to: destination)
+        let metadata: InstalledSpeechModel
+        do {
+            let destination = directory.appendingPathComponent(filename)
+            guard !fileManager.fileExists(atPath: destination.path) else {
+                throw SpeechModelLibraryError.destinationExists(destination)
+            }
+            try fileManager.moveItem(at: temporaryURL, to: destination)
 
-        let asset = SpeechModelAsset(
-            role: .primaryWeights,
-            relativePath: filename,
-            sizeBytes: Self.sizeOfItem(at: destination, fileManager: fileManager),
-            sha256: sha256
-        )
-        let metadata = InstalledSpeechModel(
-            id: id,
-            displayName: displayName,
-            providerKind: .whisperCpp,
-            family: "whisper.cpp",
-            variant: InstalledSpeechModel.inferVariant(from: filename),
-            languageScope: InstalledSpeechModel.inferLanguageScope(from: filename),
-            assets: [asset],
-            source: source,
-            sourceURL: sourceURL,
-            hfRepo: hfRepo,
-            hfFilename: hfFilename,
-            sha256: sha256,
-            capabilities: capabilities
-        )
+            let asset = SpeechModelAsset(
+                role: .primaryWeights,
+                relativePath: filename,
+                sizeBytes: Self.sizeOfItem(at: destination, fileManager: fileManager),
+                sha256: sha256
+            )
+            var assets = [asset]
+            if let temporaryVADURL {
+                let vadFilename = requestedVADFilename?.nilIfBlank ?? temporaryVADURL.lastPathComponent
+                let vadDestination = directory.appendingPathComponent(vadFilename)
+                guard !fileManager.fileExists(atPath: vadDestination.path) else {
+                    throw SpeechModelLibraryError.destinationExists(vadDestination)
+                }
+                try fileManager.moveItem(at: temporaryVADURL, to: vadDestination)
+                assets.append(SpeechModelAsset(
+                    role: .vadWeights,
+                    relativePath: vadFilename,
+                    sizeBytes: Self.sizeOfItem(at: vadDestination, fileManager: fileManager),
+                    sha256: vadSHA256
+                ))
+            }
+            metadata = InstalledSpeechModel(
+                id: id,
+                displayName: displayName,
+                providerKind: .whisperCpp,
+                family: "whisper.cpp",
+                variant: InstalledSpeechModel.inferVariant(from: filename),
+                languageScope: InstalledSpeechModel.inferLanguageScope(from: filename),
+                assets: assets,
+                source: source,
+                sourceURL: sourceURL,
+                hfRepo: hfRepo,
+                hfFilename: hfFilename,
+                sha256: sha256,
+                capabilities: capabilities
+            )
+        } catch {
+            try? fileManager.removeItem(at: directory)
+            throw error
+        }
 
         do {
             try writeMetadata(metadata)
@@ -251,7 +284,8 @@ public final class SpeechModelLibrary {
                 includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
                 options: [.skipsHiddenFiles]
               ),
-              let primary = files.first(where: { $0.pathExtension.lowercased() == "bin" })
+              let primary = files.first(where: { isLikelyPrimaryWeights($0) })
+                ?? files.first(where: { $0.pathExtension.lowercased() == "bin" })
         else { return nil }
 
         var assets: [SpeechModelAsset] = [
@@ -261,6 +295,13 @@ public final class SpeechModelLibrary {
                 sizeBytes: Self.sizeOfItem(at: primary, fileManager: fileManager)
             )
         ]
+        for file in files where isLikelyVADWeights(file) {
+            assets.append(SpeechModelAsset(
+                role: .vadWeights,
+                relativePath: file.lastPathComponent,
+                sizeBytes: Self.sizeOfItem(at: file, fileManager: fileManager)
+            ))
+        }
         for file in files where file.pathExtension.lowercased() == "mlmodelc" {
             assets.append(SpeechModelAsset(
                 role: .coreMLEncoder,
@@ -279,6 +320,16 @@ public final class SpeechModelLibrary {
             assets: assets,
             source: .imported
         )
+    }
+
+    private func isLikelyPrimaryWeights(_ url: URL) -> Bool {
+        url.pathExtension.lowercased() == "bin" && !isLikelyVADWeights(url)
+    }
+
+    private func isLikelyVADWeights(_ url: URL) -> Bool {
+        guard url.pathExtension.lowercased() == "bin" else { return false }
+        let filename = url.lastPathComponent.lowercased()
+        return filename.contains("vad") || filename.contains("silero")
     }
 
     static func sizeOfItem(at url: URL, fileManager: FileManager) -> Int64 {

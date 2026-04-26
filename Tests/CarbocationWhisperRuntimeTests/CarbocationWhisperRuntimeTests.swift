@@ -14,14 +14,24 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         let root = try makeTemporaryDirectory()
         let source = root.appendingPathComponent("ggml-base.en.bin")
         try Data("fake".utf8).write(to: source)
+        let vadSource = root.appendingPathComponent("ggml-silero-v6.2.0.bin")
+        try Data("fake vad".utf8).write(to: vadSource)
 
         let library = SpeechModelLibrary(root: root.appendingPathComponent("SpeechModels", isDirectory: true))
-        let model = try library.importFile(at: source, displayName: "Base")
+        let model = try library.add(
+            primaryAssetAt: source,
+            displayName: "Base",
+            filename: "ggml-base.en.bin",
+            source: .imported,
+            vadAssetAt: vadSource,
+            vadFilename: "ggml-silero-v6.2.0.bin"
+        )
         let engine = WhisperEngine()
         let loaded = try await engine.load(model: model, from: library.root)
         let currentModelID = await engine.currentModelID()
 
         XCTAssertEqual(loaded.modelID, model.id)
+        XCTAssertEqual(loaded.vadModelPath, model.vadWeightsURL(in: library.root)?.path)
         XCTAssertEqual(loaded.backend.kind, .whisperCpp)
         XCTAssertEqual(currentModelID, model.id)
     }

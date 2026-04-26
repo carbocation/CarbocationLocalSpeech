@@ -637,7 +637,8 @@ public struct SpeechModelLibraryPickerView: View {
             hfRepo: hfRepo,
             hfFilename: hfFilename,
             expectedSHA256: expectedSHA256,
-            capabilities: capabilities
+            capabilities: capabilities,
+            vadModel: CuratedSpeechModelCatalog.recommendedVADModel
         )
         activeDownload = download
         download.start(into: library) { result in
@@ -786,6 +787,7 @@ private final class SpeechModelLibraryDownload {
     let hfFilename: String?
     let expectedSHA256: String?
     let capabilities: SpeechModelCapabilities
+    let vadModel: CuratedSpeechVADModel?
 
     @ObservationIgnored
     private var task: Task<Void, Never>?
@@ -798,7 +800,8 @@ private final class SpeechModelLibraryDownload {
         hfRepo: String?,
         hfFilename: String?,
         expectedSHA256: String?,
-        capabilities: SpeechModelCapabilities
+        capabilities: SpeechModelCapabilities,
+        vadModel: CuratedSpeechVADModel? = nil
     ) {
         self.sourceURL = sourceURL
         self.displayName = displayName
@@ -808,6 +811,7 @@ private final class SpeechModelLibraryDownload {
         self.hfFilename = hfFilename
         self.expectedSHA256 = expectedSHA256
         self.capabilities = capabilities
+        self.vadModel = vadModel
     }
 
     func start(
@@ -820,6 +824,8 @@ private final class SpeechModelLibraryDownload {
 
         task = Task { @MainActor [weak self] in
             guard let self else { return }
+            var primaryTempURL: URL?
+            var vadTempURL: URL?
             do {
                 let result = try await SpeechModelDownloader.download(
                     from: sourceURL,
@@ -832,6 +838,32 @@ private final class SpeechModelLibraryDownload {
                         }
                     }
                 )
+                primaryTempURL = result.tempURL
+                var vadResult: SpeechModelDownloadResult?
+                if let vadModel {
+                    do {
+                        try Task.checkCancellation()
+                        vadResult = try await SpeechModelDownloader.download(
+                            hfRepo: vadModel.hfRepo,
+                            hfFilename: vadModel.hfFilename,
+                            modelsRoot: library.root,
+                            displayName: vadModel.displayName,
+                            expectedSHA256: vadModel.sha256,
+                            onProgress: { [weak self] progress in
+                                Task { @MainActor [weak self] in
+                                    self?.progress = progress
+                                }
+                            }
+                        )
+                        vadTempURL = vadResult?.tempURL
+                    } catch SpeechModelDownloaderError.cancelled {
+                        throw SpeechModelDownloaderError.cancelled
+                    } catch is CancellationError {
+                        throw SpeechModelDownloaderError.cancelled
+                    } catch {
+                        errorMessage = "Downloaded \(displayName), but VAD download failed: \(error.localizedDescription)"
+                    }
+                }
                 let model = try library.add(
                     primaryAssetAt: result.tempURL,
                     displayName: displayName,
@@ -841,15 +873,32 @@ private final class SpeechModelLibraryDownload {
                     hfRepo: hfRepo,
                     hfFilename: hfFilename,
                     sha256: result.sha256,
-                    capabilities: capabilities
+                    capabilities: capabilities,
+                    vadAssetAt: vadResult?.tempURL,
+                    vadFilename: vadResult == nil ? nil : vadModel?.hfFilename,
+                    vadSHA256: vadResult?.sha256
                 )
+                primaryTempURL = nil
+                vadTempURL = nil
                 isRunning = false
                 completion(.success(model))
             } catch is CancellationError {
+                if let primaryTempURL {
+                    try? FileManager.default.removeItem(at: primaryTempURL)
+                }
+                if let vadTempURL {
+                    try? FileManager.default.removeItem(at: vadTempURL)
+                }
                 isRunning = false
                 errorMessage = SpeechModelDownloaderError.cancelled.localizedDescription
                 completion(.failure(SpeechModelDownloaderError.cancelled))
             } catch {
+                if let primaryTempURL {
+                    try? FileManager.default.removeItem(at: primaryTempURL)
+                }
+                if let vadTempURL {
+                    try? FileManager.default.removeItem(at: vadTempURL)
+                }
                 isRunning = false
                 errorMessage = error.localizedDescription
                 completion(.failure(error))

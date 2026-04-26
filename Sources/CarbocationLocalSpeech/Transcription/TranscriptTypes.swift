@@ -89,6 +89,35 @@ public enum TimestampMode: String, Codable, Hashable, Sendable {
     case words
 }
 
+public enum VoiceActivityDetectionMode: String, Codable, Hashable, Sendable {
+    case automatic
+    case enabled
+    case disabled
+}
+
+public enum VoiceActivityDetectionSensitivity: String, Codable, Hashable, Sendable {
+    case low
+    case medium
+    case high
+}
+
+public struct VoiceActivityDetectionOptions: Hashable, Sendable {
+    public var mode: VoiceActivityDetectionMode
+    public var sensitivity: VoiceActivityDetectionSensitivity
+
+    public init(
+        mode: VoiceActivityDetectionMode = .automatic,
+        sensitivity: VoiceActivityDetectionSensitivity = .medium
+    ) {
+        self.mode = mode
+        self.sensitivity = sensitivity
+    }
+
+    public static let automatic = VoiceActivityDetectionOptions()
+    public static let enabled = VoiceActivityDetectionOptions(mode: .enabled)
+    public static let disabled = VoiceActivityDetectionOptions(mode: .disabled)
+}
+
 public struct TranscriptionOptions: Hashable, Sendable {
     public var useCase: TranscriptionUseCase
     public var language: String?
@@ -98,6 +127,7 @@ public struct TranscriptionOptions: Hashable, Sendable {
     public var contextualStrings: [String]
     public var suppressBlankAudio: Bool
     public var temperature: Double?
+    public var voiceActivityDetection: VoiceActivityDetectionOptions
 
     public init(
         useCase: TranscriptionUseCase = .general,
@@ -107,7 +137,8 @@ public struct TranscriptionOptions: Hashable, Sendable {
         initialPrompt: String? = nil,
         contextualStrings: [String] = [],
         suppressBlankAudio: Bool = true,
-        temperature: Double? = nil
+        temperature: Double? = nil,
+        voiceActivityDetection: VoiceActivityDetectionOptions = .automatic
     ) {
         self.useCase = useCase
         self.language = language
@@ -117,6 +148,7 @@ public struct TranscriptionOptions: Hashable, Sendable {
         self.contextualStrings = contextualStrings
         self.suppressBlankAudio = suppressBlankAudio
         self.temperature = temperature
+        self.voiceActivityDetection = voiceActivityDetection
     }
 }
 
