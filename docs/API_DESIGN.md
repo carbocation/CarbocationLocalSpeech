@@ -312,9 +312,16 @@ public struct TranscriptionOptions: Hashable, Sendable {
 
 public struct StreamingTranscriptionOptions: Hashable, Sendable {
     public var transcription: TranscriptionOptions
-    public var chunking: SpeechChunkingConfiguration
-    public var partialCommitStrategy: PartialCommitStrategy
+    public var implementation: StreamingImplementationPreference
+    public var commitment: TranscriptCommitmentPolicy
     public var latencyPreset: SpeechLatencyPreset
+    public var emulation: EmulatedStreamingOptions
+}
+
+public enum StreamingImplementationPreference: String, Codable, Hashable, Sendable {
+    case automatic
+    case native
+    case emulated
 }
 
 public enum SpeechLatencyPreset: String, Codable, CaseIterable, Sendable {
@@ -324,10 +331,22 @@ public enum SpeechLatencyPreset: String, Codable, CaseIterable, Sendable {
     case fileQuality
 }
 
-public enum PartialCommitStrategy: String, Codable, Sendable {
+public enum TranscriptCommitmentPolicy: Hashable, Sendable {
+    case automatic
+    case providerFinals
+    case localAgreement(iterations: Int)
     case silence
-    case chunkBoundary
-    case silenceOrChunkBoundary
+    case immediate
+}
+
+public struct EmulatedStreamingOptions: Hashable, Sendable {
+    public var window: AudioWindowingPolicy
+    public var overlapDeduplication: Bool
+}
+
+public enum AudioWindowingPolicy: Hashable, Sendable {
+    case vadUtterances(SpeechChunkingConfiguration)
+    case rollingBuffer(maxDuration: TimeInterval, updateInterval: TimeInterval, overlap: TimeInterval)
 }
 
 public protocol SpeechTranscriber: Sendable {
@@ -356,12 +375,19 @@ public enum TranscriptEvent: Sendable, Hashable {
     case started(SpeechBackendDescriptor)
     case audioLevel(AudioLevel)
     case voiceActivity(VoiceActivityEvent)
+    case snapshot(StreamingTranscriptSnapshot)
     case partial(TranscriptPartial)
     case revision(TranscriptRevision)
     case committed(TranscriptSegment)
     case progress(TranscriptionProgress)
     case stats(TranscriptionStats)
     case completed(Transcript)
+}
+
+public struct StreamingTranscriptSnapshot: Hashable, Sendable {
+    public var committed: Transcript
+    public var unconfirmed: TranscriptPartial?
+    public var volatileRange: TranscriptTimeRange?
 }
 
 public struct TranscriptPartial: Identifiable, Hashable, Sendable {
@@ -519,10 +545,10 @@ public actor AppleSpeechEngine: SpeechTranscriber {
 
 Implementation expectations:
 
-- Use `#if canImport(Speech)` and `#available(macOS 26.0, *)` around `SpeechAnalyzer`, `SpeechTranscriber`, `DictationTranscriber`, and `AssetInventory`.
+- Use `#if canImport(Speech)` and `#available(macOS 26.0, *)` around `SpeechAnalyzer`, `SpeechTranscriber`, and `AssetInventory`.
 - Return `.sdkUnavailable` or `.operatingSystemUnavailable` from stub builds instead of failing compilation.
-- Use `SpeechTranscriber` for `.general` and `.meeting`.
-- Use `DictationTranscriber` for `.dictation` and `balancedDictation`/`lowestLatency` live presets.
+- Prefer native continuous `SpeechAnalyzer` buffer streaming for `.automatic` and `.native` live transcription.
+- Map Apple final results to committed transcript state and volatile results to partial/snapshot state.
 - Use `AssetInventory` to check, reserve, download, and install locale assets when requested.
 - Expose asset-required states through availability so the UI can show an install action.
 
@@ -669,4 +695,4 @@ Smoke app:
 - install system speech assets when required
 - transcribe a selected audio file
 - observe mic input levels and VAD states
-- run streaming-ish dictation into a debug transcript pane
+- run streaming dictation into a debug transcript pane

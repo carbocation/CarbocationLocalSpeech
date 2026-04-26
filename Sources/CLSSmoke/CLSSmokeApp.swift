@@ -250,8 +250,8 @@ private struct CLSSmokeRootView: View {
                         useCase: .dictation,
                         language: Locale.current.language.languageCode?.identifier
                     ),
-                    chunking: SpeechLatencyPreset.balancedDictation.defaultChunkingConfiguration,
-                    partialCommitStrategy: .silenceOrChunkBoundary,
+                    implementation: .automatic,
+                    commitment: .automatic,
                     latencyPreset: .balancedDictation
                 )
             )
@@ -314,9 +314,9 @@ private struct CLSSmokeRootView: View {
 private extension TranscriptEvent {
     var isTranscriptPanelEvent: Bool {
         switch self {
-        case .partial, .revision, .committed, .progress, .stats, .completed:
+        case .snapshot, .partial, .revision, .committed, .progress, .stats, .completed:
             return true
-        case .started, .audioLevel, .voiceActivity:
+        case .started, .audioLevel, .voiceActivity, .diagnostic:
             return false
         }
     }

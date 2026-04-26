@@ -59,6 +59,7 @@ public enum WhisperEngineError: Error, LocalizedError, Sendable {
     case missingPrimaryWeights(UUID)
     case modelFileMissing(URL)
     case runtimeUnavailable(WhisperBackendStatus)
+    case unsupportedStreamingImplementation(StreamingImplementationPreference)
 
     public var errorDescription: String? {
         switch self {
@@ -70,6 +71,8 @@ public enum WhisperEngineError: Error, LocalizedError, Sendable {
             return "Whisper model file is missing: \(url.path)"
         case .runtimeUnavailable(let status):
             return status.displayDescription
+        case .unsupportedStreamingImplementation(let implementation):
+            return "Whisper does not support \(implementation.rawValue) streaming."
         }
     }
 }
@@ -162,6 +165,12 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
         audio: AsyncThrowingStream<AudioChunk, Error>,
         options: StreamingTranscriptionOptions
     ) -> AsyncThrowingStream<TranscriptEvent, Error> {
+        guard options.implementation != .native else {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: WhisperEngineError.unsupportedStreamingImplementation(.native))
+            }
+        }
+
         let loadedInfo = loadedInfo
         guard let loadedInfo else {
             return AsyncThrowingStream { continuation in
@@ -169,11 +178,16 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
             }
         }
 
+        var effectiveOptions = options
+        if effectiveOptions.commitment == .automatic {
+            effectiveOptions.commitment = .localAgreement(iterations: 2)
+        }
+
         let engine = self
         return SpeechChunkStreamingPipeline.stream(
             audio: audio,
             backend: loadedInfo.backend,
-            options: options
+            options: effectiveOptions
         ) { audio, transcriptionOptions in
             try await engine.transcribe(audio: audio, options: transcriptionOptions)
         }

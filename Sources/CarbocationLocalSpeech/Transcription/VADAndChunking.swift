@@ -117,3 +117,87 @@ public struct SpeechChunker: Sendable {
         speechDuration = 0
     }
 }
+
+public struct SpeechRollingWindow: Sendable {
+    public var maximumBufferDuration: TimeInterval
+    public var updateInterval: TimeInterval
+    public var overlapDuration: TimeInterval
+
+    private var samples: [Float] = []
+    private var sampleRate: Double?
+    private var startTime: TimeInterval?
+    private var lastEmissionEndTime: TimeInterval?
+
+    public init(
+        maximumBufferDuration: TimeInterval,
+        updateInterval: TimeInterval,
+        overlapDuration: TimeInterval
+    ) {
+        self.maximumBufferDuration = max(0.1, maximumBufferDuration)
+        self.updateInterval = max(0.05, updateInterval)
+        self.overlapDuration = max(0, overlapDuration)
+    }
+
+    public mutating func append(_ chunk: AudioChunk) -> [SpeechAudioChunk] {
+        if sampleRate == nil {
+            sampleRate = chunk.sampleRate
+            startTime = chunk.startTime
+        }
+
+        samples.append(contentsOf: chunk.samples)
+        trimIfNeeded()
+
+        guard let startTime else { return [] }
+        let endTime = startTime + duration
+        let lastEmissionEndTime = lastEmissionEndTime ?? startTime
+        guard endTime - lastEmissionEndTime >= updateInterval else {
+            return []
+        }
+
+        return [emitChunk(isFinal: false)]
+    }
+
+    public mutating func finish() -> [SpeechAudioChunk] {
+        guard !samples.isEmpty else { return [] }
+        return [emitChunk(isFinal: true)]
+    }
+
+    private var duration: TimeInterval {
+        guard let sampleRate, sampleRate > 0 else { return 0 }
+        return Double(samples.count) / sampleRate
+    }
+
+    private mutating func trimIfNeeded() {
+        guard let sampleRate, let startTime else { return }
+        let maximumSamples = max(1, Int(maximumBufferDuration * sampleRate))
+        guard samples.count > maximumSamples else { return }
+
+        let droppedSamples = samples.count - maximumSamples
+        samples.removeFirst(droppedSamples)
+        self.startTime = startTime + Double(droppedSamples) / sampleRate
+    }
+
+    private mutating func emitChunk(isFinal: Bool) -> SpeechAudioChunk {
+        let resolvedSampleRate = sampleRate ?? 16_000
+        let resolvedStart = startTime ?? 0
+        let prepared = PreparedAudio(
+            samples: samples,
+            sampleRate: resolvedSampleRate,
+            duration: Double(samples.count) / resolvedSampleRate
+        )
+        lastEmissionEndTime = resolvedStart + prepared.duration
+
+        if isFinal {
+            reset()
+        }
+
+        return SpeechAudioChunk(audio: prepared, startTime: resolvedStart, isFinal: isFinal)
+    }
+
+    private mutating func reset() {
+        samples.removeAll(keepingCapacity: true)
+        sampleRate = nil
+        startTime = nil
+        lastEmissionEndTime = nil
+    }
+}

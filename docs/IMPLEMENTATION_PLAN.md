@@ -146,14 +146,14 @@ Implement:
 - system provider option for `SpeechSystemModelID.appleSpeech`
 - asset status/install helpers through `AssetInventory`
 - file transcription through `SpeechAnalyzer` and `SpeechTranscriber`
-- dictation-oriented live transcription through `DictationTranscriber`
+- dictation-oriented native live transcription through `SpeechAnalyzer` buffer streaming
 - stubs for builds without modern Speech APIs
 
 Availability/compatibility rules:
 
 - Package minimum remains macOS 14.
 - Real Apple Speech implementation is gated by `#available(macOS 26.0, *)`.
-- Source that references `SpeechAnalyzer`, `SpeechTranscriber`, `DictationTranscriber`, and `AssetInventory` must compile only when the SDK exposes those symbols.
+- Source that references `SpeechAnalyzer`, `SpeechTranscriber`, and `AssetInventory` must compile only when the SDK exposes those symbols.
 - Stub builds return `.sdkUnavailable` or `.operatingSystemUnavailable`; they must not fail compilation.
 
 Acceptance criteria:

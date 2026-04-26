@@ -2,21 +2,30 @@ import Foundation
 
 public struct StreamingTranscriptionOptions: Hashable, Sendable {
     public var transcription: TranscriptionOptions
-    public var chunking: SpeechChunkingConfiguration
-    public var partialCommitStrategy: PartialCommitStrategy
+    public var implementation: StreamingImplementationPreference
+    public var commitment: TranscriptCommitmentPolicy
     public var latencyPreset: SpeechLatencyPreset
+    public var emulation: EmulatedStreamingOptions
 
     public init(
         transcription: TranscriptionOptions = TranscriptionOptions(useCase: .dictation),
-        chunking: SpeechChunkingConfiguration = .balancedDictation,
-        partialCommitStrategy: PartialCommitStrategy = .silenceOrChunkBoundary,
-        latencyPreset: SpeechLatencyPreset = .balancedDictation
+        implementation: StreamingImplementationPreference = .automatic,
+        commitment: TranscriptCommitmentPolicy = .automatic,
+        latencyPreset: SpeechLatencyPreset = .balancedDictation,
+        emulation: EmulatedStreamingOptions? = nil
     ) {
         self.transcription = transcription
-        self.chunking = chunking
-        self.partialCommitStrategy = partialCommitStrategy
+        self.implementation = implementation
+        self.commitment = commitment
         self.latencyPreset = latencyPreset
+        self.emulation = emulation ?? latencyPreset.defaultEmulatedStreamingOptions
     }
+}
+
+public enum StreamingImplementationPreference: String, Codable, Hashable, Sendable {
+    case automatic
+    case native
+    case emulated
 }
 
 public enum SpeechLatencyPreset: String, Codable, CaseIterable, Hashable, Sendable {
@@ -37,24 +46,114 @@ public enum SpeechLatencyPreset: String, Codable, CaseIterable, Hashable, Sendab
             return SpeechChunkingConfiguration(maximumChunkDuration: 60.0, overlapDuration: 1.5, silenceCommitDelay: 1.0, minimumSpeechDuration: 0.25)
         }
     }
+
+    public var defaultEmulatedStreamingOptions: EmulatedStreamingOptions {
+        switch self {
+        case .lowestLatency:
+            return EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 4.0, updateInterval: 0.75, overlap: 0.5)
+            )
+        case .balancedDictation:
+            return EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 8.0, updateInterval: 1.5, overlap: 1.0)
+            )
+        case .accuracy:
+            return EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 12.0, updateInterval: 2.0, overlap: 1.0)
+            )
+        case .fileQuality:
+            return EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 30.0, updateInterval: 5.0, overlap: 1.5)
+            )
+        }
+    }
 }
 
-public enum PartialCommitStrategy: String, Codable, Hashable, Sendable {
+public enum TranscriptCommitmentPolicy: Hashable, Sendable {
+    case automatic
+    case providerFinals
+    case localAgreement(iterations: Int)
     case silence
-    case chunkBoundary
-    case silenceOrChunkBoundary
+    case immediate
+}
+
+public struct EmulatedStreamingOptions: Hashable, Sendable {
+    public var window: AudioWindowingPolicy
+    public var overlapDeduplication: Bool
+
+    public init(
+        window: AudioWindowingPolicy = .vadUtterances(.balancedDictation),
+        overlapDeduplication: Bool = true
+    ) {
+        self.window = window
+        self.overlapDeduplication = overlapDeduplication
+    }
+}
+
+public enum AudioWindowingPolicy: Hashable, Sendable {
+    case vadUtterances(SpeechChunkingConfiguration)
+    case rollingBuffer(maxDuration: TimeInterval, updateInterval: TimeInterval, overlap: TimeInterval)
+
+    public var overlapDuration: TimeInterval {
+        switch self {
+        case .vadUtterances(let configuration):
+            return configuration.overlapDuration
+        case .rollingBuffer(_, _, let overlap):
+            return max(0, overlap)
+        }
+    }
 }
 
 public enum TranscriptEvent: Hashable, Sendable {
     case started(SpeechBackendDescriptor)
     case audioLevel(AudioLevel)
     case voiceActivity(VoiceActivityEvent)
+    case diagnostic(TranscriptionDiagnostic)
+    case snapshot(StreamingTranscriptSnapshot)
     case partial(TranscriptPartial)
     case revision(TranscriptRevision)
     case committed(TranscriptSegment)
     case progress(TranscriptionProgress)
     case stats(TranscriptionStats)
     case completed(Transcript)
+}
+
+public struct TranscriptionDiagnostic: Hashable, Sendable {
+    public var source: String
+    public var message: String
+    public var time: TimeInterval?
+
+    public init(source: String, message: String, time: TimeInterval? = nil) {
+        self.source = source
+        self.message = message
+        self.time = time
+    }
+}
+
+public struct StreamingTranscriptSnapshot: Hashable, Sendable {
+    public var committed: Transcript
+    public var unconfirmed: TranscriptPartial?
+    public var volatileRange: TranscriptTimeRange?
+
+    public init(
+        committed: Transcript = Transcript(),
+        unconfirmed: TranscriptPartial? = nil,
+        volatileRange: TranscriptTimeRange? = nil
+    ) {
+        self.committed = committed
+        self.unconfirmed = unconfirmed
+        self.volatileRange = volatileRange
+    }
+}
+
+public struct TranscriptTimeRange: Hashable, Sendable {
+    public var startTime: TimeInterval
+    public var endTime: TimeInterval
+
+    public init(startTime: TimeInterval, endTime: TimeInterval) {
+        self.startTime = startTime
+        self.endTime = max(startTime, endTime)
+    }
 }
 
 public struct TranscriptPartial: Identifiable, Hashable, Sendable {

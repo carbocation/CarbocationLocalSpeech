@@ -15,9 +15,9 @@ The package should centralize:
 - provider-aware model selection for installed and system speech providers
 - microphone capture and file-audio preparation
 - sample-rate conversion to provider-ready audio
-- voice activity detection and chunking
+- voice activity detection and emulated streaming windowing
 - file transcription
-- streaming-ish transcription for dictation and live capture
+- streaming transcription for dictation and live capture
 - stable transcript, word timestamp, and speaker-attribution types
 - optional diarization interfaces and merge utilities
 - SwiftUI model/provider and speech settings surfaces
@@ -49,7 +49,7 @@ CarbocationWhisperRuntime
 
 CarbocationAppleSpeechRuntime
   Lower-level Apple Speech runtime backed by SpeechAnalyzer,
-  SpeechTranscriber, DictationTranscriber, and AssetInventory.
+  SpeechTranscriber, and AssetInventory.
 
 CarbocationLocalSpeechRuntime
   Preferred unified facade for installed Whisper models and available
@@ -225,7 +225,7 @@ The first useful version should include both provider abstraction and Apple Spee
 3. `CarbocationWhisperRuntime` with whisper.cpp source-build file transcription.
 4. `CarbocationLocalSpeechRuntime` unified facade for installed and system providers.
 5. SwiftUI provider/model picker and provider-aware smoke app.
-6. Mic capture, resampling, VAD, chunking, and streaming-ish events.
+6. Mic capture, resampling, VAD, native/emulated streaming, and transcript events.
 7. Binary XCFramework release path for whisper.cpp.
 8. Optional diarization interfaces and delayed speaker merge.
 

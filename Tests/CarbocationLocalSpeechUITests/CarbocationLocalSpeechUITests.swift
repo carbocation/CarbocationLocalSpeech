@@ -185,4 +185,22 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
         XCTAssertFalse(committedSnapshot.hasPendingPartial)
         XCTAssertEqual(committedSnapshot.segmentCount, 1)
     }
+
+    func testLiveTranscriptDebugSnapshotUsesProviderSnapshot() {
+        let committed = TranscriptSegment(text: "hello", startTime: 0.0, endTime: 0.4)
+        let unconfirmed = TranscriptPartial(text: "world", startTime: 0.4, endTime: 0.8)
+
+        let snapshot = LiveTranscriptDebugSnapshot(events: [
+            .snapshot(StreamingTranscriptSnapshot(
+                committed: Transcript(segments: [committed]),
+                unconfirmed: unconfirmed,
+                volatileRange: TranscriptTimeRange(startTime: 0.4, endTime: 0.8)
+            ))
+        ])
+
+        XCTAssertEqual(snapshot.transcriptText, "hello world")
+        XCTAssertEqual(snapshot.latestText, "world")
+        XCTAssertTrue(snapshot.hasPendingPartial)
+        XCTAssertEqual(snapshot.segmentCount, 1)
+    }
 }

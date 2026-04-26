@@ -98,11 +98,13 @@ public struct LiveTranscriptDebugView: View {
                 Text("Provider activity will appear here.")
             }
         } else {
-            List(events.indices, id: \.self) { index in
-                Text(Self.describe(events[index]))
+            ScrollView {
+                Text(events.map(Self.describe).joined(separator: "\n"))
                     .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
             }
-            .listStyle(.inset)
         }
     }
 
@@ -114,6 +116,15 @@ public struct LiveTranscriptDebugView: View {
             return "level rms=\(format(level.rms)) peak=\(format(level.peak))"
         case .voiceActivity(let event):
             return "vad \(event.state.rawValue) \(format(event.startTime))-\(format(event.endTime))"
+        case .diagnostic(let diagnostic):
+            let time = diagnostic.time.map { " \(format($0))" } ?? ""
+            return "debug \(diagnostic.source)\(time) \(diagnostic.message)"
+        case .snapshot(let snapshot):
+            let committedCount = snapshot.committed.segments.count
+            if let unconfirmed = snapshot.unconfirmed, !unconfirmed.text.isEmpty {
+                return "snapshot committed=\(committedCount) live \(unconfirmed.text)"
+            }
+            return "snapshot committed=\(committedCount)"
         case .partial(let partial):
             return "partial \(partial.text)"
         case .revision(let revision):
@@ -203,6 +214,9 @@ struct LiveTranscriptDebugSnapshot: Equatable {
 
     private mutating func apply(_ event: TranscriptEvent) {
         switch event {
+        case .snapshot(let snapshot):
+            committedSegments = snapshot.committed.segments.filter { !Self.trim($0.text).isEmpty }
+            pendingPartial = snapshot.unconfirmed
         case .partial(let partial):
             pendingPartial = partial
         case .revision(let revision):
@@ -222,7 +236,7 @@ struct LiveTranscriptDebugSnapshot: Equatable {
                 committedSegments = nonEmptySegments
             }
             pendingPartial = nil
-        case .started, .audioLevel, .voiceActivity:
+        case .started, .audioLevel, .voiceActivity, .diagnostic:
             break
         }
     }

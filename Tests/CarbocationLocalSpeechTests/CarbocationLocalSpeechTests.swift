@@ -295,14 +295,16 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
         let options = StreamingTranscriptionOptions(
             transcription: TranscriptionOptions(useCase: .dictation),
-            chunking: SpeechChunkingConfiguration(
-                maximumChunkDuration: 0.1,
-                overlapDuration: 0,
-                silenceCommitDelay: 0.2,
-                minimumSpeechDuration: 0.01
-            ),
-            partialCommitStrategy: .chunkBoundary,
-            latencyPreset: .lowestLatency
+            commitment: .immediate,
+            latencyPreset: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .vadUtterances(SpeechChunkingConfiguration(
+                    maximumChunkDuration: 0.1,
+                    overlapDuration: 0,
+                    silenceCommitDelay: 0.2,
+                    minimumSpeechDuration: 0.01
+                ))
+            )
         )
 
         var events: [TranscriptEvent] = []
@@ -355,14 +357,16 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
         let options = StreamingTranscriptionOptions(
             transcription: TranscriptionOptions(useCase: .dictation),
-            chunking: SpeechChunkingConfiguration(
-                maximumChunkDuration: 1.0,
-                overlapDuration: 0.25,
-                silenceCommitDelay: 2.0,
-                minimumSpeechDuration: 0.01
-            ),
-            partialCommitStrategy: .chunkBoundary,
-            latencyPreset: .lowestLatency
+            commitment: .immediate,
+            latencyPreset: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .vadUtterances(SpeechChunkingConfiguration(
+                    maximumChunkDuration: 1.0,
+                    overlapDuration: 0.25,
+                    silenceCommitDelay: 2.0,
+                    minimumSpeechDuration: 0.01
+                ))
+            )
         )
         let callCounter = SpeechChunkStreamingPipelineCallCounter()
 
@@ -398,6 +402,69 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertTrue(events.contains { event in
             if case .completed(let transcript) = event {
                 return transcript.text == "apple speech. provider."
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineUsesLocalAgreementForRollingBuffer() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 8_000),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 0.5
+            ))
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 8_000),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0.5,
+                duration: 0.5
+            ))
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(useCase: .dictation),
+            commitment: .localAgreement(iterations: 2),
+            latencyPreset: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 4.0, updateInterval: 0.5, overlap: 0.25)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options
+        ) { _, _ in
+            let callIndex = await callCounter.next()
+            let text = callIndex == 1 ? "hello speech" : "hello speech provider"
+            return Transcript(segments: [
+                TranscriptSegment(text: text, startTime: 0, endTime: 1)
+            ])
+        }
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        let committedText = events.compactMap { event -> String? in
+            if case .committed(let segment) = event {
+                return segment.text
+            }
+            return nil
+        }.joined(separator: " ")
+
+        XCTAssertEqual(committedText, "hello speech provider")
+        XCTAssertTrue(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.committed.text == "hello speech"
+                    && snapshot.unconfirmed?.text == "provider"
             }
             return false
         })
