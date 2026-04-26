@@ -65,6 +65,8 @@ private final class CLSSmokeAppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.selectedSpeechModelSelection") private var selectionStorageValue = SpeechSystemModelID.appleSpeech.rawValue
+    @AppStorage("CLSSmoke.vadMode") private var vadModeStorageValue = CLSSmokeVADMode.disabled.rawValue
+    @AppStorage("CLSSmoke.vadSensitivity") private var vadSensitivityStorageValue = CLSSmokeVADSensitivity.medium.rawValue
     @State private var systemOptions: [SpeechSystemModelOption] = []
     @State private var events: [TranscriptEvent] = []
     @State private var transcriptEvents: [TranscriptEvent] = []
@@ -96,7 +98,7 @@ private struct CLSSmokeRootView: View {
                     library: library,
                     selectionStorageValue: $selectionStorageValue,
                     confirmTitle: confirmTitle,
-                    confirmDisabled: isStarting,
+                    confirmDisabled: isConfirmDisabled,
                     systemOptions: systemOptions,
                     onSelectionConfirmed: { selection in
                         startListening(with: selection)
@@ -141,6 +143,51 @@ private struct CLSSmokeRootView: View {
         return "Start Listening"
     }
 
+    private var isConfirmDisabled: Bool {
+        isStarting || isForcedVADUnavailable
+    }
+
+    private var selectedSelection: SpeechModelSelection? {
+        SpeechModelSelection(storageValue: selectionStorageValue)
+    }
+
+    private var selectedVADMode: CLSSmokeVADMode {
+        CLSSmokeVADMode(rawValue: vadModeStorageValue) ?? .disabled
+    }
+
+    private var selectedVADSensitivity: CLSSmokeVADSensitivity {
+        CLSSmokeVADSensitivity(rawValue: vadSensitivityStorageValue) ?? .medium
+    }
+
+    private var vadModeBinding: Binding<CLSSmokeVADMode> {
+        Binding(
+            get: { selectedVADMode },
+            set: { vadModeStorageValue = $0.rawValue }
+        )
+    }
+
+    private var vadSensitivityBinding: Binding<CLSSmokeVADSensitivity> {
+        Binding(
+            get: { selectedVADSensitivity },
+            set: { vadSensitivityStorageValue = $0.rawValue }
+        )
+    }
+
+    private var selectedVADAvailability: CLSSmokeVADAvailability {
+        guard let selectedSelection else {
+            return CLSSmokeVADAvailability(
+                isAvailable: false,
+                message: "Model VAD availability unavailable until a provider is selected.",
+                diagnosticValue: "unavailable:no-selection"
+            )
+        }
+        return vadAvailability(for: selectedSelection)
+    }
+
+    private var isForcedVADUnavailable: Bool {
+        selectedVADMode == .enabled && !selectedVADAvailability.isAvailable
+    }
+
     private var sessionStatus: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
@@ -170,13 +217,65 @@ private struct CLSSmokeRootView: View {
                 .disabled(!isStarting && !isListening)
             }
 
+            vadSettings
+
             MicrophonePermissionStatusView(status: microphoneStatus)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
     }
 
+    private var vadSettings: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Text("Model VAD")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 80, alignment: .leading)
+
+                Picker("Model VAD", selection: vadModeBinding) {
+                    ForEach(CLSSmokeVADMode.allCases) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 300)
+                .disabled(isStarting || isListening)
+            }
+
+            HStack(spacing: 10) {
+                Text("Sensitivity")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 80, alignment: .leading)
+
+                Picker("Sensitivity", selection: vadSensitivityBinding) {
+                    ForEach(CLSSmokeVADSensitivity.allCases) { sensitivity in
+                        Text(sensitivity.displayName).tag(sensitivity)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 240)
+                .disabled(isStarting || isListening || selectedVADMode == .disabled)
+            }
+
+            Text(selectedVADAvailability.message)
+                .font(.caption)
+                .foregroundStyle(isForcedVADUnavailable ? .orange : .secondary)
+                .lineLimit(2)
+        }
+    }
+
     private func startListening(with selection: SpeechModelSelection) {
+        let vadMode = selectedVADMode
+        let vadSensitivity = selectedVADSensitivity
+        let vadAvailability = vadAvailability(for: selection)
+        guard vadMode != .enabled || vadAvailability.isAvailable else {
+            statusTone = .error
+            statusMessage = "Model VAD is not available for the selected provider."
+            return
+        }
+
         stopListening(updateStatus: false, unloadProvider: false)
 
         let sessionID = UUID()
@@ -190,7 +289,13 @@ private struct CLSSmokeRootView: View {
         statusMessage = "Preparing selected provider..."
 
         transcriptionTask = Task {
-            await runLiveTranscriptionSession(id: sessionID, selection: selection)
+            await runLiveTranscriptionSession(
+                id: sessionID,
+                selection: selection,
+                vadMode: vadMode,
+                vadSensitivity: vadSensitivity,
+                vadAvailability: vadAvailability
+            )
         }
     }
 
@@ -216,7 +321,13 @@ private struct CLSSmokeRootView: View {
         }
     }
 
-    private func runLiveTranscriptionSession(id: UUID, selection: SpeechModelSelection) async {
+    private func runLiveTranscriptionSession(
+        id: UUID,
+        selection: SpeechModelSelection,
+        vadMode: CLSSmokeVADMode,
+        vadSensitivity: CLSSmokeVADSensitivity,
+        vadAvailability: CLSSmokeVADAvailability
+    ) async {
         do {
             guard await ensureMicrophoneAccess() else {
                 finishSession(id: id, message: "Microphone access is required to listen.", tone: .error)
@@ -242,6 +353,10 @@ private struct CLSSmokeRootView: View {
 
             guard activeSessionID == id else { return }
             loadedInfo = loaded
+            appendEvent(.diagnostic(TranscriptionDiagnostic(
+                source: "smoke.vad",
+                message: "mode=\(vadMode.diagnosticValue) sensitivity=\(vadSensitivity.diagnosticValue) provider=\(loaded.backend.displayName) availability=\(vadAvailability.diagnosticValue)"
+            )))
 
             let capture = AVAudioEngineCaptureSession()
             captureSession = capture
@@ -260,7 +375,11 @@ private struct CLSSmokeRootView: View {
                 options: StreamingTranscriptionOptions(
                     transcription: TranscriptionOptions(
                         useCase: .dictation,
-                        language: Locale.current.language.languageCode?.identifier
+                        language: Locale.current.language.languageCode?.identifier,
+                        voiceActivityDetection: VoiceActivityDetectionOptions(
+                            mode: vadMode.runtimeMode,
+                            sensitivity: vadSensitivity.runtimeSensitivity
+                        )
                     ),
                     implementation: .automatic,
                     commitment: .automatic,
@@ -301,6 +420,58 @@ private struct CLSSmokeRootView: View {
         }
     }
 
+    private func vadAvailability(for selection: SpeechModelSelection) -> CLSSmokeVADAvailability {
+        switch selection {
+        case .installed(let id):
+            guard let model = library.model(id: id) else {
+                return CLSSmokeVADAvailability(
+                    isAvailable: false,
+                    message: "Whisper model VAD unavailable: selected model is not installed.",
+                    diagnosticValue: "unavailable:missing-installed-model"
+                )
+            }
+            guard let vadURL = model.vadWeightsURL(in: library.root) else {
+                return CLSSmokeVADAvailability(
+                    isAvailable: false,
+                    message: "Whisper model VAD unavailable: selected model has no VAD asset.",
+                    diagnosticValue: "unavailable:no-vad-asset"
+                )
+            }
+            guard FileManager.default.fileExists(atPath: vadURL.path) else {
+                return CLSSmokeVADAvailability(
+                    isAvailable: false,
+                    message: "Whisper model VAD unavailable: VAD asset file is missing.",
+                    diagnosticValue: "unavailable:missing-vad-file"
+                )
+            }
+            return CLSSmokeVADAvailability(
+                isAvailable: true,
+                message: "Whisper model VAD available.",
+                diagnosticValue: "available:whisper-vad-asset"
+            )
+        case .system(.appleSpeech):
+            guard let option = systemOptions.first(where: { $0.selection == .system(.appleSpeech) }) else {
+                return CLSSmokeVADAvailability(
+                    isAvailable: false,
+                    message: "Apple Speech VAD availability is not available for the current locale.",
+                    diagnosticValue: "unavailable:no-apple-option"
+                )
+            }
+            guard option.availability.isAvailable else {
+                return CLSSmokeVADAvailability(
+                    isAvailable: false,
+                    message: "Apple Speech VAD unavailable: \(option.availability.displayMessage)",
+                    diagnosticValue: "unavailable:apple-\(option.availability.unavailableReason?.rawValue ?? "unknown")"
+                )
+            }
+            return CLSSmokeVADAvailability(
+                isAvailable: true,
+                message: "Apple SpeechDetector available.",
+                diagnosticValue: "available:apple-speechdetector"
+            )
+        }
+    }
+
     private func appendEvent(_ event: TranscriptEvent) {
         events.append(event)
         if event.isTranscriptPanelEvent {
@@ -324,6 +495,80 @@ private struct CLSSmokeRootView: View {
         isListening = false
         statusMessage = message
         statusTone = tone
+    }
+}
+
+private struct CLSSmokeVADAvailability: Hashable {
+    var isAvailable: Bool
+    var message: String
+    var diagnosticValue: String
+}
+
+private enum CLSSmokeVADMode: String, CaseIterable, Identifiable {
+    case disabled
+    case enabled
+    case automatic
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .disabled:
+            return "Disabled"
+        case .enabled:
+            return "Enabled"
+        case .automatic:
+            return "Automatic"
+        }
+    }
+
+    var runtimeMode: VoiceActivityDetectionMode {
+        switch self {
+        case .disabled:
+            return .disabled
+        case .enabled:
+            return .enabled
+        case .automatic:
+            return .automatic
+        }
+    }
+
+    var diagnosticValue: String {
+        rawValue
+    }
+}
+
+private enum CLSSmokeVADSensitivity: String, CaseIterable, Identifiable {
+    case low
+    case medium
+    case high
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .low:
+            return "Low"
+        case .medium:
+            return "Medium"
+        case .high:
+            return "High"
+        }
+    }
+
+    var runtimeSensitivity: VoiceActivityDetectionSensitivity {
+        switch self {
+        case .low:
+            return .low
+        case .medium:
+            return .medium
+        case .high:
+            return .high
+        }
+    }
+
+    var diagnosticValue: String {
+        rawValue
     }
 }
 
