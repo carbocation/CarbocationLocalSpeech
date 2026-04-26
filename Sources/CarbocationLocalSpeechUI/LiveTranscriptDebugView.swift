@@ -1,4 +1,5 @@
 import CarbocationLocalSpeech
+import AppKit
 import SwiftUI
 
 public struct LiveTranscriptDebugView: View {
@@ -143,17 +144,7 @@ public struct LiveTranscriptDebugView: View {
                 Text("Provider activity will appear here.")
             }
         } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    ForEach(lines.indices, id: \.self) { index in
-                        Text(lines[index])
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .padding(12)
-            }
+            SelectableEventLogView(lines: lines)
         }
     }
 
@@ -196,6 +187,129 @@ public struct LiveTranscriptDebugView: View {
 
     private static func format(_ value: Double) -> String {
         String(format: "%.2f", value)
+    }
+}
+
+private struct SelectableEventLogView: NSViewRepresentable {
+    var lines: [String]
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.drawsBackground = false
+        textView.font = NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        textView.textColor = .labelColor
+        textView.textContainerInset = NSSize(width: 12, height: 12)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: scrollView.contentSize.width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+
+        scrollView.documentView = textView
+        context.coordinator.textView = textView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        context.coordinator.update(lines, in: scrollView)
+    }
+
+    final class Coordinator {
+        weak var textView: NSTextView?
+        private var renderedLines: [String] = []
+
+        func update(_ lines: [String], in scrollView: NSScrollView) {
+            guard let textView else { return }
+
+            if lines.isEmpty {
+                guard !renderedLines.isEmpty else { return }
+                textView.string = ""
+                renderedLines.removeAll(keepingCapacity: true)
+                return
+            }
+
+            if canAppend(lines) {
+                append(Array(lines.dropFirst(renderedLines.count)), to: textView, in: scrollView)
+            } else if let overlapCount = suffixPrefixOverlapCount(previous: renderedLines, current: lines),
+                      overlapCount > 0 {
+                removeRenderedPrefix(renderedLines.count - overlapCount, from: textView)
+                append(Array(lines.dropFirst(overlapCount)), to: textView, in: scrollView)
+            } else {
+                textView.string = lines.joined(separator: "\n")
+                renderedLines = lines
+                scrollToBottom(scrollView)
+            }
+        }
+
+        private func canAppend(_ lines: [String]) -> Bool {
+            guard lines.count >= renderedLines.count else { return false }
+            return zip(renderedLines, lines).allSatisfy(==)
+        }
+
+        private func suffixPrefixOverlapCount(previous: [String], current: [String]) -> Int? {
+            let maximumOverlap = min(previous.count, current.count)
+            guard maximumOverlap > 0 else { return nil }
+
+            for count in stride(from: maximumOverlap, through: 1, by: -1) {
+                if Array(previous.suffix(count)) == Array(current.prefix(count)) {
+                    return count
+                }
+            }
+
+            return nil
+        }
+
+        private func removeRenderedPrefix(_ count: Int, from textView: NSTextView) {
+            guard count > 0, count <= renderedLines.count else { return }
+            let removedTextLength = renderedLines.prefix(count).joined(separator: "\n").utf16.count
+            let separatorLength = count < renderedLines.count ? 1 : 0
+            textView.textStorage?.deleteCharacters(in: NSRange(
+                location: 0,
+                length: removedTextLength + separatorLength
+            ))
+            renderedLines.removeFirst(count)
+        }
+
+        private func append(_ newLines: [String], to textView: NSTextView, in scrollView: NSScrollView) {
+            guard !newLines.isEmpty else { return }
+
+            let prefix = renderedLines.isEmpty ? "" : "\n"
+            let appendedText = prefix + newLines.joined(separator: "\n")
+            textView.textStorage?.append(NSAttributedString(string: appendedText, attributes: attributes(for: textView)))
+            renderedLines.append(contentsOf: newLines)
+            scrollToBottom(scrollView)
+        }
+
+        private func attributes(for textView: NSTextView) -> [NSAttributedString.Key: Any] {
+            var attributes: [NSAttributedString.Key: Any] = [:]
+            if let font = textView.font {
+                attributes[.font] = font
+            }
+            if let textColor = textView.textColor {
+                attributes[.foregroundColor] = textColor
+            }
+            return attributes
+        }
+
+        private func scrollToBottom(_ scrollView: NSScrollView) {
+            textView?.scrollRangeToVisible(NSRange(location: textView?.string.utf16.count ?? 0, length: 0))
+        }
     }
 }
 

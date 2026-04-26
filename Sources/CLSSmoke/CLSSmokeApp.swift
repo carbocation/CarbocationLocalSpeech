@@ -65,7 +65,7 @@ private final class CLSSmokeAppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.selectedSpeechModelSelection") private var selectionStorageValue = SpeechSystemModelID.appleSpeech.rawValue
-    @AppStorage("CLSSmoke.vadMode") private var vadModeStorageValue = CLSSmokeVADMode.disabled.rawValue
+    @AppStorage("CLSSmoke.vadMode") private var vadModeStorageValue = CLSSmokeVADMode.automatic.rawValue
     @AppStorage("CLSSmoke.vadSensitivity") private var vadSensitivityStorageValue = CLSSmokeVADSensitivity.medium.rawValue
     @State private var systemOptions: [SpeechSystemModelOption] = []
     @State private var eventDescriptions: [String] = []

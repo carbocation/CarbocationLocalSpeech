@@ -103,14 +103,32 @@ struct WhisperStreamingDecodeTuning: Hashable, Sendable {
     static func resolve(for options: StreamingTranscriptionOptions) -> WhisperStreamingDecodeTuning {
         switch options.strategy {
         case .automatic, .balanced:
-            return WhisperStreamingDecodeTuning(singleSegment: true, maxTokens: 96, audioContext: 512)
+            return WhisperStreamingDecodeTuning(singleSegment: true, maxTokens: 48, audioContext: 512)
         case .lowestLatency:
-            return WhisperStreamingDecodeTuning(singleSegment: true, maxTokens: 48, audioContext: 256)
+            return WhisperStreamingDecodeTuning(singleSegment: true, maxTokens: 32, audioContext: 256)
         case .accurate:
             return WhisperStreamingDecodeTuning(singleSegment: false, maxTokens: 0, audioContext: 768)
         case .fileQuality:
             return WhisperStreamingDecodeTuning(singleSegment: false, maxTokens: 0, audioContext: 0)
         }
+    }
+}
+
+struct WhisperStreamingOptionsResolver {
+    static func resolve(_ options: StreamingTranscriptionOptions) -> StreamingTranscriptionOptions {
+        var resolved = options
+
+        if resolved.implementation == .automatic {
+            resolved.emulation = EmulatedStreamingOptions(
+                window: .vadUtterances(options.strategy.defaultChunkingConfiguration)
+            )
+        }
+
+        if resolved.commitment == .automatic {
+            resolved.commitment = .localAgreement(iterations: 2)
+        }
+
+        return resolved
     }
 }
 
@@ -334,11 +352,7 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
             }
         }
 
-        var effectiveOptions = options
-        if effectiveOptions.commitment == .automatic {
-            effectiveOptions.commitment = .localAgreement(iterations: 2)
-        }
-        let resolvedOptions = effectiveOptions
+        let resolvedOptions = WhisperStreamingOptionsResolver.resolve(options)
 
         let engine = self
         let streamingState = WhisperStreamingSessionState()
@@ -533,7 +547,8 @@ private extension WhisperEngine {
                     params.print_progress = false
                     params.print_realtime = false
                     params.print_timestamps = false
-                    params.suppress_blank = options.suppressBlankAudio
+                    params.suppress_blank = streamingContext != nil || options.suppressBlankAudio
+                    params.suppress_nst = streamingContext != nil
                     params.language = languagePointer
                     params.detect_language = languagePointer == nil
                     params.initial_prompt = promptPointer
@@ -586,10 +601,14 @@ private extension WhisperEngine {
                         throw WhisperEngineError.transcriptionFailed(result)
                     }
 
+                    let decodedSegments = transcriptSegments(
+                        context: context,
+                        includeWords: options.timestampMode == .words
+                    )
                     let transcript = Transcript(
-                        segments: transcriptSegments(
-                            context: context,
-                            includeWords: options.timestampMode == .words
+                        segments: normalizedSegmentTimestamps(
+                            decodedSegments,
+                            fallbackDuration: params.no_timestamps ? audio.duration : nil
                         ),
                         language: detectedLanguage(context: context),
                         duration: audio.duration,
@@ -598,6 +617,26 @@ private extension WhisperEngine {
                     return WhisperRunResult(transcript: transcript)
                 }
             }
+        }
+    }
+
+    func normalizedSegmentTimestamps(
+        _ segments: [TranscriptSegment],
+        fallbackDuration: TimeInterval?
+    ) -> [TranscriptSegment] {
+        guard let fallbackDuration else {
+            return segments
+        }
+        return segments.map { segment in
+            TranscriptSegment(
+                id: segment.id,
+                text: segment.text,
+                startTime: 0,
+                endTime: fallbackDuration,
+                words: segment.words,
+                speaker: segment.speaker,
+                confidence: segment.confidence
+            )
         }
     }
 
@@ -613,10 +652,11 @@ private extension WhisperEngine {
         params.max_tokens = tuning.maxTokens
         params.no_context = true
         params.carry_initial_prompt = false
-        params.temperature_inc = 0
         params.audio_ctx = clampedAudioContext(tuning.audioContext, context: context)
         if includeWords {
             params.single_segment = false
+        } else if tuning.singleSegment {
+            params.no_timestamps = true
         }
     }
 
@@ -627,8 +667,7 @@ private extension WhisperEngine {
         case .disabled:
             return false
         case .automatic:
-            _ = isStreaming
-            return false
+            return isStreaming
         }
     }
 

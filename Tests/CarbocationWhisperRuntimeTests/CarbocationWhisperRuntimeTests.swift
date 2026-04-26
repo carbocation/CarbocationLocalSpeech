@@ -1,4 +1,4 @@
-import CarbocationLocalSpeech
+@_spi(Internal) import CarbocationLocalSpeech
 @testable import CarbocationWhisperRuntime
 import Foundation
 import XCTest
@@ -65,6 +65,54 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         XCTAssertFalse(fileQuality.singleSegment)
         XCTAssertEqual(fileQuality.maxTokens, 0)
         XCTAssertEqual(fileQuality.audioContext, 0)
+    }
+
+    func testWhisperStreamingOptionsPreferVADUtterancesForDefaultAutomaticStream() {
+        let resolved = WhisperStreamingOptionsResolver.resolve(StreamingTranscriptionOptions(
+            strategy: .balanced
+        ))
+
+        XCTAssertEqual(resolved.commitment, .localAgreement(iterations: 2))
+        guard case .vadUtterances(let configuration) = resolved.emulation.window else {
+            XCTFail("Expected Whisper default streaming to use VAD utterances.")
+            return
+        }
+        XCTAssertEqual(configuration, StreamingTranscriptionStrategy.balanced.defaultChunkingConfiguration)
+    }
+
+    func testWhisperStreamingOptionsKeepExplicitRollingBufferWithLocalAgreement() {
+        let options = StreamingTranscriptionOptions(
+            strategy: .balanced,
+            implementation: .emulated,
+            commitment: .automatic,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 8.0, updateInterval: 1.5, overlap: 1.0)
+            )
+        )
+
+        let resolved = WhisperStreamingOptionsResolver.resolve(options)
+
+        XCTAssertEqual(resolved.commitment, .localAgreement(iterations: 2))
+        guard case .rollingBuffer(let maxDuration, let updateInterval, let overlap) = resolved.emulation.window else {
+            XCTFail("Expected explicit rolling-buffer configuration to be preserved.")
+            return
+        }
+        XCTAssertEqual(maxDuration, 8.0)
+        XCTAssertEqual(updateInterval, 1.5)
+        XCTAssertEqual(overlap, 1.0)
+    }
+
+    func testWhisperStreamingOptionsPreserveExplicitCommitmentPolicy() {
+        let resolved = WhisperStreamingOptionsResolver.resolve(StreamingTranscriptionOptions(
+            strategy: .balanced,
+            implementation: .emulated,
+            commitment: .providerFinals,
+            emulation: EmulatedStreamingOptions(
+                window: .vadUtterances(.balancedDictation)
+            )
+        ))
+
+        XCTAssertEqual(resolved.commitment, .providerFinals)
     }
 
     @MainActor
