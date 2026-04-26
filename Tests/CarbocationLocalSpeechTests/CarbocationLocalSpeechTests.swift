@@ -284,6 +284,54 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(final.first?.audio.duration), 0.25, accuracy: 0.000_1)
     }
 
+    func testSpeechChunkerResetsOverlapAfterSilenceFinal() throws {
+        var chunker = SpeechChunker(configuration: SpeechChunkingConfiguration(
+            maximumChunkDuration: 10.0,
+            overlapDuration: 0.25,
+            silenceCommitDelay: 0.2,
+            minimumSpeechDuration: 0.1
+        ))
+
+        XCTAssertTrue(chunker.append(
+            AudioChunk(
+                samples: Array(repeating: 0.1, count: 400),
+                sampleRate: 1_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 0.4
+            ),
+            activity: VoiceActivityEvent(state: .speech, startTime: 0, endTime: 0.4)
+        ).isEmpty)
+
+        let final = chunker.append(
+            AudioChunk(
+                samples: Array(repeating: 0, count: 250),
+                sampleRate: 1_000,
+                channelCount: 1,
+                startTime: 0.4,
+                duration: 0.25
+            ),
+            activity: VoiceActivityEvent(state: .silence, startTime: 0.4, endTime: 0.65)
+        )
+        XCTAssertEqual(final.count, 1)
+        XCTAssertTrue(final[0].isFinal)
+
+        XCTAssertTrue(chunker.append(
+            AudioChunk(
+                samples: Array(repeating: 0.1, count: 400),
+                sampleRate: 1_000,
+                channelCount: 1,
+                startTime: 0.65,
+                duration: 0.4
+            ),
+            activity: VoiceActivityEvent(state: .speech, startTime: 0.65, endTime: 1.05)
+        ).isEmpty)
+
+        let next = try XCTUnwrap(chunker.finish().first)
+        XCTAssertEqual(next.startTime, 0.65, accuracy: 0.000_1)
+        XCTAssertEqual(next.audio.duration, 0.4, accuracy: 0.000_1)
+    }
+
     func testSpeechChunkerResetsAfterInputGap() throws {
         var chunker = SpeechChunker(configuration: SpeechChunkingConfiguration(
             maximumChunkDuration: 2.0,
@@ -870,6 +918,69 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertFalse(events.contains { event in
             if case .snapshot(let snapshot) = event {
                 return snapshot.transcript.text.contains("painful memory and painful memory")
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineTreatsPluralOverlapAsDuplicate() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            for index in 0..<2 {
+                continuation.yield(AudioChunk(
+                    samples: Array(repeating: 0.05, count: 8_000),
+                    sampleRate: 16_000,
+                    channelCount: 1,
+                    startTime: TimeInterval(index) * 0.5,
+                    duration: 0.5
+                ))
+            }
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(useCase: .dictation),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 1.0, updateInterval: 0.5, overlap: 0.25)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribe: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1:
+                    text = "scientists speculate that the oceans"
+                case 2:
+                    text = "The ocean may be a massive neural center"
+                default:
+                    return Transcript()
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            })
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == "scientists speculate that The ocean may be a massive neural center"
+            }
+            return false
+        })
+        XCTAssertFalse(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.transcript.text.contains("oceans The ocean")
             }
             return false
         })

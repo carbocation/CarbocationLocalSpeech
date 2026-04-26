@@ -103,11 +103,11 @@ struct WhisperStreamingDecodeTuning: Hashable, Sendable {
     static func resolve(for options: StreamingTranscriptionOptions) -> WhisperStreamingDecodeTuning {
         switch options.strategy {
         case .automatic, .balanced:
-            return WhisperStreamingDecodeTuning(singleSegment: true, maxTokens: 48, audioContext: 512)
+            return WhisperStreamingDecodeTuning(singleSegment: false, maxTokens: 0, audioContext: 0)
         case .lowestLatency:
             return WhisperStreamingDecodeTuning(singleSegment: true, maxTokens: 32, audioContext: 256)
         case .accurate:
-            return WhisperStreamingDecodeTuning(singleSegment: false, maxTokens: 0, audioContext: 768)
+            return WhisperStreamingDecodeTuning(singleSegment: false, maxTokens: 0, audioContext: 0)
         case .fileQuality:
             return WhisperStreamingDecodeTuning(singleSegment: false, maxTokens: 0, audioContext: 0)
         }

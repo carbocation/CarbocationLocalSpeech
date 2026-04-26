@@ -439,7 +439,7 @@ import Foundation
         var count = 0
         while count < first.count {
             let token = first[count]
-            guard tokenLists.allSatisfy({ count < $0.count && $0[count] == token }) else {
+            guard tokenLists.allSatisfy({ count < $0.count && tokensAreEquivalent($0[count], token) }) else {
                 break
             }
             count += 1
@@ -589,7 +589,7 @@ import Foundation
 
     private static func isPrefix(_ prefix: [String], of tokens: [String]) -> Bool {
         guard !prefix.isEmpty, prefix.count <= tokens.count else { return false }
-        return Array(tokens.prefix(prefix.count)) == prefix
+        return tokenSequencesMatch(Array(tokens.prefix(prefix.count)), prefix)
     }
 
     private static func suffixPrefixOverlapTokenCount(
@@ -600,7 +600,7 @@ import Foundation
         guard maximumOverlap > 0 else { return 0 }
 
         for count in stride(from: maximumOverlap, through: 1, by: -1) {
-            if Array(previousTokens.suffix(count)) == Array(currentTokens.prefix(count)) {
+            if tokenSequencesMatch(Array(previousTokens.suffix(count)), Array(currentTokens.prefix(count))) {
                 return count
             }
         }
@@ -626,7 +626,7 @@ import Foundation
             guard lastStart >= 1 else { continue }
             for start in 1...lastStart {
                 let previousSlice = Array(previousTokens[start..<(start + count)])
-                if previousSlice == currentPrefix {
+                if tokenSequencesMatch(previousSlice, currentPrefix) {
                     return start
                 }
             }
@@ -729,7 +729,7 @@ import Foundation
         for count in stride(from: maximumOverlap, through: 1, by: -1) {
             let committedSuffix = committedTokens.suffix(count).map(\.normalized)
             let newPrefix = newTokens.prefix(count).map(\.normalized)
-            if Array(committedSuffix) == Array(newPrefix) {
+            if tokenSequencesMatch(Array(committedSuffix), Array(newPrefix)) {
                 duplicateTokenCount = count
                 break
             }
@@ -791,6 +791,34 @@ import Foundation
             normalized: value.lowercased(),
             range: start..<end
         ))
+    }
+
+    private static func tokenSequencesMatch(_ lhs: [String], _ rhs: [String]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        return zip(lhs, rhs).allSatisfy { tokensAreEquivalent($0.0, $0.1) }
+    }
+
+    private static func tokensAreEquivalent(_ lhs: String, _ rhs: String) -> Bool {
+        guard lhs != rhs else { return true }
+        return !normalizedTokenAlternates(lhs).isDisjoint(with: normalizedTokenAlternates(rhs))
+    }
+
+    private static func normalizedTokenAlternates(_ token: String) -> Set<String> {
+        var alternates: Set<String> = [token]
+        if token.count > 4, token.hasSuffix("'s") {
+            alternates.insert(String(token.dropLast(2)))
+        }
+        if token.count > 5, token.hasSuffix("ies") {
+            alternates.insert(String(token.dropLast(3)) + "y")
+        }
+        if token.count > 4,
+           token.hasSuffix("s"),
+           !token.hasSuffix("ss"),
+           !token.hasSuffix("is"),
+           !token.hasSuffix("us") {
+            alternates.insert(String(token.dropLast()))
+        }
+        return alternates
     }
 
     private static func offset(_ segment: TranscriptSegment, by offset: TimeInterval) -> TranscriptSegment {

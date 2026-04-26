@@ -52,6 +52,9 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
     }
 
     func testStreamingDecodeTuningFollowsStrategy() {
+        let balanced = WhisperStreamingDecodeTuning.resolve(for: StreamingTranscriptionOptions(
+            strategy: .balanced
+        ))
         let lowestLatency = WhisperStreamingDecodeTuning.resolve(for: StreamingTranscriptionOptions(
             strategy: .lowestLatency
         ))
@@ -59,6 +62,9 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
             strategy: .fileQuality
         ))
 
+        XCTAssertFalse(balanced.singleSegment)
+        XCTAssertEqual(balanced.maxTokens, 0)
+        XCTAssertEqual(balanced.audioContext, 0)
         XCTAssertTrue(lowestLatency.singleSegment)
         XCTAssertGreaterThan(lowestLatency.maxTokens, 0)
         XCTAssertGreaterThan(lowestLatency.audioContext, 0)

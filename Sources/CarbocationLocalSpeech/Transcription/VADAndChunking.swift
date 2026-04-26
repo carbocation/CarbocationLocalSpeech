@@ -83,7 +83,7 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
 
         if silenceDuration >= configuration.silenceCommitDelay,
            speechDuration >= configuration.minimumSpeechDuration {
-            return [emitChunk(isFinal: true)]
+            return [emitChunk(isFinal: true, keepOverlap: false)]
         }
 
         if silenceDuration >= configuration.silenceCommitDelay,
