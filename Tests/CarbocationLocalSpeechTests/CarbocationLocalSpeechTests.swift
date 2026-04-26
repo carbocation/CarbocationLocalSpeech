@@ -133,6 +133,47 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(recommended?.id, "large-v3-turbo")
     }
 
+    func testSpeechModelDownloadConfigurationNormalizesUnsafeValues() {
+        let defaults = SpeechModelDownloadConfiguration.default
+        XCTAssertEqual(defaults.parallelConnections, SpeechModelDownloadConfiguration.defaultParallelConnections)
+        XCTAssertEqual(defaults.chunkSize, SpeechModelDownloadConfiguration.defaultChunkSize)
+
+        let normalized = SpeechModelDownloadConfiguration(
+            parallelConnections: 0,
+            chunkSize: 1,
+            requestTimeout: 1
+        )
+        XCTAssertEqual(normalized.parallelConnections, 1)
+        XCTAssertEqual(normalized.chunkSize, 1_024 * 1_024)
+        XCTAssertEqual(normalized.requestTimeout, 30)
+
+        let capped = SpeechModelDownloadConfiguration(
+            parallelConnections: SpeechModelDownloadConfiguration.maximumParallelConnections + 1
+        )
+        XCTAssertEqual(capped.parallelConnections, SpeechModelDownloadConfiguration.maximumParallelConnections)
+    }
+
+    @MainActor
+    func testModelLibraryAddsDownloadedPartialUsingRequestedFilename() throws {
+        let root = try makeTemporaryDirectory()
+        let partial = root.appendingPathComponent("cls-partial-abcdef.bin")
+        try Data("downloaded whisper weights".utf8).write(to: partial)
+
+        let library = SpeechModelLibrary(root: root.appendingPathComponent("SpeechModels", isDirectory: true))
+        let model = try library.add(
+            primaryAssetAt: partial,
+            displayName: "Base English",
+            filename: "ggml-base.en.bin",
+            source: .curated,
+            hfRepo: "ggerganov/whisper.cpp",
+            hfFilename: "ggml-base.en.bin"
+        )
+
+        XCTAssertEqual(model.primaryWeightsAsset?.relativePath, "ggml-base.en.bin")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: model.primaryWeightsURL(in: library.root)!.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
+    }
+
     func testPartialDownloadListingAndDeletion() throws {
         let root = try makeTemporaryDirectory()
         let partialsRoot = try SpeechModelDownloader.partialsDirectory(in: root)
@@ -157,7 +198,10 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         try Data(sidecar.utf8).write(to: sidecarURL)
 
         let partial = try XCTUnwrap(SpeechModelDownloader.listPartials(in: root).first)
+        XCTAssertEqual(partial.id, "abcdef")
         XCTAssertEqual(partial.displayName, "Base")
+        XCTAssertEqual(partial.hfRepo, "ggerganov/whisper.cpp")
+        XCTAssertEqual(partial.hfFilename, "ggml-base.en.bin")
         XCTAssertEqual(partial.bytesOnDisk, 30)
         XCTAssertEqual(partial.fractionComplete, 0.3, accuracy: 0.000_1)
 

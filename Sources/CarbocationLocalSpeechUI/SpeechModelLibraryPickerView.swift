@@ -1,5 +1,6 @@
 import AppKit
 import CarbocationLocalSpeech
+import Observation
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -7,34 +8,47 @@ import UniformTypeIdentifiers
 public struct SpeechModelLibraryPickerView: View {
     private let library: SpeechModelLibrary
     @Binding private var selectionStorageValue: String
+    private let title: String
+    private let confirmTitle: String
+    private let confirmDisabled: Bool
     private let systemOptions: [SpeechSystemModelOption]
     private let curatedCatalog: [CuratedSpeechModel]
     private let labelPolicy: SpeechModelPickerLabelPolicy
     private let physicalMemoryBytes: UInt64
-    private let onSelectionConfirmed: (SpeechModelSelection) -> Void
-    private let onDeleteModel: ((InstalledSpeechModel) -> Void)?
+    private let onSelectionConfirmed: @MainActor (SpeechModelSelection) -> Void
+    private let onDeleteModel: (@MainActor (InstalledSpeechModel) -> Void)?
     private let onDownloadCuratedModel: ((CuratedSpeechModel) -> Void)?
     private let onImportRequested: (() -> Void)?
     private let onCustomURLRequested: (() -> Void)?
 
-    @State private var activeDownloadIDs: Set<String> = []
+    @State private var activeDownload: SpeechModelLibraryDownload?
     @State private var notice: PickerNotice?
+    @State private var showCustomSheet = false
+    @State private var showDeleteConfirm: InstalledSpeechModel?
+    @State private var showDeletePartialConfirm: PartialSpeechModelDownload?
+    @State private var refreshToken = UUID()
 
     public init(
         library: SpeechModelLibrary,
         selectionStorageValue: Binding<String>,
+        title: String = "Choose a Speech Provider",
+        confirmTitle: String = "Use Selected Provider",
+        confirmDisabled: Bool = false,
         systemOptions: [SpeechSystemModelOption] = [],
         curatedCatalog: [CuratedSpeechModel] = CuratedSpeechModelCatalog.all,
         labelPolicy: SpeechModelPickerLabelPolicy = .default,
         physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory,
-        onSelectionConfirmed: @escaping (SpeechModelSelection) -> Void = { _ in },
-        onDeleteModel: ((InstalledSpeechModel) -> Void)? = nil,
+        onSelectionConfirmed: @escaping @MainActor (SpeechModelSelection) -> Void = { _ in },
+        onDeleteModel: (@MainActor (InstalledSpeechModel) -> Void)? = nil,
         onDownloadCuratedModel: ((CuratedSpeechModel) -> Void)? = nil,
         onImportRequested: (() -> Void)? = nil,
         onCustomURLRequested: (() -> Void)? = nil
     ) {
         self.library = library
         self._selectionStorageValue = selectionStorageValue
+        self.title = title
+        self.confirmTitle = confirmTitle
+        self.confirmDisabled = confirmDisabled
         self.systemOptions = systemOptions
         self.curatedCatalog = curatedCatalog
         self.labelPolicy = labelPolicy
@@ -46,95 +60,22 @@ public struct SpeechModelLibraryPickerView: View {
         self.onCustomURLRequested = onCustomURLRequested
     }
 
-    public var body: some View {
-        List {
-            if let notice {
-                Section {
-                    Label(notice.message, systemImage: notice.systemImageName)
-                        .font(.caption)
-                        .foregroundStyle(color(for: notice.tone))
-                }
-            }
+    private var selectedSystemOption: SpeechSystemModelOption? {
+        systemOptions.first { $0.selection.storageValue == selectionStorageValue }
+    }
 
-            if !systemOptions.isEmpty {
-                Section("System Providers") {
-                    ForEach(systemOptions) { option in
-                        providerButton(option)
-                    }
-                }
-            }
+    private var selectedInstalledModel: InstalledSpeechModel? {
+        library.model(id: selectionStorageValue)
+    }
 
-            Section("Installed Models") {
-                if library.models.isEmpty {
-                    Text("No installed speech models")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(library.models) { model in
-                        installedModelButton(model)
-                    }
-                }
-            }
-
-            if !library.partials.isEmpty {
-                Section("Interrupted Downloads") {
-                    ForEach(library.partials) { partial in
-                        HStack {
-                            Label(partial.displayName, systemImage: "arrow.down.circle")
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .layoutPriority(1)
-                            Spacer()
-                            Text(partial.fractionComplete, format: .percent.precision(.fractionLength(0)))
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: true, vertical: false)
-                            Button(role: .destructive) {
-                                library.deletePartial(partial)
-                                notice = PickerNotice(
-                                    message: "Deleted interrupted download for \(partial.displayName).",
-                                    tone: .positive
-                                )
-                            } label: {
-                                Image(systemName: "trash")
-                            }
-                            .buttonStyle(.borderless)
-                        }
-                    }
-                }
-            }
-
-            Section("Curated Whisper Models") {
-                ForEach(curatedCatalog) { model in
-                    curatedRow(model)
-                }
-            }
-
-            Section {
-                Button(action: importModel) {
-                    Label("Import Local Model", systemImage: "square.and.arrow.down")
-                }
-                Button(action: requestCustomURLDownload) {
-                    Label("Download From URL", systemImage: "link.badge.plus")
-                }
-                Button {
-                    library.refresh()
-                    notice = PickerNotice(message: "Model library refreshed.", tone: .secondary)
-                } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
-                }
-                Button {
-                    NSWorkspace.shared.activateFileViewerSelecting([library.root])
-                } label: {
-                    Label("Reveal Folder", systemImage: "folder")
-                }
-            }
-
-            Section("Storage") {
-                LabeledContent("Installed Usage") {
-                    Text(ByteCountFormatter.string(fromByteCount: library.totalDiskUsageBytes(), countStyle: .file))
-                }
-            }
+    private var selectedSelection: SpeechModelSelection? {
+        if let selectedSystemOption {
+            return selectedSystemOption.selection
         }
-        .listStyle(.inset)
+        if let selectedInstalledModel {
+            return .installed(selectedInstalledModel.id)
+        }
+        return nil
     }
 
     private var recommendedCuratedModel: CuratedSpeechModel? {
@@ -152,41 +93,274 @@ public struct SpeechModelLibraryPickerView: View {
         )
     }
 
-    private func providerButton(_ option: SpeechSystemModelOption) -> some View {
-        Button {
-            selectionStorageValue = option.selection.storageValue
-            onSelectionConfirmed(option.selection)
-        } label: {
-            rowContent(
-                title: option.displayName,
-                subtitle: option.subtitle,
-                systemImageName: option.systemImageName,
-                isSelected: selectionStorageValue == option.selection.storageValue,
-                statusLabel: labelPolicy.systemProviderLabel(for: option)
-            )
+    public var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    if !systemOptions.isEmpty {
+                        systemProviderSection
+                        Divider()
+                    }
+                    installedSection
+                    if !library.partials.isEmpty {
+                        Divider()
+                        interruptedSection
+                    }
+                    Divider()
+                    downloadSection
+                    if let notice {
+                        Label(notice.message, systemImage: notice.systemImageName)
+                            .font(.callout)
+                            .foregroundStyle(color(for: notice.tone))
+                    }
+                }
+                .padding(20)
+                .id(refreshToken)
+            }
+            Divider()
+            footer
         }
+        .task {
+            refresh()
+        }
+        .sheet(isPresented: $showCustomSheet) {
+            CustomSpeechDownloadSheet { request in
+                startDownload(
+                    from: request.sourceURL,
+                    displayName: request.displayName,
+                    filename: request.filename,
+                    source: request.source,
+                    hfRepo: request.hfRepo,
+                    hfFilename: request.hfFilename,
+                    expectedSHA256: nil,
+                    capabilities: .whisperCppDefault
+                )
+            }
+        }
+        .alert(
+            "Delete \(showDeleteConfirm?.displayName ?? "model")?",
+            isPresented: Binding(
+                get: { showDeleteConfirm != nil },
+                set: { if !$0 { showDeleteConfirm = nil } }
+            ),
+            presenting: showDeleteConfirm
+        ) { model in
+            Button("Delete", role: .destructive) { delete(model) }
+            Button("Cancel", role: .cancel) {}
+        } message: { model in
+            Text("This will remove \(formatBytes(model.totalSizeBytes)) from disk.")
+        }
+        .alert(
+            "Delete interrupted download?",
+            isPresented: Binding(
+                get: { showDeletePartialConfirm != nil },
+                set: { if !$0 { showDeletePartialConfirm = nil } }
+            ),
+            presenting: showDeletePartialConfirm
+        ) { partial in
+            Button("Delete", role: .destructive) {
+                library.deletePartial(partial)
+                notice = PickerNotice(
+                    message: "Deleted interrupted download for \(partial.displayName).",
+                    tone: .positive
+                )
+                refresh()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { partial in
+            Text("This will delete the partial download for \(partial.displayName) and reclaim \(formatBytes(partial.bytesOnDisk)).")
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "waveform.and.mic")
+                .font(.system(size: 28, weight: .regular))
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.title3.bold())
+                Text(headerSubtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
+    }
+
+    private var headerSubtitle: String {
+        if systemOptions.isEmpty {
+            return "Installed Whisper models, curated downloads, Hugging Face URLs, HTTPS URLs, and local .bin imports."
+        }
+        return "System providers, installed Whisper models, curated downloads, Hugging Face URLs, HTTPS URLs, and local .bin imports."
+    }
+
+    @ViewBuilder
+    private var systemProviderSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("System Providers")
+                .font(.headline)
+
+            ForEach(systemOptions) { option in
+                systemProviderRow(option)
+            }
+        }
+    }
+
+    private func systemProviderRow(_ option: SpeechSystemModelOption) -> some View {
+        let isSelected = option.selection.storageValue == selectionStorageValue
+        let statusLabel = labelPolicy.systemProviderLabel(for: option)
+
+        return Button {
+            selectionStorageValue = option.selection.storageValue
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+
+                Image(systemName: option.systemImageName)
+                    .foregroundStyle(.tint)
+                    .frame(width: 18)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(option.displayName)
+                            .font(.body)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        if let statusLabel {
+                            statusBadge(statusLabel)
+                        }
+                    }
+                    Text(option.subtitle.isEmpty ? option.availability.displayMessage : option.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Spacer()
+            }
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
         .disabled(!option.availability.shouldOfferModelOption)
     }
 
-    private func installedModelButton(_ model: InstalledSpeechModel) -> some View {
+    @ViewBuilder
+    private var installedSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Installed Models")
+                    .font(.headline)
+                Spacer()
+                Text("Total: \(formatBytes(library.totalDiskUsageBytes()))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if library.models.isEmpty {
+                Text("No Whisper models installed. Download one below, or import an existing whisper.cpp .bin file.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 6)
+            } else {
+                ForEach(library.models) { model in
+                    installedModelRow(model)
+                }
+            }
+
+            HStack {
+                Button {
+                    importLocalModel()
+                } label: {
+                    Label("Import .bin", systemImage: "square.and.arrow.down")
+                }
+
+                Button {
+                    revealModelsFolder()
+                } label: {
+                    Label("Reveal Folder", systemImage: "folder")
+                }
+
+                Spacer()
+
+                Button {
+                    refresh()
+                    notice = PickerNotice(message: "Model library refreshed.", tone: .secondary)
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+            }
+        }
+    }
+
+    private func installedModelRow(_ model: InstalledSpeechModel) -> some View {
         let selection = SpeechModelSelection.installed(model.id)
+        let isSelected = selection.storageValue == selectionStorageValue
+        let statusLabel = labelPolicy.installedModelLabel(
+            for: model,
+            recommendedCuratedModel: recommendedCuratedModel,
+            bestInstalledCuratedModel: bestInstalledCuratedModel
+        )
 
         return Button {
             selectionStorageValue = selection.storageValue
-            onSelectionConfirmed(selection)
         } label: {
-            rowContent(
-                title: model.displayName,
-                subtitle: installedSubtitle(model),
-                systemImageName: "waveform",
-                isSelected: selectionStorageValue == selection.storageValue,
-                statusLabel: labelPolicy.installedModelLabel(
-                    for: model,
-                    recommendedCuratedModel: recommendedCuratedModel,
-                    bestInstalledCuratedModel: bestInstalledCuratedModel
-                )
-            )
+            HStack(spacing: 10) {
+                Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(model.displayName)
+                            .font(.body)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        if let statusLabel {
+                            statusBadge(statusLabel)
+                        }
+                    }
+                    HStack(spacing: 6) {
+                        if let variant = model.variant {
+                            Text(variant)
+                                .font(.caption.monospaced())
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(.quaternary, in: .rect(cornerRadius: 3))
+                        }
+                        Text(formatBytes(model.totalSizeBytes))
+                        Text(languageScopeLabel(model.languageScope))
+                        if let repo = model.hfRepo {
+                            Text(repo)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                }
+
+                Spacer()
+
+                Button {
+                    showDeleteConfirm = model
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("Delete this model")
+            }
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .contextMenu {
             Button {
                 NSWorkspace.shared.activateFileViewerSelecting([model.directory(in: library.root)])
@@ -194,300 +368,190 @@ public struct SpeechModelLibraryPickerView: View {
                 Label("Reveal", systemImage: "folder")
             }
             Button(role: .destructive) {
-                deleteModel(model)
+                showDeleteConfirm = model
             } label: {
                 Label("Delete", systemImage: "trash")
             }
         }
     }
 
-    private func curatedRow(_ model: CuratedSpeechModel) -> some View {
-        let downloadID = curatedDownloadID(for: model)
-        let isDownloading = activeDownloadIDs.contains(downloadID)
-        let isInstalled = library.models.contains {
+    @ViewBuilder
+    private var interruptedSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Interrupted Downloads")
+                .font(.headline)
+            ForEach(library.partials) { partial in
+                interruptedRow(partial)
+            }
+        }
+    }
+
+    private func interruptedRow(_ partial: PartialSpeechModelDownload) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(partial.displayName)
+                    .font(.body)
+                    .lineLimit(1)
+                Text("\(formatBytes(partial.bytesOnDisk)) of \(formatBytes(partial.totalBytes)) - \(Int(partial.fractionComplete * 100))%")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Resume") {
+                resume(partial)
+            }
+            .disabled(activeDownload != nil)
+            Button {
+                showDeletePartialConfirm = partial
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .help("Delete partial download")
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private var downloadSection: some View {
+        let recommendedID = recommendedCuratedModel?.id
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Download a Model")
+                .font(.headline)
+            Text(recommendationSummary())
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if let activeDownload {
+                activeDownloadRow(activeDownload)
+            } else {
+                ForEach(curatedCatalog) { model in
+                    curatedModelRow(model, isRecommended: recommendedID == model.id)
+                }
+                Button {
+                    requestCustomDownload()
+                } label: {
+                    Label("Paste a Hugging Face or HTTPS URL", systemImage: "link")
+                }
+                .padding(.top, 4)
+            }
+        }
+    }
+
+    private func curatedModelRow(_ model: CuratedSpeechModel, isRecommended: Bool) -> some View {
+        let alreadyInstalled = library.models.contains {
             SpeechModelPickerLabelPolicy.installedModel($0, matches: model)
         }
-        let statusLabel = labelPolicy.curatedModelLabel(
-            for: model,
-            recommendedCuratedModel: recommendedCuratedModel
-        )
 
-        return HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Image(systemName: "arrow.down.circle")
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 2) {
+        return HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(model.displayName)
+                        .font(.body)
                         .lineLimit(1)
-                        .truncationMode(.tail)
-                    if let statusLabel {
-                        status(statusLabel)
-                            .fixedSize(horizontal: true, vertical: false)
+                    if isRecommended, let recommendedLabel = labelPolicy.recommendedLabel {
+                        statusBadge(recommendedLabel)
                     }
                 }
                 Text(model.subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
-                    .truncationMode(.tail)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .layoutPriority(1)
-            Spacer(minLength: 8)
-            VStack(alignment: .trailing, spacing: 4) {
-                Text(ByteCountFormatter.string(fromByteCount: model.approxSizeBytes, countStyle: .file))
+                Text("\(formatBytes(model.approxSizeBytes)) - \(languageScopeLabel(model.languageScope)) - ~\(model.recommendedRAMGB) GB RAM")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: true, vertical: false)
-                if isInstalled {
-                    status(SpeechModelPickerStatusLabel("Installed", systemImageName: "checkmark.circle", tone: .positive))
-                        .fixedSize(horizontal: true, vertical: false)
-                } else if isDownloading {
-                    ProgressView()
-                        .controlSize(.small)
-                        .help("Downloading \(model.displayName)")
-                } else {
-                    Button {
-                        downloadCuratedModel(model)
-                    } label: {
-                        Label("Download", systemImage: "arrow.down")
-                    }
-                    .buttonStyle(.borderless)
-                    .controlSize(.small)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .help(model.downloadURL == nil ? "No download URL is configured." : "Download \(model.displayName)")
-                    .disabled(model.downloadURL == nil)
-                }
-            }
-        }
-    }
-
-    private func deleteModel(_ model: InstalledSpeechModel) {
-        if let onDeleteModel {
-            onDeleteModel(model)
-            return
-        }
-
-        do {
-            try library.delete(id: model.id)
-            notice = PickerNotice(message: "Deleted \(model.displayName).", tone: .positive)
-        } catch {
-            notice = PickerNotice(
-                message: "Failed to delete \(model.displayName): \(error.localizedDescription)",
-                tone: .warning
-            )
-        }
-    }
-
-    private func importModel() {
-        if let onImportRequested {
-            onImportRequested()
-            return
-        }
-
-        let panel = NSOpenPanel()
-        panel.title = "Import Whisper Model"
-        panel.message = "Choose a whisper.cpp .bin model file."
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        if let binType = UTType(filenameExtension: "bin") {
-            panel.allowedContentTypes = [binType]
-        }
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            let model = try library.importFile(at: url)
-            notice = PickerNotice(message: "Imported \(model.displayName).", tone: .positive)
-        } catch {
-            notice = PickerNotice(
-                message: "Failed to import model: \(error.localizedDescription)",
-                tone: .warning
-            )
-        }
-    }
-
-    private func requestCustomURLDownload() {
-        if let onCustomURLRequested {
-            onCustomURLRequested()
-            return
-        }
-
-        let alert = NSAlert()
-        alert.messageText = "Download Whisper Model"
-        alert.informativeText = "Enter a Hugging Face model path or a direct HTTPS URL to a whisper.cpp .bin file."
-        alert.addButton(withTitle: "Download")
-        alert.addButton(withTitle: "Cancel")
-
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 24))
-        input.placeholderString = "ggerganov/whisper.cpp/ggml-base.en.bin"
-        alert.accessoryView = input
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let rawValue = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawValue.isEmpty else { return }
-
-        if let hfModel = HuggingFaceSpeechModelURL.parse(rawValue),
-           let sourceURL = CuratedSpeechModel.huggingFaceResolveURL(repo: hfModel.repo, filename: hfModel.filename) {
-            startDownload(
-                from: sourceURL,
-                displayName: displayName(for: sourceURL),
-                source: .customURL,
-                downloadID: "url:\(sourceURL.absoluteString)",
-                hfRepo: hfModel.repo,
-                hfFilename: hfModel.filename,
-                expectedSHA256: nil,
-                capabilities: .whisperCppDefault
-            )
-            return
-        }
-
-        guard let sourceURL = URL(string: rawValue),
-              sourceURL.scheme?.lowercased() == "https",
-              sourceURL.pathExtension.lowercased() == "bin"
-        else {
-            notice = PickerNotice(message: "Enter an HTTPS URL ending in .bin.", tone: .warning)
-            return
-        }
-
-        startDownload(
-            from: sourceURL,
-            displayName: displayName(for: sourceURL),
-            source: .customURL,
-            downloadID: "url:\(sourceURL.absoluteString)",
-            hfRepo: nil,
-            hfFilename: nil,
-            expectedSHA256: nil,
-            capabilities: .whisperCppDefault
-        )
-    }
-
-    private func downloadCuratedModel(_ model: CuratedSpeechModel) {
-        if let onDownloadCuratedModel {
-            onDownloadCuratedModel(model)
-            return
-        }
-
-        guard let sourceURL = model.downloadURL else {
-            notice = PickerNotice(message: "No download URL is configured for \(model.displayName).", tone: .warning)
-            return
-        }
-
-        startDownload(
-            from: sourceURL,
-            displayName: model.displayName,
-            source: .curated,
-            downloadID: curatedDownloadID(for: model),
-            hfRepo: model.hfRepo,
-            hfFilename: model.hfFilename,
-            expectedSHA256: model.sha256,
-            capabilities: model.capabilities
-        )
-    }
-
-    private func startDownload(
-        from sourceURL: URL,
-        displayName: String,
-        source: SpeechModelSource,
-        downloadID: String,
-        hfRepo: String?,
-        hfFilename: String?,
-        expectedSHA256: String?,
-        capabilities: SpeechModelCapabilities
-    ) {
-        guard activeDownloadIDs.insert(downloadID).inserted else { return }
-        notice = PickerNotice(message: "Downloading \(displayName)...", tone: .secondary)
-
-        Task { @MainActor in
-            do {
-                let result = try await SpeechModelDownloader.download(
-                    from: sourceURL,
-                    displayName: displayName,
-                    expectedSHA256: expectedSHA256,
-                    to: library.root
-                )
-                _ = try library.add(
-                    primaryAssetAt: result.tempURL,
-                    displayName: displayName,
-                    source: source,
-                    sourceURL: sourceURL,
-                    hfRepo: hfRepo,
-                    hfFilename: hfFilename,
-                    sha256: result.sha256,
-                    capabilities: capabilities
-                )
-                notice = PickerNotice(message: "Installed \(displayName).", tone: .positive)
-            } catch {
-                notice = PickerNotice(
-                    message: "Failed to download \(displayName): \(error.localizedDescription)",
-                    tone: .warning
-                )
-            }
-            activeDownloadIDs.remove(downloadID)
-        }
-    }
-
-    private func curatedDownloadID(for model: CuratedSpeechModel) -> String {
-        "curated:\(model.id)"
-    }
-
-    private func displayName(for sourceURL: URL) -> String {
-        let displayName = sourceURL.deletingPathExtension().lastPathComponent
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return displayName.isEmpty ? "Whisper Model" : displayName
-    }
-
-    private func rowContent(
-        title: String,
-        subtitle: String,
-        systemImageName: String,
-        isSelected: Bool,
-        statusLabel: SpeechModelPickerStatusLabel?
-    ) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Image(systemName: systemImageName)
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
                     .lineLimit(1)
-                    .truncationMode(.tail)
-                if !subtitle.isEmpty {
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
+            }
+
+            Spacer()
+
+            if alreadyInstalled {
+                Label("Installed", systemImage: "checkmark.circle")
+                    .foregroundStyle(.green)
+                    .font(.caption)
+                    .fixedSize(horizontal: true, vertical: false)
+            } else {
+                Button("Download") {
+                    downloadCuratedModel(model)
                 }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .layoutPriority(1)
-            Spacer(minLength: 8)
-            if let statusLabel {
-                status(statusLabel)
-                    .fixedSize(horizontal: true, vertical: false)
-            }
-            if isSelected {
-                Image(systemName: "checkmark")
-                    .foregroundStyle(.tint)
-                    .fixedSize(horizontal: true, vertical: false)
+                .disabled(model.downloadURL == nil)
             }
         }
-        .contentShape(Rectangle())
+        .padding(.vertical, 4)
     }
 
-    private func status(_ label: SpeechModelPickerStatusLabel) -> some View {
-        Label {
-            Text(label.title)
-        } icon: {
-            if let image = label.systemImageName {
-                Image(systemName: image)
+    private func activeDownloadRow(_ download: SpeechModelLibraryDownload) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Downloading \(download.displayName)")
+                .font(.body)
+                .lineLimit(1)
+            ProgressView(value: download.progress.fractionComplete)
+            HStack {
+                Text("\(formatBytes(download.progress.bytesReceived)) of \(formatBytes(download.progress.totalBytes))")
+                if download.progress.bytesPerSecond > 0 {
+                    Text("\(formatBytes(Int64(download.progress.bytesPerSecond)))/s")
+                }
+                Spacer()
+                Button("Cancel", role: .destructive) {
+                    download.cancel()
+                    activeDownload = nil
+                    refresh()
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            if let errorMessage = download.errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
             }
         }
-        .font(.caption)
+        .padding(.vertical, 4)
+    }
+
+    private var footer: some View {
+        HStack {
+            if let selectedSystemOption {
+                Label(selectedSystemOption.displayName, systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            } else if let selectedInstalledModel {
+                Label(selectedInstalledModel.displayName, systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            } else {
+                Label("Select a provider", systemImage: "circle")
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button(confirmTitle) {
+                if let selectedSelection {
+                    onSelectionConfirmed(selectedSelection)
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(selectedSelection == nil || confirmDisabled)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+    }
+
+    private func statusBadge(_ label: SpeechModelPickerStatusLabel) -> some View {
+        HStack(spacing: 3) {
+            if let systemImageName = label.systemImageName {
+                Image(systemName: systemImageName)
+            }
+            Text(label.title)
+        }
+        .font(.caption2)
+        .fontWeight(.semibold)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(color(for: label.tone).opacity(0.15), in: Capsule())
         .foregroundStyle(color(for: label.tone))
-        .labelStyle(.titleAndIcon)
     }
 
     private func color(for tone: SpeechModelPickerStatusLabel.Tone) -> Color {
@@ -503,10 +567,391 @@ public struct SpeechModelLibraryPickerView: View {
         }
     }
 
-    private func installedSubtitle(_ model: InstalledSpeechModel) -> String {
-        let size = ByteCountFormatter.string(fromByteCount: model.totalSizeBytes, countStyle: .file)
-        let variant = model.variant.map { " \($0)" } ?? ""
-        return "\(model.providerKind.rawValue)\(variant) - \(size)"
+    private func downloadCuratedModel(_ model: CuratedSpeechModel) {
+        if let onDownloadCuratedModel {
+            onDownloadCuratedModel(model)
+            refresh()
+            return
+        }
+
+        guard let sourceURL = model.downloadURL else {
+            notice = PickerNotice(message: "No download URL is configured for \(model.displayName).", tone: .warning)
+            return
+        }
+
+        startDownload(
+            from: sourceURL,
+            displayName: model.displayName,
+            filename: model.hfFilename ?? sourceURL.lastPathComponent,
+            source: .curated,
+            hfRepo: model.hfRepo,
+            hfFilename: model.hfFilename,
+            expectedSHA256: model.sha256,
+            capabilities: model.capabilities
+        )
+    }
+
+    private func resume(_ partial: PartialSpeechModelDownload) {
+        let curated = curatedCatalog.first {
+            $0.hfRepo == partial.hfRepo && $0.hfFilename == partial.hfFilename
+        }
+        let sourceURL = curated?.downloadURL ?? partial.sourceURL
+        startDownload(
+            from: sourceURL,
+            displayName: partial.displayName,
+            filename: partial.hfFilename ?? sourceURL.lastPathComponent,
+            source: curated == nil ? .customURL : .curated,
+            hfRepo: partial.hfRepo,
+            hfFilename: partial.hfFilename,
+            expectedSHA256: curated?.sha256,
+            capabilities: curated?.capabilities ?? .whisperCppDefault
+        )
+    }
+
+    private func requestCustomDownload() {
+        if let onCustomURLRequested {
+            onCustomURLRequested()
+            refresh()
+            return
+        }
+        showCustomSheet = true
+    }
+
+    private func startDownload(
+        from sourceURL: URL,
+        displayName: String,
+        filename: String,
+        source: SpeechModelSource,
+        hfRepo: String?,
+        hfFilename: String?,
+        expectedSHA256: String?,
+        capabilities: SpeechModelCapabilities
+    ) {
+        guard activeDownload == nil else { return }
+        notice = nil
+        let download = SpeechModelLibraryDownload(
+            sourceURL: sourceURL,
+            displayName: displayName,
+            filename: filename,
+            source: source,
+            hfRepo: hfRepo,
+            hfFilename: hfFilename,
+            expectedSHA256: expectedSHA256,
+            capabilities: capabilities
+        )
+        activeDownload = download
+        download.start(into: library) { result in
+            switch result {
+            case .success(let model):
+                if selectionStorageValue.isEmpty {
+                    selectionStorageValue = SpeechModelSelection.installed(model.id).storageValue
+                }
+                notice = PickerNotice(message: "Installed \(model.displayName).", tone: .positive)
+            case .failure(let error):
+                notice = PickerNotice(
+                    message: "Failed to download \(displayName): \(error.localizedDescription)",
+                    tone: .warning
+                )
+            }
+            activeDownload = nil
+            refresh()
+        }
+    }
+
+    private func importLocalModel() {
+        if let onImportRequested {
+            onImportRequested()
+            refresh()
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.title = "Import Whisper Model"
+        panel.message = "Choose a whisper.cpp .bin model file."
+        panel.allowedContentTypes = [UTType(filenameExtension: "bin") ?? .data]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.directoryURL = library.root
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let didStart = url.startAccessingSecurityScopedResource()
+        defer { if didStart { url.stopAccessingSecurityScopedResource() } }
+
+        do {
+            let model = try library.importFile(at: url)
+            if selectionStorageValue.isEmpty {
+                selectionStorageValue = SpeechModelSelection.installed(model.id).storageValue
+            }
+            notice = PickerNotice(message: "Imported \(model.displayName).", tone: .positive)
+            refresh()
+        } catch {
+            notice = PickerNotice(
+                message: "Failed to import model: \(error.localizedDescription)",
+                tone: .warning
+            )
+        }
+    }
+
+    private func delete(_ model: InstalledSpeechModel) {
+        do {
+            if let onDeleteModel {
+                onDeleteModel(model)
+                library.refresh()
+            } else {
+                try library.delete(id: model.id)
+            }
+            if selectionStorageValue == SpeechModelSelection.installed(model.id).storageValue {
+                selectionStorageValue = systemOptions.first?.selection.storageValue
+                    ?? library.models.first.map { SpeechModelSelection.installed($0.id).storageValue }
+                    ?? ""
+            }
+            notice = PickerNotice(message: "Deleted \(model.displayName).", tone: .positive)
+            refresh()
+        } catch {
+            notice = PickerNotice(
+                message: "Failed to delete \(model.displayName): \(error.localizedDescription)",
+                tone: .warning
+            )
+        }
+    }
+
+    private func revealModelsFolder() {
+        NSWorkspace.shared.activateFileViewerSelecting([library.root])
+    }
+
+    private func refresh() {
+        library.refresh()
+        normalizeSelection()
+        refreshToken = UUID()
+    }
+
+    private func normalizeSelection() {
+        if selectionStorageValue.isEmpty {
+            selectionStorageValue = systemOptions.first?.selection.storageValue
+                ?? library.models.first.map { SpeechModelSelection.installed($0.id).storageValue }
+                ?? ""
+        } else if selectedSystemOption == nil && selectedInstalledModel == nil {
+            if case .system = SpeechModelSelection(storageValue: selectionStorageValue),
+               systemOptions.isEmpty {
+                return
+            }
+            selectionStorageValue = systemOptions.first?.selection.storageValue
+                ?? library.models.first.map { SpeechModelSelection.installed($0.id).storageValue }
+                ?? ""
+        }
+    }
+
+    private func recommendationSummary() -> String {
+        let memory = formatBytes(Int64(min(physicalMemoryBytes, UInt64(Int64.max))))
+        if let recommendedCuratedModel {
+            return "\(memory) RAM detected. Recommended for this Mac: \(recommendedCuratedModel.displayName)."
+        }
+        return "\(memory) RAM detected."
+    }
+
+    private func languageScopeLabel(_ scope: SpeechLanguageScope) -> String {
+        switch scope {
+        case .englishOnly:
+            return "English"
+        case .multilingual:
+            return "Multilingual"
+        case .languageSpecific:
+            return "Language-specific"
+        case .unknown:
+            return "Unknown language"
+        }
+    }
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        guard bytes > 0 else { return "0 B" }
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useGB]
+        formatter.countStyle = .binary
+        return formatter.string(fromByteCount: bytes)
+    }
+}
+
+@MainActor
+@Observable
+private final class SpeechModelLibraryDownload {
+    var progress = SpeechDownloadProgress(bytesReceived: 0, totalBytes: 0, bytesPerSecond: 0)
+    var isRunning = false
+    var errorMessage: String?
+
+    let sourceURL: URL
+    let displayName: String
+    let filename: String
+    let source: SpeechModelSource
+    let hfRepo: String?
+    let hfFilename: String?
+    let expectedSHA256: String?
+    let capabilities: SpeechModelCapabilities
+
+    @ObservationIgnored
+    private var task: Task<Void, Never>?
+
+    init(
+        sourceURL: URL,
+        displayName: String,
+        filename: String,
+        source: SpeechModelSource,
+        hfRepo: String?,
+        hfFilename: String?,
+        expectedSHA256: String?,
+        capabilities: SpeechModelCapabilities
+    ) {
+        self.sourceURL = sourceURL
+        self.displayName = displayName
+        self.filename = filename
+        self.source = source
+        self.hfRepo = hfRepo
+        self.hfFilename = hfFilename
+        self.expectedSHA256 = expectedSHA256
+        self.capabilities = capabilities
+    }
+
+    func start(
+        into library: SpeechModelLibrary,
+        completion: @escaping @MainActor (Result<InstalledSpeechModel, Error>) -> Void
+    ) {
+        guard !isRunning else { return }
+        isRunning = true
+        errorMessage = nil
+
+        task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await SpeechModelDownloader.download(
+                    from: sourceURL,
+                    displayName: displayName,
+                    expectedSHA256: expectedSHA256,
+                    to: library.root,
+                    onProgress: { [weak self] progress in
+                        Task { @MainActor [weak self] in
+                            self?.progress = progress
+                        }
+                    }
+                )
+                let model = try library.add(
+                    primaryAssetAt: result.tempURL,
+                    displayName: displayName,
+                    filename: filename,
+                    source: source,
+                    sourceURL: sourceURL,
+                    hfRepo: hfRepo,
+                    hfFilename: hfFilename,
+                    sha256: result.sha256,
+                    capabilities: capabilities
+                )
+                isRunning = false
+                completion(.success(model))
+            } catch is CancellationError {
+                isRunning = false
+                errorMessage = SpeechModelDownloaderError.cancelled.localizedDescription
+                completion(.failure(SpeechModelDownloaderError.cancelled))
+            } catch {
+                isRunning = false
+                errorMessage = error.localizedDescription
+                completion(.failure(error))
+            }
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+        isRunning = false
+    }
+}
+
+private struct SpeechCustomDownloadRequest: Hashable {
+    var sourceURL: URL
+    var displayName: String
+    var filename: String
+    var source: SpeechModelSource
+    var hfRepo: String?
+    var hfFilename: String?
+}
+
+private struct CustomSpeechDownloadSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var input = ""
+    @State private var displayName = ""
+    @State private var parseError: String?
+
+    let onSubmit: (SpeechCustomDownloadRequest) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Download Whisper Model")
+                .font(.title3.bold())
+
+            TextField(
+                "https://huggingface.co/<repo>/resolve/main/<file>.bin",
+                text: $input,
+                axis: .vertical
+            )
+            .textFieldStyle(.roundedBorder)
+            .lineLimit(2...4)
+
+            TextField("Display name", text: $displayName)
+                .textFieldStyle(.roundedBorder)
+
+            if let parseError {
+                Label(parseError, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                    .font(.callout)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Download") { submit() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 500)
+    }
+
+    private func submit() {
+        let rawValue = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawValue.isEmpty else { return }
+
+        if let hfModel = HuggingFaceSpeechModelURL.parse(rawValue),
+           let sourceURL = CuratedSpeechModel.huggingFaceResolveURL(repo: hfModel.repo, filename: hfModel.filename) {
+            let name = displayName.nilIfEmpty ?? hfModel.filename.replacingOccurrences(of: ".bin", with: "")
+            onSubmit(SpeechCustomDownloadRequest(
+                sourceURL: sourceURL,
+                displayName: name,
+                filename: hfModel.filename,
+                source: .customURL,
+                hfRepo: hfModel.repo,
+                hfFilename: hfModel.filename
+            ))
+            dismiss()
+            return
+        }
+
+        guard let sourceURL = URL(string: rawValue),
+              sourceURL.scheme?.lowercased() == "https",
+              sourceURL.pathExtension.lowercased() == "bin"
+        else {
+            parseError = "Expected a Hugging Face URL, repo/file.bin path, or direct HTTPS URL ending in .bin."
+            return
+        }
+
+        let name = displayName.nilIfEmpty ?? sourceURL.deletingPathExtension().lastPathComponent
+        onSubmit(SpeechCustomDownloadRequest(
+            sourceURL: sourceURL,
+            displayName: name,
+            filename: sourceURL.lastPathComponent,
+            source: .customURL,
+            hfRepo: nil,
+            hfFilename: nil
+        ))
+        dismiss()
     }
 }
 
@@ -525,5 +970,12 @@ private struct PickerNotice: Equatable {
         case .secondary:
             return "info.circle"
         }
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

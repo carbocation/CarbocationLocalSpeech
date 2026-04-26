@@ -64,7 +64,7 @@ private final class CLSSmokeAppDelegate: NSObject, NSApplicationDelegate {
 
 @MainActor
 private struct CLSSmokeRootView: View {
-    @State private var selectionStorageValue = SpeechSystemModelID.appleSpeech.rawValue
+    @AppStorage("CLSSmoke.selectedSpeechModelSelection") private var selectionStorageValue = SpeechSystemModelID.appleSpeech.rawValue
     @State private var systemOptions: [SpeechSystemModelOption] = []
     @State private var events: [TranscriptEvent] = []
 

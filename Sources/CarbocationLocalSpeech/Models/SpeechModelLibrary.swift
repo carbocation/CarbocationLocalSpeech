@@ -132,6 +132,7 @@ public final class SpeechModelLibrary {
     public func add(
         primaryAssetAt temporaryURL: URL,
         displayName: String,
+        filename requestedFilename: String? = nil,
         source: SpeechModelSource,
         sourceURL: URL? = nil,
         hfRepo: String? = nil,
@@ -139,7 +140,7 @@ public final class SpeechModelLibrary {
         sha256: String? = nil,
         capabilities: SpeechModelCapabilities = .whisperCppDefault
     ) throws -> InstalledSpeechModel {
-        let filename = temporaryURL.lastPathComponent
+        let filename = requestedFilename?.nilIfBlank ?? temporaryURL.lastPathComponent
         guard filename.lowercased().hasSuffix(".bin") else {
             throw SpeechModelLibraryError.notAWhisperModel(filename)
         }
