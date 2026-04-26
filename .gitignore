@@ -1,0 +1,7 @@
+.DS_Store
+.build/
+DerivedData/
+Vendor/whisper-artifacts/
+*.xcframework.zip
+*.swiftpm/
+Package.resolved
