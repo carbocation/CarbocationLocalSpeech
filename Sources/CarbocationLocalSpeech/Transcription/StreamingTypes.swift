@@ -262,6 +262,10 @@ public protocol VoiceActivityDetecting: Sendable {
     func analyze(_ chunk: AudioChunk) throws -> VoiceActivityEvent
 }
 
+@_spi(Internal) public protocol VoiceActivityDetectionStateResetting: Sendable {
+    func resetVoiceActivityState()
+}
+
 @_spi(Internal) public struct SpeechChunkingConfiguration: Hashable, Sendable {
     public var maximumChunkDuration: TimeInterval
     public var overlapDuration: TimeInterval

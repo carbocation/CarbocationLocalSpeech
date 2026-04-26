@@ -16,7 +16,9 @@ import Foundation
             options: options,
             transcribeTimed: { chunk, options in
                 try await transcribe(chunk.audio, options)
-            }
+            },
+            voiceActivityDetector: nil,
+            startupDiagnostics: []
         )
     }
 
@@ -24,15 +26,20 @@ import Foundation
         audio: AsyncThrowingStream<AudioChunk, Error>,
         backend: SpeechBackendDescriptor,
         options: StreamingTranscriptionOptions,
-        transcribeTimed transcribe: @escaping TimedChunkTranscription
+        transcribeTimed transcribe: @escaping TimedChunkTranscription,
+        voiceActivityDetector injectedVoiceActivityDetector: VoiceActivityDetecting? = nil,
+        startupDiagnostics: [TranscriptionDiagnostic] = []
     ) -> AsyncThrowingStream<TranscriptEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 continuation.yield(.started(backend))
+                for diagnostic in startupDiagnostics {
+                    continuation.yield(.diagnostic(diagnostic))
+                }
 
-                let detector = options.transcription.voiceActivityDetection.mode == .disabled
+                let detector: VoiceActivityDetecting? = options.transcription.voiceActivityDetection.mode == .disabled
                     ? nil
-                    : EnergyVoiceActivityDetector(sensitivity: options.transcription.voiceActivityDetection.sensitivity)
+                    : injectedVoiceActivityDetector ?? EnergyVoiceActivityDetector(sensitivity: options.transcription.voiceActivityDetection.sensitivity)
                 var committedSegments: [TranscriptSegment] = []
                 var agreementState = LocalAgreementState(policy: Self.resolvedCommitmentPolicy(options))
 
@@ -56,6 +63,7 @@ import Foundation
                                     agreementState: &agreementState,
                                     continuation: continuation
                                 )
+                                resetVoiceActivityStateIfNeeded(detector, after: emitted)
                             }
                         }
 
@@ -69,6 +77,7 @@ import Foundation
                                 agreementState: &agreementState,
                                 continuation: continuation
                             )
+                            resetVoiceActivityStateIfNeeded(detector, after: emitted)
                         }
                     case .rollingBuffer(let maxDuration, let updateInterval, let overlap):
                         var window = SpeechRollingWindow(
@@ -92,6 +101,7 @@ import Foundation
                                     agreementState: &agreementState,
                                     continuation: continuation
                                 )
+                                resetVoiceActivityStateIfNeeded(detector, after: emitted)
                             }
                         }
 
@@ -105,6 +115,7 @@ import Foundation
                                 agreementState: &agreementState,
                                 continuation: continuation
                             )
+                            resetVoiceActivityStateIfNeeded(detector, after: emitted)
                         }
                     }
 
@@ -132,7 +143,7 @@ import Foundation
 
     private static func voiceActivity(
         for chunk: AudioChunk,
-        detector: EnergyVoiceActivityDetector?,
+        detector: VoiceActivityDetecting?,
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) throws -> VoiceActivityEvent {
         guard let detector else {
@@ -150,11 +161,19 @@ import Foundation
 
     private static func reportVoiceActivityIfNeeded(
         for chunk: AudioChunk,
-        detector: EnergyVoiceActivityDetector?,
+        detector: VoiceActivityDetecting?,
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) throws {
         guard let detector else { return }
         continuation.yield(.voiceActivity(try detector.analyze(chunk)))
+    }
+
+    private static func resetVoiceActivityStateIfNeeded(
+        _ detector: VoiceActivityDetecting?,
+        after emitted: SpeechAudioChunk
+    ) {
+        guard emitted.isFinal else { return }
+        (detector as? VoiceActivityDetectionStateResetting)?.resetVoiceActivityState()
     }
 
     private static func process(

@@ -707,6 +707,72 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         })
     }
 
+    func testSpeechChunkStreamingPipelineUsesInjectedVoiceActivityDetector() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0, count: 1_600),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 0.1
+            ))
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0, count: 1_600),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0.1,
+                duration: 0.1
+            ))
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(useCase: .dictation),
+            commitment: .providerFinals,
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .vadUtterances(SpeechChunkingConfiguration(
+                    maximumChunkDuration: 2.0,
+                    overlapDuration: 0,
+                    silenceCommitDelay: 0.1,
+                    minimumSpeechDuration: 0.01
+                ))
+            )
+        )
+        let detector = SequenceVoiceActivityDetector(states: [.speech, .silence])
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { chunk, _ in
+                Transcript(segments: [
+                    TranscriptSegment(text: "injected", startTime: 0, endTime: chunk.audio.duration)
+                ])
+            },
+            voiceActivityDetector: detector
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .voiceActivity(let activity) = event {
+                return activity.state == .speech
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == "injected"
+            }
+            return false
+        })
+    }
+
     func testSpeechChunkStreamingPipelineTrimsCommittedOverlap() async throws {
         let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
             continuation.yield(AudioChunk(
@@ -1235,5 +1301,29 @@ private actor SpeechChunkStreamingPipelineStartRecorder {
 
     func recordedValue() -> TimeInterval? {
         value
+    }
+}
+
+private final class SequenceVoiceActivityDetector: VoiceActivityDetecting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var states: [VoiceActivityState]
+    private var index = 0
+
+    init(states: [VoiceActivityState]) {
+        self.states = states
+    }
+
+    func analyze(_ chunk: AudioChunk) throws -> VoiceActivityEvent {
+        lock.lock()
+        let state = states.isEmpty ? VoiceActivityState.silence : states[min(index, states.count - 1)]
+        index += 1
+        lock.unlock()
+
+        return VoiceActivityEvent(
+            state: state,
+            startTime: chunk.startTime,
+            endTime: chunk.startTime + chunk.duration,
+            confidence: state == .speech ? 1 : 0
+        )
     }
 }

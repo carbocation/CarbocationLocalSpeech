@@ -87,6 +87,44 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         XCTAssertGreaterThan(high.samplesOverlap, low.samplesOverlap)
     }
 
+    func testWhisperOuterVADSelectionUsesModelWhenAvailable() {
+        XCTAssertEqual(
+            WhisperOuterVADSelection.resolve(mode: .automatic, vadModelPath: "/tmp/ggml-silero.bin"),
+            .whisper
+        )
+        XCTAssertEqual(
+            WhisperOuterVADSelection.resolve(mode: .enabled, vadModelPath: "/tmp/ggml-silero.bin"),
+            .whisper
+        )
+        XCTAssertEqual(
+            WhisperOuterVADSelection.resolve(mode: .automatic, vadModelPath: nil),
+            .energyFallback(reason: "missing-vad-model")
+        )
+        XCTAssertEqual(
+            WhisperOuterVADSelection.resolve(mode: .disabled, vadModelPath: "/tmp/ggml-silero.bin"),
+            .disabled
+        )
+    }
+
+    func testWhisperInnerVADPolicyDisablesModelVADForStreaming() {
+        XCTAssertFalse(WhisperInnerVADPolicy.shouldUseModelVAD(
+            options: TranscriptionOptions(voiceActivityDetection: .enabled),
+            isStreaming: true
+        ))
+        XCTAssertTrue(WhisperInnerVADPolicy.shouldUseModelVAD(
+            options: TranscriptionOptions(voiceActivityDetection: .enabled),
+            isStreaming: false
+        ))
+        XCTAssertFalse(WhisperInnerVADPolicy.shouldUseModelVAD(
+            options: TranscriptionOptions(voiceActivityDetection: .automatic),
+            isStreaming: false
+        ))
+        XCTAssertFalse(WhisperInnerVADPolicy.shouldUseModelVAD(
+            options: TranscriptionOptions(voiceActivityDetection: .disabled),
+            isStreaming: false
+        ))
+    }
+
     func testWhisperStreamingOptionsPreferVADUtterancesForDefaultAutomaticStream() {
         let resolved = WhisperStreamingOptionsResolver.resolve(StreamingTranscriptionOptions(
             strategy: .balanced
