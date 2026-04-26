@@ -67,6 +67,17 @@ private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.selectedSpeechModelSelection") private var selectionStorageValue = SpeechSystemModelID.appleSpeech.rawValue
     @State private var systemOptions: [SpeechSystemModelOption] = []
     @State private var events: [TranscriptEvent] = []
+    @State private var microphoneStatus = MicrophonePermissionHelper.authorizationStatus()
+    @State private var loadedInfo: LocalSpeechLoadedModelInfo?
+    @State private var statusMessage = "Select a provider, then start listening."
+    @State private var statusTone = CLSSmokeStatusTone.secondary
+    @State private var isStarting = false
+    @State private var isListening = false
+    @State private var captureSession: AVAudioEngineCaptureSession?
+    @State private var transcriptionTask: Task<Void, Never>?
+    @State private var activeSessionID: UUID?
+
+    private let maximumDisplayedEvents = 500
 
     private let library = SpeechModelLibrary(
         root: SpeechModelStorage.modelsDirectory(appSupportFolderName: "CLSSmoke")
@@ -83,15 +94,11 @@ private struct CLSSmokeRootView: View {
                 SpeechModelLibraryPickerView(
                     library: library,
                     selectionStorageValue: $selectionStorageValue,
+                    confirmTitle: confirmTitle,
+                    confirmDisabled: isStarting,
                     systemOptions: systemOptions,
                     onSelectionConfirmed: { selection in
-                        Task {
-                            _ = try? await LocalSpeechEngine.shared.load(
-                                selection: selection,
-                                from: library,
-                                options: SpeechLoadOptions(locale: .current)
-                            )
-                        }
+                        startListening(with: selection)
                     },
                     onDeleteModel: { model in
                         try? library.delete(id: model.id)
@@ -108,6 +115,8 @@ private struct CLSSmokeRootView: View {
                     .padding(.horizontal, 20)
                     .padding(.vertical, 16)
                 Divider()
+                sessionStatus
+                Divider()
                 LiveTranscriptDebugView(events: events)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -115,6 +124,211 @@ private struct CLSSmokeRootView: View {
         .frame(minWidth: 980, minHeight: 600)
         .task {
             systemOptions = await LocalSpeechEngine.systemModelOptions(locale: .current)
+        }
+        .onDisappear {
+            stopListening()
+        }
+    }
+
+    private var confirmTitle: String {
+        if isStarting {
+            return "Starting..."
+        }
+        if isListening {
+            return "Restart Listening"
+        }
+        return "Start Listening"
+    }
+
+    private var sessionStatus: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Label(statusMessage, systemImage: statusTone.systemImageName)
+                    .foregroundStyle(statusTone.color)
+                    .lineLimit(2)
+
+                if isStarting {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+
+                Spacer()
+
+                if let loadedInfo {
+                    Text(loadedInfo.backend.displayName)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Button {
+                    stopListening()
+                } label: {
+                    Label("Stop", systemImage: "stop.fill")
+                }
+                .disabled(!isStarting && !isListening)
+            }
+
+            MicrophonePermissionStatusView(status: microphoneStatus)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+    }
+
+    private func startListening(with selection: SpeechModelSelection) {
+        stopListening(updateStatus: false)
+
+        let sessionID = UUID()
+        activeSessionID = sessionID
+        loadedInfo = nil
+        events.removeAll(keepingCapacity: true)
+        isStarting = true
+        isListening = false
+        statusTone = .secondary
+        statusMessage = "Preparing selected provider..."
+
+        transcriptionTask = Task {
+            await runLiveTranscriptionSession(id: sessionID, selection: selection)
+        }
+    }
+
+    private func stopListening(updateStatus: Bool = true) {
+        activeSessionID = nil
+        transcriptionTask?.cancel()
+        transcriptionTask = nil
+        captureSession?.stop()
+        captureSession = nil
+        isStarting = false
+        isListening = false
+
+        if updateStatus {
+            statusTone = .secondary
+            statusMessage = "Stopped."
+        }
+    }
+
+    private func runLiveTranscriptionSession(id: UUID, selection: SpeechModelSelection) async {
+        do {
+            guard await ensureMicrophoneAccess() else {
+                finishSession(id: id, message: "Microphone access is required to listen.", tone: .error)
+                return
+            }
+
+            guard activeSessionID == id else { return }
+            statusMessage = "Loading selected provider..."
+
+            let loaded = try await LocalSpeechEngine.shared.load(
+                selection: selection,
+                from: library,
+                options: SpeechLoadOptions(
+                    locale: .current,
+                    installSystemAssetsIfNeeded: true
+                )
+            )
+
+            guard activeSessionID == id else { return }
+            loadedInfo = loaded
+
+            let capture = AVAudioEngineCaptureSession()
+            captureSession = capture
+            isStarting = false
+            isListening = true
+            statusTone = .listening
+            statusMessage = "Listening with \(loaded.displayName)."
+
+            let audio = capture.start(configuration: AudioCaptureConfiguration(
+                preferredSampleRate: 16_000,
+                preferredChannelCount: 1,
+                frameDuration: 0.1
+            ))
+            let stream = await LocalSpeechEngine.shared.stream(
+                audio: audio,
+                options: StreamingTranscriptionOptions(
+                    transcription: TranscriptionOptions(
+                        useCase: .dictation,
+                        language: Locale.current.language.languageCode?.identifier
+                    ),
+                    chunking: SpeechLatencyPreset.balancedDictation.defaultChunkingConfiguration,
+                    partialCommitStrategy: .silenceOrChunkBoundary,
+                    latencyPreset: .balancedDictation
+                )
+            )
+
+            for try await event in stream {
+                try Task.checkCancellation()
+                guard activeSessionID == id else { return }
+                appendEvent(event)
+            }
+
+            finishSession(id: id, message: "Listening completed.", tone: .secondary)
+        } catch is CancellationError {
+            finishSession(id: id, message: "Stopped.", tone: .secondary)
+        } catch {
+            finishSession(id: id, message: error.localizedDescription, tone: .error)
+        }
+    }
+
+    private func ensureMicrophoneAccess() async -> Bool {
+        microphoneStatus = MicrophonePermissionHelper.authorizationStatus()
+
+        switch microphoneStatus {
+        case .authorized:
+            return true
+        case .notDetermined:
+            _ = await MicrophonePermissionHelper.requestAccess()
+            microphoneStatus = MicrophonePermissionHelper.authorizationStatus()
+            return microphoneStatus == .authorized
+        case .denied, .restricted, .unknown:
+            return false
+        }
+    }
+
+    private func appendEvent(_ event: TranscriptEvent) {
+        events.append(event)
+        let overflow = events.count - maximumDisplayedEvents
+        if overflow > 0 {
+            events.removeFirst(overflow)
+        }
+    }
+
+    private func finishSession(id: UUID, message: String, tone: CLSSmokeStatusTone) {
+        guard activeSessionID == id else { return }
+
+        captureSession?.stop()
+        captureSession = nil
+        transcriptionTask = nil
+        activeSessionID = nil
+        isStarting = false
+        isListening = false
+        statusMessage = message
+        statusTone = tone
+    }
+}
+
+private enum CLSSmokeStatusTone {
+    case secondary
+    case listening
+    case error
+
+    var systemImageName: String {
+        switch self {
+        case .secondary:
+            return "info.circle"
+        case .listening:
+            return "waveform.and.mic"
+        case .error:
+            return "exclamationmark.triangle"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .secondary:
+            return .secondary
+        case .listening:
+            return .green
+        case .error:
+            return .red
         }
     }
 }

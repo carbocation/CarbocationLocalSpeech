@@ -163,53 +163,19 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
         options: StreamingTranscriptionOptions
     ) -> AsyncThrowingStream<TranscriptEvent, Error> {
         let loadedInfo = loadedInfo
-        return AsyncThrowingStream { continuation in
-            Task {
-                guard let loadedInfo else {
-                    continuation.finish(throwing: WhisperEngineError.noModelLoaded)
-                    return
-                }
-
-                continuation.yield(.started(loadedInfo.backend))
-                let detector = EnergyVoiceActivityDetector()
-                var chunker = SpeechChunker(configuration: options.chunking)
-                var committedSegments: [TranscriptSegment] = []
-
-                do {
-                    for try await chunk in audio {
-                        let activity = try detector.analyze(chunk)
-                        continuation.yield(.audioLevel(AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)))
-                        continuation.yield(.voiceActivity(activity))
-                        for emitted in chunker.append(chunk, activity: activity) where emitted.isFinal {
-                            let segment = TranscriptSegment(
-                                text: "",
-                                startTime: emitted.startTime,
-                                endTime: emitted.startTime + emitted.audio.duration
-                            )
-                            committedSegments.append(segment)
-                            continuation.yield(.committed(segment))
-                        }
-                    }
-
-                    for emitted in chunker.finish() {
-                        let segment = TranscriptSegment(
-                            text: "",
-                            startTime: emitted.startTime,
-                            endTime: emitted.startTime + emitted.audio.duration
-                        )
-                        committedSegments.append(segment)
-                        continuation.yield(.committed(segment))
-                    }
-
-                    continuation.yield(.completed(Transcript(
-                        segments: committedSegments,
-                        backend: loadedInfo.backend
-                    )))
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
+        guard let loadedInfo else {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(throwing: WhisperEngineError.noModelLoaded)
             }
+        }
+
+        let engine = self
+        return SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: loadedInfo.backend,
+            options: options
+        ) { audio, transcriptionOptions in
+            try await engine.transcribe(audio: audio, options: transcriptionOptions)
         }
     }
 }

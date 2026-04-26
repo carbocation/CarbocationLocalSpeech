@@ -160,27 +160,14 @@ public actor AppleSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTra
             displayName: Self.displayName,
             selection: .system(Self.systemModelID)
         )
-        return AsyncThrowingStream { continuation in
-            Task {
-                do {
-                    continuation.yield(.started(backend))
-                    let segments: [TranscriptSegment] = []
-                    let detector = EnergyVoiceActivityDetector()
-                    for try await chunk in audio {
-                        if Task.isCancelled {
-                            throw CancellationError()
-                        }
-                        continuation.yield(.audioLevel(AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)))
-                        continuation.yield(.voiceActivity(try detector.analyze(chunk)))
-                    }
-                    let transcript = Transcript(segments: segments, backend: backend)
-                    continuation.yield(.completed(transcript))
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            _ = options
+
+        let engine = self
+        return SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options
+        ) { audio, transcriptionOptions in
+            try await engine.transcribe(audio: audio, options: transcriptionOptions)
         }
     }
 

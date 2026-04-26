@@ -236,7 +236,7 @@ public actor LocalSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTra
         switch loadedInfo.selection {
         case .installed:
             return AsyncThrowingStream { continuation in
-                Task {
+                let task = Task {
                     let providerStream = await whisperEngine.stream(audio: audio, options: options)
                     do {
                         for try await event in providerStream {
@@ -247,10 +247,13 @@ public actor LocalSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTra
                         continuation.finish(throwing: error)
                     }
                 }
+                continuation.onTermination = { _ in
+                    task.cancel()
+                }
             }
         case .system(.appleSpeech):
             return AsyncThrowingStream { continuation in
-                Task {
+                let task = Task {
                     let providerStream = await appleSpeechEngine.stream(audio: audio, options: options)
                     do {
                         for try await event in providerStream {
@@ -260,6 +263,9 @@ public actor LocalSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTra
                     } catch {
                         continuation.finish(throwing: error)
                     }
+                }
+                continuation.onTermination = { _ in
+                    task.cancel()
                 }
             }
         }

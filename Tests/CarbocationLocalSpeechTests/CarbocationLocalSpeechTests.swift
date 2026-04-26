@@ -281,6 +281,59 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         })
     }
 
+    func testSpeechChunkStreamingPipelineTranscribesCommittedChunks() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 1_600),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 0.1
+            ))
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(useCase: .dictation),
+            chunking: SpeechChunkingConfiguration(
+                maximumChunkDuration: 0.1,
+                overlapDuration: 0,
+                silenceCommitDelay: 0.2,
+                minimumSpeechDuration: 0.01
+            ),
+            partialCommitStrategy: .chunkBoundary,
+            latencyPreset: .lowestLatency
+        )
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options
+        ) { audio, _ in
+            Transcript(segments: [
+                TranscriptSegment(text: "hello", startTime: 0, endTime: audio.duration)
+            ])
+        }
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .committed(let segment) = event {
+                return segment.text == "hello"
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == "hello"
+            }
+            return false
+        })
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("CarbocationLocalSpeechTests-\(UUID().uuidString)", isDirectory: true)

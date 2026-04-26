@@ -170,14 +170,18 @@ private final class CaptureTiming: @unchecked Sendable {
 public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Sendable {
     private let lock = NSLock()
     private var engine: AVAudioEngine?
+    private var continuation: AsyncThrowingStream<AudioChunk, Error>.Continuation?
 
     public init() {}
 
     public func start(configuration: AudioCaptureConfiguration = AudioCaptureConfiguration()) -> AsyncThrowingStream<AudioChunk, Error> {
         AsyncThrowingStream { continuation in
+            stop()
+
             lock.lock()
             let audioEngine = AVAudioEngine()
             engine = audioEngine
+            self.continuation = continuation
             lock.unlock()
 
             let inputNode = audioEngine.inputNode
@@ -211,6 +215,7 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
                 try audioEngine.start()
             } catch {
                 inputNode.removeTap(onBus: 0)
+                clear(audioEngine: audioEngine)
                 continuation.finish(throwing: error)
             }
 
@@ -224,11 +229,24 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
         lock.lock()
         let audioEngine = engine
         engine = nil
+        let continuation = continuation
+        self.continuation = nil
         lock.unlock()
 
-        guard let audioEngine else { return }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        audioEngine.stop()
+        if let audioEngine {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            audioEngine.stop()
+        }
+        continuation?.finish()
+    }
+
+    private func clear(audioEngine expectedEngine: AVAudioEngine) {
+        lock.lock()
+        if engine === expectedEngine {
+            engine = nil
+            continuation = nil
+        }
+        lock.unlock()
     }
 }
 
