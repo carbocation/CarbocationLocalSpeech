@@ -109,6 +109,30 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertNil(HuggingFaceSpeechModelURL.parse("https://huggingface.co/org/repo/blob/main/README.md"))
     }
 
+    func testCuratedCatalogEntriesHaveDownloadURLs() throws {
+        for model in CuratedSpeechModelCatalog.all {
+            let url = try XCTUnwrap(model.downloadURL, "\(model.id) should have a download URL")
+            XCTAssertEqual(url.host(), "huggingface.co")
+            XCTAssertTrue(url.path.contains("/ggerganov/whisper.cpp/resolve/main/"))
+            XCTAssertTrue(url.lastPathComponent.hasSuffix(".bin"))
+        }
+
+        let base = try XCTUnwrap(CuratedSpeechModelCatalog.entry(id: "base.en"))
+        XCTAssertEqual(base.hfFilename, "ggml-base.en.bin")
+        XCTAssertEqual(
+            base.downloadURL?.absoluteString,
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+        )
+    }
+
+    func testRecommendedCuratedModelPrefersLargerModelWhenRAMTierTies() throws {
+        let recommended = CuratedSpeechModelCatalog.recommendedModel(
+            forPhysicalMemoryBytes: 48 * 1_073_741_824
+        )
+
+        XCTAssertEqual(recommended?.id, "large-v3-turbo")
+    }
+
     func testPartialDownloadListingAndDeletion() throws {
         let root = try makeTemporaryDirectory()
         let partialsRoot = try SpeechModelDownloader.partialsDirectory(in: root)

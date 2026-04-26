@@ -53,6 +53,16 @@ public struct SpeechModelPickerLabelPolicy: Equatable, Sendable {
         systemProviderLabels[option.selection]
     }
 
+    public func curatedModelLabel(
+        for model: CuratedSpeechModel,
+        recommendedCuratedModel: CuratedSpeechModel?
+    ) -> SpeechModelPickerStatusLabel? {
+        guard let recommendedCuratedModel,
+              model.id == recommendedCuratedModel.id
+        else { return nil }
+        return recommendedLabel
+    }
+
     public func installedModelLabel(
         for model: InstalledSpeechModel,
         recommendedCuratedModel: CuratedSpeechModel?,
@@ -84,11 +94,21 @@ public struct SpeechModelPickerLabelPolicy: Equatable, Sendable {
                 continue
             }
 
-            if bestFit == nil || curatedModel.recommendedRAMBytes > bestFit!.recommendedRAMBytes {
+            if bestFit == nil || Self.curatedModel(curatedModel, isBetterRecommendationThan: bestFit!) {
                 bestFit = curatedModel
             }
         }
         return bestFit
+    }
+
+    private static func curatedModel(
+        _ model: CuratedSpeechModel,
+        isBetterRecommendationThan other: CuratedSpeechModel
+    ) -> Bool {
+        if model.recommendedRAMBytes != other.recommendedRAMBytes {
+            return model.recommendedRAMBytes > other.recommendedRAMBytes
+        }
+        return model.approxSizeBytes > other.approxSizeBytes
     }
 
     public static func installedModel(

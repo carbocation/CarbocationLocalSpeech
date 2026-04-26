@@ -48,9 +48,23 @@ public struct CuratedSpeechModel: Identifiable, Hashable, Sendable {
     public var recommendedRAMBytes: UInt64 {
         UInt64(recommendedRAMGB) * 1_073_741_824
     }
+
+    public var downloadURL: URL? {
+        if let sourceURL {
+            return sourceURL
+        }
+        guard let hfRepo, let hfFilename else { return nil }
+        return Self.huggingFaceResolveURL(repo: hfRepo, filename: hfFilename)
+    }
+
+    public static func huggingFaceResolveURL(repo: String, filename: String) -> URL? {
+        URL(string: "https://huggingface.co/\(repo)/resolve/main/\(filename)")
+    }
 }
 
 public enum CuratedSpeechModelCatalog {
+    private static let whisperCppRepo = "ggerganov/whisper.cpp"
+
     public static let all: [CuratedSpeechModel] = [
         CuratedSpeechModel(
             id: "tiny.en",
@@ -59,7 +73,9 @@ public enum CuratedSpeechModelCatalog {
             variant: "tiny.en",
             languageScope: .englishOnly,
             approxSizeBytes: 75_000_000,
-            recommendedRAMGB: 4
+            recommendedRAMGB: 4,
+            hfRepo: whisperCppRepo,
+            hfFilename: "ggml-tiny.en.bin"
         ),
         CuratedSpeechModel(
             id: "base.en",
@@ -68,7 +84,9 @@ public enum CuratedSpeechModelCatalog {
             variant: "base.en",
             languageScope: .englishOnly,
             approxSizeBytes: 145_000_000,
-            recommendedRAMGB: 4
+            recommendedRAMGB: 4,
+            hfRepo: whisperCppRepo,
+            hfFilename: "ggml-base.en.bin"
         ),
         CuratedSpeechModel(
             id: "small.en",
@@ -77,7 +95,9 @@ public enum CuratedSpeechModelCatalog {
             variant: "small.en",
             languageScope: .englishOnly,
             approxSizeBytes: 485_000_000,
-            recommendedRAMGB: 8
+            recommendedRAMGB: 8,
+            hfRepo: whisperCppRepo,
+            hfFilename: "ggml-small.en.bin"
         ),
         CuratedSpeechModel(
             id: "medium.en",
@@ -86,7 +106,9 @@ public enum CuratedSpeechModelCatalog {
             variant: "medium.en",
             languageScope: .englishOnly,
             approxSizeBytes: 1_530_000_000,
-            recommendedRAMGB: 16
+            recommendedRAMGB: 16,
+            hfRepo: whisperCppRepo,
+            hfFilename: "ggml-medium.en.bin"
         ),
         CuratedSpeechModel(
             id: "large-v3-turbo",
@@ -95,7 +117,9 @@ public enum CuratedSpeechModelCatalog {
             variant: "large-v3-turbo",
             languageScope: .multilingual,
             approxSizeBytes: 1_620_000_000,
-            recommendedRAMGB: 16
+            recommendedRAMGB: 16,
+            hfRepo: whisperCppRepo,
+            hfFilename: "ggml-large-v3-turbo.bin"
         )
     ]
 
@@ -111,10 +135,19 @@ public enum CuratedSpeechModelCatalog {
 
         var bestFit: CuratedSpeechModel?
         for model in models where model.recommendedRAMBytes <= physicalMemoryBytes {
-            if bestFit == nil || model.recommendedRAMBytes > bestFit!.recommendedRAMBytes {
+            if bestFit == nil || model.isBetterRecommendation(than: bestFit!) {
                 bestFit = model
             }
         }
         return bestFit
+    }
+}
+
+extension CuratedSpeechModel {
+    fileprivate func isBetterRecommendation(than other: CuratedSpeechModel) -> Bool {
+        if recommendedRAMBytes != other.recommendedRAMBytes {
+            return recommendedRAMBytes > other.recommendedRAMBytes
+        }
+        return approxSizeBytes > other.approxSizeBytes
     }
 }
