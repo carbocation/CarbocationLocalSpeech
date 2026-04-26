@@ -9,17 +9,20 @@ public struct WhisperEngineConfiguration: Hashable, Sendable {
     public var useCoreML: Bool
     public var threadCount: Int32?
     public var heartbeatInterval: TimeInterval
+    public var suppressNativeLogs: Bool
 
     public init(
         useMetal: Bool = true,
         useCoreML: Bool = true,
         threadCount: Int32? = nil,
-        heartbeatInterval: TimeInterval = 2
+        heartbeatInterval: TimeInterval = 2,
+        suppressNativeLogs: Bool = true
     ) {
         self.useMetal = useMetal
         self.useCoreML = useCoreML
         self.threadCount = threadCount
         self.heartbeatInterval = heartbeatInterval
+        self.suppressNativeLogs = suppressNativeLogs
     }
 }
 
@@ -118,6 +121,23 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
 
     public func currentLoadedModelInfo() -> WhisperLoadedModelInfo? {
         loadedInfo
+    }
+
+    public func preload() throws {
+        guard let loadedInfo else {
+            throw WhisperEngineError.noModelLoaded
+        }
+
+        let status = WhisperBackend.ensureInitialized()
+        guard status.isUsable else {
+            throw WhisperEngineError.runtimeUnavailable(status)
+        }
+
+#if CARBOCATION_HAS_WHISPER_C_API
+        _ = try ensureContext(for: loadedInfo)
+#else
+        throw WhisperEngineError.runtimeUnavailable(status)
+#endif
     }
 
     @discardableResult
@@ -260,6 +280,7 @@ private extension WhisperEngine {
         }
 
         freeContext()
+        configureNativeLogging()
         var params = whisper_context_default_params()
         params.use_gpu = loadedConfiguration?.useMetal ?? configuration.useMetal
 
@@ -280,6 +301,14 @@ private extension WhisperEngine {
         }
         context = nil
         contextModelPath = nil
+    }
+
+    func configureNativeLogging() {
+        if configuration.suppressNativeLogs {
+            whisper_log_set({ _, _, _ in }, nil)
+        } else {
+            whisper_log_set(nil, nil)
+        }
     }
 
     func normalizeAudio(_ audio: PreparedAudio) throws -> PreparedAudio {

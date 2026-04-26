@@ -224,7 +224,12 @@ private struct CLSSmokeRootView: View {
             }
 
             guard activeSessionID == id else { return }
-            statusMessage = "Loading selected provider..."
+            switch selection {
+            case .installed:
+                statusMessage = "Loading Whisper model. First run can take a few seconds..."
+            case .system:
+                statusMessage = "Loading selected provider..."
+            }
 
             let loaded = try await LocalSpeechEngine.shared.load(
                 selection: selection,

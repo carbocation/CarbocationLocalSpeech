@@ -34,7 +34,11 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         let library = SpeechModelLibrary(root: root.appendingPathComponent("SpeechModels", isDirectory: true))
         let model = try library.importFile(at: source, displayName: "Base")
         let engine = LocalSpeechEngine()
-        let loaded = try await engine.load(selection: .installed(model.id), from: library)
+        let loaded = try await engine.load(
+            selection: .installed(model.id),
+            from: library,
+            options: SpeechLoadOptions(preload: false)
+        )
         let currentSelection = await engine.currentSelection()
 
         XCTAssertEqual(loaded.selection, .installed(model.id))

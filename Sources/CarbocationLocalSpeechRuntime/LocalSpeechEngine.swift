@@ -124,9 +124,12 @@ public actor LocalSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTra
                 configuration: WhisperLoadConfiguration(
                     language: options.locale.language.languageCode?.identifier,
                     useMetal: true,
-                    useCoreML: true
+                    useCoreML: model.assets.contains { $0.role == .coreMLEncoder }
                 )
             )
+            if options.preload {
+                try await whisperEngine.preload()
+            }
             let info = LocalSpeechLoadedModelInfo(
                 selection: selection,
                 displayName: loaded.displayName ?? URL(fileURLWithPath: loaded.modelPath).lastPathComponent,

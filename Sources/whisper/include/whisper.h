@@ -17,7 +17,17 @@ typedef int32_t whisper_pos;
 typedef int32_t whisper_token;
 typedef int32_t whisper_seq_id;
 
+enum ggml_log_level {
+    GGML_LOG_LEVEL_NONE  = 0,
+    GGML_LOG_LEVEL_DEBUG = 1,
+    GGML_LOG_LEVEL_INFO  = 2,
+    GGML_LOG_LEVEL_WARN  = 3,
+    GGML_LOG_LEVEL_ERROR = 4,
+    GGML_LOG_LEVEL_CONT  = 5,
+};
+
 typedef bool (*ggml_abort_callback)(void * data);
+typedef void (*ggml_log_callback)(enum ggml_log_level level, const char * text, void * user_data);
 typedef void (*whisper_new_segment_callback)(struct whisper_context * ctx, struct whisper_state * state, int n_new, void * user_data);
 typedef void (*whisper_progress_callback)(struct whisper_context * ctx, struct whisper_state * state, int progress, void * user_data);
 typedef bool (*whisper_encoder_begin_callback)(struct whisper_context * ctx, struct whisper_state * state, void * user_data);
@@ -193,6 +203,7 @@ int whisper_full_n_tokens(struct whisper_context * ctx, int i_segment);
 const char * whisper_full_get_token_text(struct whisper_context * ctx, int i_segment, int i_token);
 whisper_token_data whisper_full_get_token_data(struct whisper_context * ctx, int i_segment, int i_token);
 float whisper_full_get_token_p(struct whisper_context * ctx, int i_segment, int i_token);
+void whisper_log_set(ggml_log_callback log_callback, void * user_data);
 
 #ifdef __cplusplus
 }
