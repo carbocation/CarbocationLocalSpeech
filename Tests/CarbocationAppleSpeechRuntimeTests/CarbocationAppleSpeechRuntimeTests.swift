@@ -1,4 +1,5 @@
 @testable import CarbocationAppleSpeechRuntime
+import AVFoundation
 import CarbocationLocalSpeech
 import XCTest
 
@@ -56,5 +57,21 @@ final class CarbocationAppleSpeechRuntimeTests: XCTestCase {
         )
 
         XCTAssertEqual(afterGap, 2, accuracy: 0.000_001)
+    }
+
+    func testTemporaryAnalysisAudioFileWritesPreparedAudio() throws {
+        let audio = PreparedAudio(
+            samples: [0.0, 0.25, -0.25, 0.5, -0.5],
+            sampleRate: 16_000
+        )
+
+        let url = try AppleSpeechEngine.writeTemporaryAudioFile(audio)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let file = try AVAudioFile(forReading: url)
+
+        XCTAssertEqual(file.length, AVAudioFramePosition(audio.samples.count))
+        XCTAssertEqual(file.processingFormat.sampleRate, 16_000, accuracy: 0.01)
+        XCTAssertEqual(file.processingFormat.channelCount, 1)
     }
 }

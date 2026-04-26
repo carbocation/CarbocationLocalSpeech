@@ -228,11 +228,19 @@ public actor AppleSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTra
         return unsupported
     }
 
-    private nonisolated static func writeTemporaryAudioFile(_ audio: PreparedAudio) throws -> URL {
+    nonisolated static func writeTemporaryAudioFile(_ audio: PreparedAudio) throws -> URL {
         let buffer = try pcm16MonoBuffer(samples: audio.samples, sampleRate: audio.sampleRate)
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("cls-apple-speech-\(UUID().uuidString).caf")
-        let file = try AVAudioFile(forWriting: url, settings: buffer.format.settings)
+
+        var settings = buffer.format.settings
+        settings[AVLinearPCMIsNonInterleaved] = false
+        let file = try AVAudioFile(
+            forWriting: url,
+            settings: settings,
+            commonFormat: buffer.format.commonFormat,
+            interleaved: buffer.format.isInterleaved
+        )
         try file.write(from: buffer)
         return url
     }
