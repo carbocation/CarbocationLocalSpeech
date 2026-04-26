@@ -65,12 +65,26 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         XCTAssertFalse(balanced.singleSegment)
         XCTAssertEqual(balanced.maxTokens, 0)
         XCTAssertEqual(balanced.audioContext, 0)
+        XCTAssertGreaterThan(balanced.decoderContextTokenLimit, lowestLatency.decoderContextTokenLimit)
         XCTAssertTrue(lowestLatency.singleSegment)
         XCTAssertGreaterThan(lowestLatency.maxTokens, 0)
         XCTAssertGreaterThan(lowestLatency.audioContext, 0)
         XCTAssertFalse(fileQuality.singleSegment)
         XCTAssertEqual(fileQuality.maxTokens, 0)
         XCTAssertEqual(fileQuality.audioContext, 0)
+        XCTAssertGreaterThan(fileQuality.decoderContextTokenLimit, balanced.decoderContextTokenLimit)
+    }
+
+    func testWhisperVADTuningFollowsSensitivity() {
+        let low = WhisperVADTuning.resolve(for: .low)
+        let medium = WhisperVADTuning.resolve(for: .medium)
+        let high = WhisperVADTuning.resolve(for: .high)
+
+        XCTAssertGreaterThan(low.threshold, medium.threshold)
+        XCTAssertGreaterThan(medium.threshold, high.threshold)
+        XCTAssertGreaterThan(low.minSpeechDurationMS, high.minSpeechDurationMS)
+        XCTAssertGreaterThan(high.speechPadMS, low.speechPadMS)
+        XCTAssertGreaterThan(high.samplesOverlap, low.samplesOverlap)
     }
 
     func testWhisperStreamingOptionsPreferVADUtterancesForDefaultAutomaticStream() {

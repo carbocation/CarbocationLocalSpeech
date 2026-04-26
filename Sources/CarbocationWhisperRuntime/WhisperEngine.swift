@@ -99,17 +99,75 @@ struct WhisperStreamingDecodeTuning: Hashable, Sendable {
     var singleSegment: Bool
     var maxTokens: Int32
     var audioContext: Int32
+    var decoderContextTokenLimit: Int32
 
     static func resolve(for options: StreamingTranscriptionOptions) -> WhisperStreamingDecodeTuning {
         switch options.strategy {
         case .automatic, .balanced:
-            return WhisperStreamingDecodeTuning(singleSegment: false, maxTokens: 0, audioContext: 0)
+            return WhisperStreamingDecodeTuning(
+                singleSegment: false,
+                maxTokens: 0,
+                audioContext: 0,
+                decoderContextTokenLimit: 96
+            )
         case .lowestLatency:
-            return WhisperStreamingDecodeTuning(singleSegment: true, maxTokens: 32, audioContext: 256)
+            return WhisperStreamingDecodeTuning(
+                singleSegment: true,
+                maxTokens: 32,
+                audioContext: 256,
+                decoderContextTokenLimit: 48
+            )
         case .accurate:
-            return WhisperStreamingDecodeTuning(singleSegment: false, maxTokens: 0, audioContext: 0)
+            return WhisperStreamingDecodeTuning(
+                singleSegment: false,
+                maxTokens: 0,
+                audioContext: 0,
+                decoderContextTokenLimit: 160
+            )
         case .fileQuality:
-            return WhisperStreamingDecodeTuning(singleSegment: false, maxTokens: 0, audioContext: 0)
+            return WhisperStreamingDecodeTuning(
+                singleSegment: false,
+                maxTokens: 0,
+                audioContext: 0,
+                decoderContextTokenLimit: 160
+            )
+        }
+    }
+}
+
+struct WhisperVADTuning: Hashable, Sendable {
+    var threshold: Float
+    var minSpeechDurationMS: Int32
+    var minSilenceDurationMS: Int32
+    var speechPadMS: Int32
+    var samplesOverlap: Float
+
+    static func resolve(for sensitivity: VoiceActivityDetectionSensitivity) -> WhisperVADTuning {
+        switch sensitivity {
+        case .low:
+            return WhisperVADTuning(
+                threshold: 0.65,
+                minSpeechDurationMS: 300,
+                minSilenceDurationMS: 200,
+                speechPadMS: 20,
+                samplesOverlap: 0.05
+            )
+        case .medium:
+            return WhisperVADTuning(
+                threshold: 0.5,
+                minSpeechDurationMS: 250,
+                minSilenceDurationMS: 100,
+                speechPadMS: 30,
+                samplesOverlap: 0.1
+            )
+        case .high:
+            return WhisperVADTuning(
+                threshold: 0.35,
+                minSpeechDurationMS: 150,
+                minSilenceDurationMS: 80,
+                speechPadMS: 60,
+                samplesOverlap: 0.15
+            )
         }
     }
 }
@@ -149,6 +207,8 @@ private struct WhisperStreamingRunContext: Sendable {
     var chunkStartTime: TimeInterval
     var chunkDuration: TimeInterval
     var tuning: WhisperStreamingDecodeTuning
+    var keepsDecoderContext: Bool
+    var resetDecoderContext: Bool
     var sessionState: WhisperStreamingSessionState
     var eventSink: @Sendable (TranscriptEvent) -> Void
 }
@@ -156,6 +216,7 @@ private struct WhisperStreamingRunContext: Sendable {
 private final class WhisperStreamingSessionState: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
+    private var hasStartedDecoderContext = false
 
     var isCancelled: Bool {
         lock.lock()
@@ -167,6 +228,16 @@ private final class WhisperStreamingSessionState: @unchecked Sendable {
         lock.lock()
         cancelled = true
         lock.unlock()
+    }
+
+    func claimDecoderContextReset() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !hasStartedDecoderContext else {
+            return false
+        }
+        hasStartedDecoderContext = true
+        return true
     }
 }
 
@@ -362,6 +433,7 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
         let engine = self
         let streamingState = WhisperStreamingSessionState()
         let tuning = WhisperStreamingDecodeTuning.resolve(for: resolvedOptions)
+        let keepsDecoderContext = Self.shouldKeepDecoderContext(for: resolvedOptions)
         return AsyncThrowingStream { continuation in
             let task = Task {
                 let pipelineStream = SpeechChunkStreamingPipeline.stream(
@@ -373,6 +445,8 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
                             chunkStartTime: emitted.startTime,
                             chunkDuration: emitted.audio.duration,
                             tuning: tuning,
+                            keepsDecoderContext: keepsDecoderContext,
+                            resetDecoderContext: streamingState.claimDecoderContextReset(),
                             sessionState: streamingState,
                             eventSink: { event in
                                 continuation.yield(event)
@@ -401,6 +475,15 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
         }
     }
 
+    private nonisolated static func shouldKeepDecoderContext(for options: StreamingTranscriptionOptions) -> Bool {
+        switch options.emulation.window {
+        case .rollingBuffer:
+            return true
+        case .vadUtterances:
+            return false
+        }
+    }
+
     private func transcribeStreamingChunk(
         _ audio: PreparedAudio,
         options: TranscriptionOptions,
@@ -409,7 +492,7 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
         try Task.checkCancellation()
         context.eventSink(.diagnostic(TranscriptionDiagnostic(
             source: "whisper.streaming",
-            message: "chunk duration=\(audio.duration.formattedWhisperDebug)s audio_ctx=\(context.tuning.audioContext) max_tokens=\(context.tuning.maxTokens) single_segment=\(context.tuning.singleSegment)",
+            message: "chunk duration=\(audio.duration.formattedWhisperDebug)s audio_ctx=\(context.tuning.audioContext) max_tokens=\(context.tuning.maxTokens) single_segment=\(context.tuning.singleSegment) decoder_context=\(context.keepsDecoderContext)",
             time: context.chunkStartTime
         )))
         return try transcribePreparedAudio(audio, options: options, streamingContext: context).transcript
@@ -563,6 +646,10 @@ private extension WhisperEngine {
                        shouldUseModelVAD(options: options, isStreaming: streamingContext != nil) {
                         params.vad = true
                         params.vad_model_path = vadModelPathPointer
+                        applyVADTuning(
+                            WhisperVADTuning.resolve(for: options.voiceActivityDetection.sensitivity),
+                            to: &params
+                        )
                     }
                     if let temperature = options.temperature {
                         params.temperature = Float(temperature)
@@ -655,8 +742,9 @@ private extension WhisperEngine {
         let tuning = streamingContext.tuning
         params.single_segment = tuning.singleSegment
         params.max_tokens = tuning.maxTokens
-        params.no_context = true
-        params.carry_initial_prompt = false
+        params.no_context = !streamingContext.keepsDecoderContext || streamingContext.resetDecoderContext
+        params.n_max_text_ctx = streamingContext.keepsDecoderContext ? tuning.decoderContextTokenLimit : 0
+        params.carry_initial_prompt = streamingContext.keepsDecoderContext
         params.audio_ctx = clampedAudioContext(tuning.audioContext, context: context)
         if includeWords {
             params.single_segment = false
@@ -674,6 +762,14 @@ private extension WhisperEngine {
         case .automatic:
             return isStreaming
         }
+    }
+
+    func applyVADTuning(_ tuning: WhisperVADTuning, to params: inout whisper_full_params) {
+        params.vad_params.threshold = tuning.threshold
+        params.vad_params.min_speech_duration_ms = tuning.minSpeechDurationMS
+        params.vad_params.min_silence_duration_ms = tuning.minSilenceDurationMS
+        params.vad_params.speech_pad_ms = tuning.speechPadMS
+        params.vad_params.samples_overlap = tuning.samplesOverlap
     }
 
     func transcriptSegments(context: OpaquePointer, includeWords: Bool) -> [TranscriptSegment] {
