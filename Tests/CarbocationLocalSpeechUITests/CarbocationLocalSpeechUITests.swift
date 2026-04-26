@@ -1,5 +1,5 @@
 import CarbocationLocalSpeech
-import CarbocationLocalSpeechUI
+@testable import CarbocationLocalSpeechUI
 import XCTest
 
 final class CarbocationLocalSpeechUITests: XCTestCase {
@@ -138,5 +138,51 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
         )
 
         XCTAssertEqual(best?.id, "large-v3-turbo")
+    }
+
+    func testLiveTranscriptDebugSnapshotBuildsReadableCommittedTranscript() {
+        let events: [TranscriptEvent] = [
+            .progress(TranscriptionProgress(processedDuration: 0.8)),
+            .stats(TranscriptionStats(audioDuration: 0.8, processingDuration: 0.2, realTimeFactor: 0.25, segmentCount: 2)),
+            .committed(TranscriptSegment(text: " hello ", startTime: 0.0, endTime: 0.4)),
+            .committed(TranscriptSegment(text: "world", startTime: 0.4, endTime: 0.8))
+        ]
+
+        let snapshot = LiveTranscriptDebugSnapshot(events: events)
+
+        XCTAssertEqual(snapshot.transcriptText, "hello world")
+        XCTAssertEqual(snapshot.latestText, "world")
+        XCTAssertEqual(snapshot.latestTimeRange, "0.40-0.80")
+        XCTAssertEqual(snapshot.segmentCount, 2)
+        XCTAssertEqual(snapshot.processedDuration, 0.8)
+        XCTAssertEqual(snapshot.realTimeFactor, 0.25)
+    }
+
+    func testLiveTranscriptDebugSnapshotShowsPartialUntilCommit() {
+        let partialID = UUID()
+        let events: [TranscriptEvent] = [
+            .partial(TranscriptPartial(id: partialID, text: "hel", startTime: 0.0, endTime: 0.2)),
+            .revision(TranscriptRevision(
+                replacesPartialID: partialID,
+                replacement: TranscriptPartial(text: "hello wor", startTime: 0.0, endTime: 0.6)
+            ))
+        ]
+
+        let partialSnapshot = LiveTranscriptDebugSnapshot(events: events)
+
+        XCTAssertEqual(partialSnapshot.transcriptText, "hello wor")
+        XCTAssertEqual(partialSnapshot.latestText, "hello wor")
+        XCTAssertEqual(partialSnapshot.latestTimeRange, "0.00-0.60")
+        XCTAssertTrue(partialSnapshot.hasPendingPartial)
+        XCTAssertEqual(partialSnapshot.segmentCount, 0)
+
+        let committedSnapshot = LiveTranscriptDebugSnapshot(events: events + [
+            .committed(TranscriptSegment(text: "hello world", startTime: 0.0, endTime: 0.8))
+        ])
+
+        XCTAssertEqual(committedSnapshot.transcriptText, "hello world")
+        XCTAssertEqual(committedSnapshot.latestText, "hello world")
+        XCTAssertFalse(committedSnapshot.hasPendingPartial)
+        XCTAssertEqual(committedSnapshot.segmentCount, 1)
     }
 }

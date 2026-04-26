@@ -334,10 +334,88 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         })
     }
 
+    func testSpeechChunkStreamingPipelineTrimsCommittedOverlap() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 16_000),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 1.0
+            ))
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 12_000),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 1.0,
+                duration: 0.75
+            ))
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(useCase: .dictation),
+            chunking: SpeechChunkingConfiguration(
+                maximumChunkDuration: 1.0,
+                overlapDuration: 0.25,
+                silenceCommitDelay: 2.0,
+                minimumSpeechDuration: 0.01
+            ),
+            partialCommitStrategy: .chunkBoundary,
+            latencyPreset: .lowestLatency
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options
+        ) { audio, _ in
+            if audio.duration < 0.5 {
+                return Transcript()
+            }
+
+            let callIndex = await callCounter.next()
+            let text = callIndex == 1 ? "apple speech." : "speech provider."
+            return Transcript(segments: [
+                TranscriptSegment(text: text, startTime: 0, endTime: audio.duration)
+            ])
+        }
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        let committedText = events.compactMap { event -> String? in
+            if case .committed(let segment) = event {
+                return segment.text
+            }
+            return nil
+        }.joined(separator: " ")
+
+        XCTAssertEqual(committedText, "apple speech. provider.")
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == "apple speech. provider."
+            }
+            return false
+        })
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("CarbocationLocalSpeechTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+}
+
+private actor SpeechChunkStreamingPipelineCallCounter {
+    private var value = 0
+
+    func next() -> Int {
+        value += 1
+        return value
     }
 }

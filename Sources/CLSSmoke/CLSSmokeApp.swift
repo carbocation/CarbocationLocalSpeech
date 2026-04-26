@@ -67,6 +67,7 @@ private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.selectedSpeechModelSelection") private var selectionStorageValue = SpeechSystemModelID.appleSpeech.rawValue
     @State private var systemOptions: [SpeechSystemModelOption] = []
     @State private var events: [TranscriptEvent] = []
+    @State private var transcriptEvents: [TranscriptEvent] = []
     @State private var microphoneStatus = MicrophonePermissionHelper.authorizationStatus()
     @State private var loadedInfo: LocalSpeechLoadedModelInfo?
     @State private var statusMessage = "Select a provider, then start listening."
@@ -117,7 +118,7 @@ private struct CLSSmokeRootView: View {
                 Divider()
                 sessionStatus
                 Divider()
-                LiveTranscriptDebugView(events: events)
+                LiveTranscriptDebugView(events: events, transcriptEvents: transcriptEvents)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -182,6 +183,7 @@ private struct CLSSmokeRootView: View {
         activeSessionID = sessionID
         loadedInfo = nil
         events.removeAll(keepingCapacity: true)
+        transcriptEvents.removeAll(keepingCapacity: true)
         isStarting = true
         isListening = false
         statusTone = .secondary
@@ -285,6 +287,10 @@ private struct CLSSmokeRootView: View {
 
     private func appendEvent(_ event: TranscriptEvent) {
         events.append(event)
+        if event.isTranscriptPanelEvent {
+            transcriptEvents.append(event)
+        }
+
         let overflow = events.count - maximumDisplayedEvents
         if overflow > 0 {
             events.removeFirst(overflow)
@@ -302,6 +308,17 @@ private struct CLSSmokeRootView: View {
         isListening = false
         statusMessage = message
         statusTone = tone
+    }
+}
+
+private extension TranscriptEvent {
+    var isTranscriptPanelEvent: Bool {
+        switch self {
+        case .partial, .revision, .committed, .progress, .stats, .completed:
+            return true
+        case .started, .audioLevel, .voiceActivity:
+            return false
+        }
     }
 }
 

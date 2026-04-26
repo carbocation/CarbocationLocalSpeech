@@ -97,6 +97,14 @@ public enum SpeechChunkStreamingPipeline {
 
         if shouldCommit(emitted: emitted, strategy: options.partialCommitStrategy) {
             for segment in segments {
+                guard let segment = removeCommittedOverlap(
+                    from: segment,
+                    committedSegments: committedSegments,
+                    overlapDuration: options.chunking.overlapDuration
+                ) else {
+                    continue
+                }
+
                 committedSegments.append(segment)
                 continuation.yield(.committed(segment))
             }
@@ -117,6 +125,127 @@ public enum SpeechChunkStreamingPipeline {
             }
             pendingPartialID = partial.id
         }
+    }
+
+    private static func removeCommittedOverlap(
+        from segment: TranscriptSegment,
+        committedSegments: [TranscriptSegment],
+        overlapDuration: TimeInterval
+    ) -> TranscriptSegment? {
+        guard overlapDuration > 0,
+              let lastCommitted = committedSegments.last,
+              segment.startTime <= lastCommitted.endTime + overlapDuration + 0.1
+        else {
+            return segment
+        }
+
+        let committedText = committedSegments.map(\.text).joined(separator: " ")
+        let trimResult = trimDuplicatePrefix(in: segment.text, after: committedText)
+        guard trimResult.removedTokenCount > 0 else {
+            return segment
+        }
+
+        let trimmedText = trimResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else {
+            return nil
+        }
+
+        let trimmedWords: [TranscriptWord]
+        if segment.words.count >= trimResult.removedTokenCount {
+            trimmedWords = Array(segment.words.dropFirst(trimResult.removedTokenCount))
+        } else {
+            trimmedWords = []
+        }
+
+        let startTime = trimmedWords.first?.startTime ?? max(segment.startTime, lastCommitted.endTime)
+        return TranscriptSegment(
+            id: segment.id,
+            text: trimmedText,
+            startTime: startTime,
+            endTime: max(startTime, segment.endTime),
+            words: trimmedWords,
+            speaker: segment.speaker,
+            confidence: segment.confidence
+        )
+    }
+
+    private static func trimDuplicatePrefix(
+        in text: String,
+        after committedText: String
+    ) -> (text: String, removedTokenCount: Int) {
+        let committedTokens = tokens(in: committedText)
+        let newTokens = tokens(in: text)
+        guard !committedTokens.isEmpty, !newTokens.isEmpty else {
+            return (text, 0)
+        }
+
+        let maximumOverlap = min(committedTokens.count, newTokens.count, 12)
+        var duplicateTokenCount = 0
+        for count in stride(from: maximumOverlap, through: 1, by: -1) {
+            let committedSuffix = committedTokens.suffix(count).map(\.normalized)
+            let newPrefix = newTokens.prefix(count).map(\.normalized)
+            if Array(committedSuffix) == Array(newPrefix) {
+                duplicateTokenCount = count
+                break
+            }
+        }
+
+        guard duplicateTokenCount > 0 else {
+            return (text, 0)
+        }
+
+        let cutIndex = newTokens[duplicateTokenCount - 1].range.upperBound
+        let trimmed = trimLeadingOverlapSeparators(String(text[cutIndex...]))
+        return (trimmed, duplicateTokenCount)
+    }
+
+    private static func trimLeadingOverlapSeparators(_ text: String) -> String {
+        let separators = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
+        var startIndex = text.startIndex
+
+        while startIndex < text.endIndex,
+              text[startIndex].unicodeScalars.allSatisfy({ separators.contains($0) }) {
+            startIndex = text.index(after: startIndex)
+        }
+
+        return String(text[startIndex...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func tokens(in text: String) -> [TranscriptTextToken] {
+        var tokens: [TranscriptTextToken] = []
+        var tokenStart: String.Index?
+
+        for index in text.indices {
+            let character = text[index]
+            if character.isLetter || character.isNumber || character == "'" {
+                if tokenStart == nil {
+                    tokenStart = index
+                }
+            } else if let start = tokenStart {
+                appendToken(from: start, to: index, in: text, tokens: &tokens)
+                tokenStart = nil
+            }
+        }
+
+        if let start = tokenStart {
+            appendToken(from: start, to: text.endIndex, in: text, tokens: &tokens)
+        }
+
+        return tokens
+    }
+
+    private static func appendToken(
+        from start: String.Index,
+        to end: String.Index,
+        in text: String,
+        tokens: inout [TranscriptTextToken]
+    ) {
+        let value = String(text[start..<end])
+        tokens.append(TranscriptTextToken(
+            normalized: value.lowercased(),
+            range: start..<end
+        ))
     }
 
     private static func shouldCommit(
@@ -154,4 +283,9 @@ public enum SpeechChunkStreamingPipeline {
             confidence: segment.confidence
         )
     }
+}
+
+private struct TranscriptTextToken {
+    var normalized: String
+    var range: Range<String.Index>
 }

@@ -290,6 +290,8 @@ extension AppleSpeechEngine {
         let collector = Task<[TranscriptSegment], Error> {
             var segments: [TranscriptSegment] = []
             for try await result in transcriber.results {
+                guard result.isFinal else { continue }
+
                 let segment = segment(from: result)
                 if !segment.text.isEmpty {
                     segments.append(segment)
