@@ -10,6 +10,8 @@ let whisperBinaryArtifactChecksum = ""
 let whisperBinaryArtifactPath = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH"] ?? ""
 let forceSourceWhisper = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_SOURCE_WHISPER"] == "1"
 let sourceWhisperLibraryExists = FileManager.default.fileExists(atPath: whisperCombinedLibrary)
+let whisperCAPIIsLinked = sourceWhisperLibraryExists || forceSourceWhisper || !whisperBinaryArtifactPath.isEmpty || (!whisperBinaryArtifactURL.isEmpty && !whisperBinaryArtifactChecksum.isEmpty)
+let whisperRuntimeSwiftSettings: [SwiftSetting] = whisperCAPIIsLinked ? [.define("CARBOCATION_HAS_WHISPER_C_API")] : []
 let clsSmokeInfoPlist = "\(packageRoot)/Sources/CLSSmoke/Info.plist"
 
 let whisperTarget: Target
@@ -61,10 +63,12 @@ let package = Package(
                 "CarbocationLocalSpeech",
                 "whisper"
             ],
+            swiftSettings: whisperRuntimeSwiftSettings,
             linkerSettings: whisperUnsafeLinkerSettings + [
                 .linkedLibrary("c++"),
                 .linkedFramework("Accelerate"),
                 .linkedFramework("AVFoundation"),
+                .linkedFramework("CoreML"),
                 .linkedFramework("Foundation"),
                 .linkedFramework("Metal")
             ]

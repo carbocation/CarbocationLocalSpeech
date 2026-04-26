@@ -177,7 +177,7 @@ private struct CLSSmokeRootView: View {
     }
 
     private func startListening(with selection: SpeechModelSelection) {
-        stopListening(updateStatus: false)
+        stopListening(updateStatus: false, unloadProvider: false)
 
         let sessionID = UUID()
         activeSessionID = sessionID
@@ -194,7 +194,7 @@ private struct CLSSmokeRootView: View {
         }
     }
 
-    private func stopListening(updateStatus: Bool = true) {
+    private func stopListening(updateStatus: Bool = true, unloadProvider: Bool = true) {
         activeSessionID = nil
         transcriptionTask?.cancel()
         transcriptionTask = nil
@@ -202,6 +202,13 @@ private struct CLSSmokeRootView: View {
         captureSession = nil
         isStarting = false
         isListening = false
+
+        if unloadProvider {
+            loadedInfo = nil
+            Task {
+                await LocalSpeechEngine.shared.unload()
+            }
+        }
 
         if updateStatus {
             statusTone = .secondary
@@ -262,10 +269,14 @@ private struct CLSSmokeRootView: View {
                 appendEvent(event)
             }
 
+            guard activeSessionID == id else { return }
+            await LocalSpeechEngine.shared.unload()
             finishSession(id: id, message: "Listening completed.", tone: .secondary)
         } catch is CancellationError {
             finishSession(id: id, message: "Stopped.", tone: .secondary)
         } catch {
+            guard activeSessionID == id else { return }
+            await LocalSpeechEngine.shared.unload()
             finishSession(id: id, message: error.localizedDescription, tone: .error)
         }
     }
