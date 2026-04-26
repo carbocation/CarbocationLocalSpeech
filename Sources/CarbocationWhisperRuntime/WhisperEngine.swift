@@ -119,9 +119,14 @@ struct WhisperStreamingOptionsResolver {
         var resolved = options
 
         if resolved.implementation == .automatic {
-            resolved.emulation = EmulatedStreamingOptions(
-                window: .vadUtterances(options.strategy.defaultChunkingConfiguration)
-            )
+            switch resolved.transcription.voiceActivityDetection.mode {
+            case .disabled:
+                resolved.emulation = options.strategy.defaultEmulatedStreamingOptions
+            case .automatic, .enabled:
+                resolved.emulation = EmulatedStreamingOptions(
+                    window: .vadUtterances(options.strategy.defaultChunkingConfiguration)
+                )
+            }
         }
 
         if resolved.commitment == .automatic {

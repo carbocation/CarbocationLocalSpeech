@@ -30,7 +30,9 @@ import Foundation
             let task = Task {
                 continuation.yield(.started(backend))
 
-                let detector = EnergyVoiceActivityDetector()
+                let detector = options.transcription.voiceActivityDetection.mode == .disabled
+                    ? nil
+                    : EnergyVoiceActivityDetector(sensitivity: options.transcription.voiceActivityDetection.sensitivity)
                 var committedSegments: [TranscriptSegment] = []
                 var agreementState = LocalAgreementState(policy: Self.resolvedCommitmentPolicy(options))
 
@@ -41,9 +43,8 @@ import Foundation
                         for try await chunk in audio {
                             try Task.checkCancellation()
 
-                            let activity = try detector.analyze(chunk)
                             continuation.yield(.audioLevel(AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)))
-                            continuation.yield(.voiceActivity(activity))
+                            let activity = try voiceActivity(for: chunk, detector: detector, continuation: continuation)
 
                             for emitted in chunker.append(chunk, activity: activity) {
                                 try await process(
@@ -78,9 +79,8 @@ import Foundation
                         for try await chunk in audio {
                             try Task.checkCancellation()
 
-                            let activity = try detector.analyze(chunk)
                             continuation.yield(.audioLevel(AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)))
-                            continuation.yield(.voiceActivity(activity))
+                            try reportVoiceActivityIfNeeded(for: chunk, detector: detector, continuation: continuation)
 
                             for emitted in window.append(chunk) {
                                 try await process(
@@ -128,6 +128,33 @@ import Foundation
                 task.cancel()
             }
         }
+    }
+
+    private static func voiceActivity(
+        for chunk: AudioChunk,
+        detector: EnergyVoiceActivityDetector?,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) throws -> VoiceActivityEvent {
+        guard let detector else {
+            return VoiceActivityEvent(
+                state: .speech,
+                startTime: chunk.startTime,
+                endTime: chunk.startTime + chunk.duration
+            )
+        }
+
+        let activity = try detector.analyze(chunk)
+        continuation.yield(.voiceActivity(activity))
+        return activity
+    }
+
+    private static func reportVoiceActivityIfNeeded(
+        for chunk: AudioChunk,
+        detector: EnergyVoiceActivityDetector?,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) throws {
+        guard let detector else { return }
+        continuation.yield(.voiceActivity(try detector.analyze(chunk)))
     }
 
     private static func process(

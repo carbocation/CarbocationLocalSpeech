@@ -86,6 +86,22 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         XCTAssertEqual(configuration, StreamingTranscriptionStrategy.balanced.defaultChunkingConfiguration)
     }
 
+    func testWhisperStreamingOptionsUseRollingBufferWhenVADIsDisabled() {
+        let resolved = WhisperStreamingOptionsResolver.resolve(StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .disabled),
+            strategy: .balanced
+        ))
+
+        XCTAssertEqual(resolved.commitment, .localAgreement(iterations: 2))
+        guard case .rollingBuffer(let maxDuration, let updateInterval, let overlap) = resolved.emulation.window else {
+            XCTFail("Expected Whisper streaming with disabled VAD to use rolling buffer windows.")
+            return
+        }
+        XCTAssertEqual(maxDuration, 8.0)
+        XCTAssertEqual(updateInterval, 1.5)
+        XCTAssertEqual(overlap, 1.0)
+    }
+
     func testWhisperStreamingOptionsKeepExplicitRollingBufferWithLocalAgreement() {
         let options = StreamingTranscriptionOptions(
             strategy: .balanced,

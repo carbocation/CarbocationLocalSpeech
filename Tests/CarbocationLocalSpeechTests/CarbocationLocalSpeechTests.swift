@@ -262,6 +262,14 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(try detector.analyze(speech).state, .speech)
     }
 
+    func testEnergyVADAppliesSensitivityThresholds() throws {
+        let borderline = AudioChunk(samples: Array(repeating: 0.01, count: 160), sampleRate: 16_000, channelCount: 1, startTime: 0)
+
+        XCTAssertEqual(try EnergyVoiceActivityDetector(sensitivity: .low).analyze(borderline).state, .silence)
+        XCTAssertEqual(try EnergyVoiceActivityDetector(sensitivity: .medium).analyze(borderline).state, .silence)
+        XCTAssertEqual(try EnergyVoiceActivityDetector(sensitivity: .high).analyze(borderline).state, .speech)
+    }
+
     func testSpeechChunkerEmitsOnChunkBoundaryAndKeepsOverlap() throws {
         var chunker = SpeechChunker(configuration: SpeechChunkingConfiguration(
             maximumChunkDuration: 1.0,
@@ -603,6 +611,55 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         let recordedStartValue = await observedStart.recordedValue()
         let recordedStart = try XCTUnwrap(recordedStartValue)
         XCTAssertEqual(recordedStart, 2.0, accuracy: 0.000_1)
+    }
+
+    func testSpeechChunkStreamingPipelineDoesNotReportVADWhenDisabled() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 1_600),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 0.1
+            ))
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .disabled),
+            commitment: .immediate,
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 1.0, updateInterval: 0.05, overlap: 0)
+            )
+        )
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribe: { audio, _ in
+                Transcript(segments: [
+                    TranscriptSegment(text: "hello", startTime: 0, endTime: audio.duration)
+                ])
+            })
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertFalse(events.contains { event in
+            if case .voiceActivity = event { return true }
+            return false
+        })
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == "hello"
+            }
+            return false
+        })
     }
 
     func testSpeechChunkStreamingPipelineTrimsCommittedOverlap() async throws {

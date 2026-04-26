@@ -30,6 +30,17 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
         self.minimumPeakThreshold = minimumPeakThreshold
     }
 
+    public init(sensitivity: VoiceActivityDetectionSensitivity) {
+        switch sensitivity {
+        case .low:
+            self.init(speechRMSThreshold: 0.02, minimumPeakThreshold: 0.04)
+        case .medium:
+            self.init()
+        case .high:
+            self.init(speechRMSThreshold: 0.006, minimumPeakThreshold: 0.012)
+        }
+    }
+
     public func analyze(_ chunk: AudioChunk) throws -> VoiceActivityEvent {
         let level = AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)
         let isSpeech = level.rms >= speechRMSThreshold || level.peak >= minimumPeakThreshold
