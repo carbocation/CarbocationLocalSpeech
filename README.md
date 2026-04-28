@@ -260,7 +260,7 @@ struct SpeechSettingsPane: View {
 If you are building your own UI, download and install a curated model with the core APIs:
 
 ```swift
-let catalogModel = CuratedSpeechModelCatalog.entry(id: "base.en")!
+let catalogModel = CuratedSpeechModelCatalog.entry(id: "small.en")!
 
 let downloaded = try await SpeechModelDownloader.download(
     hfRepo: catalogModel.hfRepo!,

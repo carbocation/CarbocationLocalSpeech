@@ -105,10 +105,7 @@ public struct SpeechModelPickerLabelPolicy: Equatable, Sendable {
         _ model: CuratedSpeechModel,
         isBetterRecommendationThan other: CuratedSpeechModel
     ) -> Bool {
-        if model.recommendedRAMBytes != other.recommendedRAMBytes {
-            return model.recommendedRAMBytes > other.recommendedRAMBytes
-        }
-        return model.approxSizeBytes > other.approxSizeBytes
+        model.isBetterRecommendation(than: other)
     }
 
     public static func installedModel(

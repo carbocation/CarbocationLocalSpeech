@@ -130,19 +130,68 @@ final class CarbocationLocalSpeechTests: XCTestCase {
     }
 
     func testCuratedCatalogEntriesHaveDownloadURLs() throws {
+        XCTAssertEqual(
+            CuratedSpeechModelCatalog.all.map(\.id),
+            ["tiny.en", "small.en", "medium.en", "distil-large-v3", "large-v2", "large-v3-turbo"]
+        )
+        XCTAssertNil(CuratedSpeechModelCatalog.entry(id: "base.en"))
+
         for model in CuratedSpeechModelCatalog.all {
             let url = try XCTUnwrap(model.downloadURL, "\(model.id) should have a download URL")
+            let hfRepo = try XCTUnwrap(model.hfRepo)
             XCTAssertEqual(url.host(), "huggingface.co")
-            XCTAssertTrue(url.path.contains("/ggerganov/whisper.cpp/resolve/main/"))
+            XCTAssertTrue(url.path.contains("/\(hfRepo)/resolve/main/"))
             XCTAssertTrue(url.lastPathComponent.hasSuffix(".bin"))
         }
 
-        let base = try XCTUnwrap(CuratedSpeechModelCatalog.entry(id: "base.en"))
-        XCTAssertEqual(base.hfFilename, "ggml-base.en.bin")
+        let small = try XCTUnwrap(CuratedSpeechModelCatalog.entry(id: "small.en"))
+        XCTAssertEqual(small.displayName, "Whisper small.en (English-only)")
+        XCTAssertEqual(small.hfFilename, "ggml-small.en.bin")
+        XCTAssertEqual(small.languageScope, .englishOnly)
         XCTAssertEqual(
-            base.downloadURL?.absoluteString,
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+            small.downloadURL?.absoluteString,
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
         )
+
+        let distil = try XCTUnwrap(CuratedSpeechModelCatalog.entry(id: "distil-large-v3"))
+        XCTAssertEqual(distil.hfRepo, "distil-whisper/distil-large-v3-ggml")
+        XCTAssertEqual(distil.hfFilename, "ggml-distil-large-v3.bin")
+        XCTAssertEqual(distil.languageScope, .englishOnly)
+        XCTAssertEqual(
+            distil.downloadURL?.absoluteString,
+            "https://huggingface.co/distil-whisper/distil-large-v3-ggml/resolve/main/ggml-distil-large-v3.bin"
+        )
+
+        let largeV2 = try XCTUnwrap(CuratedSpeechModelCatalog.entry(id: "large-v2"))
+        XCTAssertEqual(largeV2.displayName, "Whisper large-v2 (multilingual)")
+        XCTAssertEqual(largeV2.hfFilename, "ggml-large-v2.bin")
+        XCTAssertEqual(largeV2.languageScope, .multilingual)
+
+        let turbo = try XCTUnwrap(CuratedSpeechModelCatalog.entry(id: "large-v3-turbo"))
+        XCTAssertEqual(turbo.displayName, "Whisper large-v3 turbo (multilingual)")
+        XCTAssertEqual(turbo.languageScope, .multilingual)
+        XCTAssertTrue(turbo.isBetterRecommendation(than: largeV2))
+        XCTAssertTrue(turbo.isBetterRecommendation(than: distil))
+
+        let unrankedLarger = CuratedSpeechModel(
+            id: "larger",
+            displayName: "Larger",
+            subtitle: "",
+            variant: "larger",
+            languageScope: .unknown,
+            approxSizeBytes: 2,
+            recommendedRAMGB: 4
+        )
+        let unrankedSmaller = CuratedSpeechModel(
+            id: "smaller",
+            displayName: "Smaller",
+            subtitle: "",
+            variant: "smaller",
+            languageScope: .unknown,
+            approxSizeBytes: 1,
+            recommendedRAMGB: 4
+        )
+        XCTAssertTrue(unrankedLarger.isBetterRecommendation(than: unrankedSmaller))
 
         let vad = CuratedSpeechModelCatalog.recommendedVADModel
         XCTAssertEqual(vad.hfRepo, "ggml-org/whisper-vad")
@@ -153,12 +202,19 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         )
     }
 
-    func testRecommendedCuratedModelPrefersLargerModelWhenRAMTierTies() throws {
+    func testRecommendedCuratedModelUsesCatalogPriority() throws {
         let recommended = CuratedSpeechModelCatalog.recommendedModel(
             forPhysicalMemoryBytes: 48 * 1_073_741_824
         )
 
         XCTAssertEqual(recommended?.id, "large-v3-turbo")
+    }
+
+    func testInstalledSpeechModelInfersDistilLargeV3AsEnglishOnly() {
+        XCTAssertEqual(
+            InstalledSpeechModel.inferLanguageScope(from: "ggml-distil-large-v3.bin"),
+            .englishOnly
+        )
     }
 
     func testSpeechModelDownloadConfigurationNormalizesUnsafeValues() {
