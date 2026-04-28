@@ -193,6 +193,20 @@ struct whisper_context * whisper_init_from_file_with_params(const char * path_mo
 void whisper_free(struct whisper_context * ctx);
 struct whisper_full_params whisper_full_default_params(enum whisper_sampling_strategy strategy);
 int whisper_full(struct whisper_context * ctx, struct whisper_full_params params, const float * samples, int n_samples);
+struct whisper_vad_context;
+struct whisper_vad_context_params {
+    int n_threads;
+    bool use_gpu;
+    int gpu_device;
+};
+struct whisper_vad_context_params whisper_vad_default_context_params(void);
+struct whisper_vad_params whisper_vad_default_params(void);
+struct whisper_vad_context * whisper_vad_init_from_file_with_params(const char * path_model, struct whisper_vad_context_params params);
+void whisper_vad_free(struct whisper_vad_context * ctx);
+bool whisper_vad_detect_speech_no_reset(struct whisper_vad_context * vctx, const float * samples, int n_samples);
+void whisper_vad_reset_state(struct whisper_vad_context * vctx);
+int whisper_vad_n_probs(struct whisper_vad_context * vctx);
+float * whisper_vad_probs(struct whisper_vad_context * vctx);
 int whisper_tokenize(struct whisper_context * ctx, const char * text, whisper_token * tokens, int n_max_tokens);
 int whisper_n_text_ctx(struct whisper_context * ctx);
 int whisper_n_audio_ctx(struct whisper_context * ctx);

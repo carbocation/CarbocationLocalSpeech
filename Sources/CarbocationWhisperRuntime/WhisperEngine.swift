@@ -172,19 +172,48 @@ struct WhisperVADTuning: Hashable, Sendable {
     }
 }
 
+enum WhisperInnerVADPolicy {
+    static func shouldUseModelVAD(options: TranscriptionOptions, isStreaming: Bool) -> Bool {
+        guard !isStreaming else {
+            return false
+        }
+
+        switch options.voiceActivityDetection.mode {
+        case .enabled:
+            return true
+        case .disabled, .automatic:
+            return false
+        }
+    }
+}
+
+enum WhisperOuterVADSelection: Hashable, Sendable {
+    case disabled
+    case whisper
+    case energyFallback(reason: String)
+
+    static func resolve(
+        mode: VoiceActivityDetectionMode,
+        vadModelPath: String?
+    ) -> WhisperOuterVADSelection {
+        switch mode {
+        case .disabled:
+            return .disabled
+        case .automatic, .enabled:
+            guard vadModelPath != nil else {
+                return .energyFallback(reason: "missing-vad-model")
+            }
+            return .whisper
+        }
+    }
+}
+
 struct WhisperStreamingOptionsResolver {
     static func resolve(_ options: StreamingTranscriptionOptions) -> StreamingTranscriptionOptions {
         var resolved = options
 
         if resolved.implementation == .automatic {
-            switch resolved.transcription.voiceActivityDetection.mode {
-            case .disabled:
-                resolved.emulation = options.strategy.defaultEmulatedStreamingOptions
-            case .automatic, .enabled:
-                resolved.emulation = EmulatedStreamingOptions(
-                    window: .vadUtterances(options.strategy.defaultChunkingConfiguration)
-                )
-            }
+            resolved.emulation = options.strategy.defaultContextualStreamingOptions
         }
 
         if resolved.commitment == .automatic {
@@ -434,6 +463,11 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
         let streamingState = WhisperStreamingSessionState()
         let tuning = WhisperStreamingDecodeTuning.resolve(for: resolvedOptions)
         let keepsDecoderContext = Self.shouldKeepDecoderContext(for: resolvedOptions)
+        let outerVAD = makeOuterVoiceActivityDetector(
+            loadedInfo: loadedInfo,
+            options: resolvedOptions
+        )
+        let startupDiagnostics = outerVAD.diagnostics + Self.streamingDiagnostics(for: resolvedOptions)
         return AsyncThrowingStream { continuation in
             let task = Task {
                 let pipelineStream = SpeechChunkStreamingPipeline.stream(
@@ -457,7 +491,9 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
                             options: transcriptionOptions,
                             context: context
                         )
-                    })
+                    },
+                    voiceActivityDetector: outerVAD.detector,
+                    startupDiagnostics: startupDiagnostics)
 
                 do {
                     for try await event in pipelineStream {
@@ -475,13 +511,121 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
         }
     }
 
+    private func makeOuterVoiceActivityDetector(
+        loadedInfo: WhisperLoadedModelInfo,
+        options: StreamingTranscriptionOptions
+    ) -> (detector: VoiceActivityDetecting?, diagnostics: [TranscriptionDiagnostic]) {
+        var diagnostics: [TranscriptionDiagnostic] = [
+            TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "inner_whisper_vad=false"
+            )
+        ]
+
+        switch WhisperOuterVADSelection.resolve(
+            mode: options.transcription.voiceActivityDetection.mode,
+            vadModelPath: loadedInfo.vadModelPath
+        ) {
+        case .disabled:
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "outer_vad=disabled"
+            ))
+            return (nil, diagnostics)
+        case .energyFallback(let reason):
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "outer_vad=energy-fallback reason=\(reason)"
+            ))
+            return (nil, diagnostics)
+        case .whisper:
+#if CARBOCATION_HAS_WHISPER_C_API
+            guard let vadModelPath = loadedInfo.vadModelPath else {
+                diagnostics.append(TranscriptionDiagnostic(
+                    source: "whisper.streaming",
+                    message: "outer_vad=energy-fallback reason=missing-vad-model"
+                ))
+                return (nil, diagnostics)
+            }
+
+            do {
+                configureNativeLogging()
+                let detector = try WhisperVoiceActivityDetector(
+                    modelPath: vadModelPath,
+                    sensitivity: options.transcription.voiceActivityDetection.sensitivity,
+                    threadCount: threadCount(isStreaming: true)
+                )
+                diagnostics.append(TranscriptionDiagnostic(
+                    source: "whisper.streaming",
+                    message: "outer_vad=whisper"
+                ))
+                return (detector, diagnostics)
+            } catch {
+                diagnostics.append(TranscriptionDiagnostic(
+                    source: "whisper.streaming",
+                    message: "outer_vad=energy-fallback reason=init-failed"
+                ))
+                return (nil, diagnostics)
+            }
+#else
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "outer_vad=energy-fallback reason=runtime-unavailable"
+            ))
+            return (nil, diagnostics)
+#endif
+        }
+    }
+
     private nonisolated static func shouldKeepDecoderContext(for options: StreamingTranscriptionOptions) -> Bool {
         switch options.emulation.window {
-        case .rollingBuffer:
+        case .rollingBuffer, .contextualRollingBuffer:
             return true
         case .vadUtterances:
             return false
         }
+    }
+
+    private nonisolated static func streamingDiagnostics(
+        for options: StreamingTranscriptionOptions
+    ) -> [TranscriptionDiagnostic] {
+        var diagnostics: [TranscriptionDiagnostic] = []
+
+        switch options.emulation.window {
+        case .contextualRollingBuffer(let maxDuration, let updateInterval, let finalSilenceDelay):
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "window=contextual-rolling max=\(maxDuration.formattedWhisperDebug)s update=\(updateInterval.formattedWhisperDebug)s final_silence=\(finalSilenceDelay.formattedWhisperDebug)s"
+            ))
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "decode_queue=coalescing"
+            ))
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "commit_policy=strict-contextual"
+            ))
+        case .rollingBuffer(let maxDuration, let updateInterval, let overlap):
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "window=rolling max=\(maxDuration.formattedWhisperDebug)s update=\(updateInterval.formattedWhisperDebug)s overlap=\(overlap.formattedWhisperDebug)s"
+            ))
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "decode_queue=inline"
+            ))
+        case .vadUtterances(let configuration):
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "window=vad-utterances max=\(configuration.maximumChunkDuration.formattedWhisperDebug)s silence=\(configuration.silenceCommitDelay.formattedWhisperDebug)s overlap=\(configuration.overlapDuration.formattedWhisperDebug)s"
+            ))
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "decode_queue=inline"
+            ))
+        }
+
+        return diagnostics
     }
 
     private func transcribeStreamingChunk(
@@ -533,6 +677,137 @@ private final class WhisperStreamingCallbackBox: @unchecked Sendable {
         if let event {
             eventSink(event)
         }
+    }
+}
+
+enum WhisperVoiceActivityDetectorError: Error, LocalizedError, Sendable {
+    case failedToLoadModel(String)
+    case detectionFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .failedToLoadModel(let path):
+            return "whisper.cpp VAD could not load model at \(path)."
+        case .detectionFailed:
+            return "whisper.cpp VAD detection failed."
+        }
+    }
+}
+
+final class WhisperVoiceActivityDetector: VoiceActivityDetecting, VoiceActivityDetectionStateResetting, @unchecked Sendable {
+    private let lock = NSLock()
+    private let tuning: WhisperVADTuning
+    private let resampler = AudioResampler16kMono(targetSampleRate: Double(WHISPER_SAMPLE_RATE))
+    private var context: OpaquePointer?
+    private var lastInputEndTime: TimeInterval?
+
+    init(
+        modelPath: String,
+        sensitivity: VoiceActivityDetectionSensitivity,
+        threadCount: Int32
+    ) throws {
+        self.tuning = WhisperVADTuning.resolve(for: sensitivity)
+
+        var params = whisper_vad_default_context_params()
+        params.n_threads = CInt(max(1, threadCount))
+        params.use_gpu = false
+
+        let context = modelPath.withCString { path in
+            whisper_vad_init_from_file_with_params(path, params)
+        }
+        guard let context else {
+            throw WhisperVoiceActivityDetectorError.failedToLoadModel(modelPath)
+        }
+        self.context = context
+    }
+
+    deinit {
+        if let context {
+            whisper_vad_free(context)
+        }
+    }
+
+    func analyze(_ chunk: AudioChunk) throws -> VoiceActivityEvent {
+        let prepared = try resampler.prepareChunk(chunk)
+        let probability = try detectSpeechProbability(
+            prepared,
+            sourceStartTime: chunk.startTime,
+            sourceDuration: chunk.duration
+        )
+        return VoiceActivityEvent(
+            state: probability >= tuning.threshold ? .speech : .silence,
+            startTime: chunk.startTime,
+            endTime: chunk.startTime + chunk.duration,
+            confidence: Double(probability)
+        )
+    }
+
+    func resetVoiceActivityState() {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let context {
+            whisper_vad_reset_state(context)
+        }
+        lastInputEndTime = nil
+    }
+
+    private func detectSpeechProbability(
+        _ chunk: AudioChunk,
+        sourceStartTime: TimeInterval,
+        sourceDuration: TimeInterval
+    ) throws -> Float {
+        guard !chunk.samples.isEmpty else {
+            return 0
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let context else {
+            throw WhisperVoiceActivityDetectorError.detectionFailed
+        }
+
+        resetStateAfterDiscontinuityIfNeeded(
+            context: context,
+            sourceStartTime: sourceStartTime,
+            sourceDuration: sourceDuration
+        )
+
+        let succeeded = chunk.samples.withUnsafeBufferPointer { buffer in
+            whisper_vad_detect_speech_no_reset(context, buffer.baseAddress, Int32(buffer.count))
+        }
+        guard succeeded else {
+            throw WhisperVoiceActivityDetectorError.detectionFailed
+        }
+
+        let probabilityCount = max(0, Int(whisper_vad_n_probs(context)))
+        guard probabilityCount > 0,
+              let probabilities = whisper_vad_probs(context)
+        else {
+            return 0
+        }
+
+        var maximumProbability: Float = 0
+        for index in 0..<probabilityCount {
+            maximumProbability = max(maximumProbability, probabilities[index])
+        }
+        return maximumProbability
+    }
+
+    private func resetStateAfterDiscontinuityIfNeeded(
+        context: OpaquePointer,
+        sourceStartTime: TimeInterval,
+        sourceDuration: TimeInterval
+    ) {
+        if let lastInputEndTime {
+            let tolerance = max(0.25, min(1.0, max(0.05, sourceDuration) * 2))
+            if sourceStartTime > lastInputEndTime + tolerance ||
+                sourceStartTime + sourceDuration < lastInputEndTime - tolerance {
+                whisper_vad_reset_state(context)
+            }
+        }
+        lastInputEndTime = sourceStartTime + sourceDuration
     }
 }
 
@@ -754,14 +1029,7 @@ private extension WhisperEngine {
     }
 
     func shouldUseModelVAD(options: TranscriptionOptions, isStreaming: Bool) -> Bool {
-        switch options.voiceActivityDetection.mode {
-        case .enabled:
-            return true
-        case .disabled:
-            return false
-        case .automatic:
-            return isStreaming
-        }
+        WhisperInnerVADPolicy.shouldUseModelVAD(options: options, isStreaming: isStreaming)
     }
 
     func applyVADTuning(_ tuning: WhisperVADTuning, to params: inout whisper_full_params) {

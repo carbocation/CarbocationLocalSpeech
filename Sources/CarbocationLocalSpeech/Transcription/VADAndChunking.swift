@@ -314,3 +314,247 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
         lastEmissionEndTime = nil
     }
 }
+
+@_spi(Internal) public struct SpeechContextualRollingWindow: Sendable {
+    public struct AppendResult: Sendable {
+        public var chunks: [SpeechAudioChunk]
+        public var audioGap: TimeInterval?
+        public var speechStartTime: TimeInterval?
+        public var leadingSilenceTrimmed: TimeInterval?
+        public var turnFinalTime: TimeInterval?
+
+        public init(
+            chunks: [SpeechAudioChunk],
+            audioGap: TimeInterval? = nil,
+            speechStartTime: TimeInterval? = nil,
+            leadingSilenceTrimmed: TimeInterval? = nil,
+            turnFinalTime: TimeInterval? = nil
+        ) {
+            self.chunks = chunks
+            self.audioGap = audioGap
+            self.speechStartTime = speechStartTime
+            self.leadingSilenceTrimmed = leadingSilenceTrimmed
+            self.turnFinalTime = turnFinalTime
+        }
+    }
+
+    public var maximumBufferDuration: TimeInterval
+    public var updateInterval: TimeInterval
+    public var finalSilenceDelay: TimeInterval
+    public var preSpeechPaddingDuration: TimeInterval
+
+    private var samples: [Float] = []
+    private var sampleRate: Double?
+    private var startTime: TimeInterval?
+    private var lastEmissionEndTime: TimeInterval?
+    private var silenceDuration: TimeInterval = 0
+    private var usesVoiceActivity = false
+    private var hasObservedSpeech = false
+    private var hasActiveSpeechTurn = false
+    private var hasEmittedTurnFinal = false
+
+    public init(
+        maximumBufferDuration: TimeInterval,
+        updateInterval: TimeInterval,
+        finalSilenceDelay: TimeInterval,
+        preSpeechPaddingDuration: TimeInterval = 0.5
+    ) {
+        self.maximumBufferDuration = max(0.1, maximumBufferDuration)
+        self.updateInterval = max(0.05, updateInterval)
+        self.finalSilenceDelay = max(0.05, finalSilenceDelay)
+        self.preSpeechPaddingDuration = max(0, preSpeechPaddingDuration)
+    }
+
+    public mutating func append(
+        _ chunk: AudioChunk,
+        activity: VoiceActivityEvent?
+    ) -> AppendResult {
+        var emitted: [SpeechAudioChunk] = []
+        let gap = prepareForAppend(chunk)
+        if gap != nil {
+            if let final = emitChunk(isFinal: true, resetAfterEmit: true) {
+                emitted.append(final)
+            } else {
+                reset()
+            }
+        }
+
+        let startsSpeechTurn = activity?.state == .speech && !hasActiveSpeechTurn
+        let isFirstObservedSpeech = startsSpeechTurn && !hasObservedSpeech
+        appendSamples(from: chunk)
+        apply(activity: activity, duration: chunk.duration)
+        let leadingSilenceTrimmed = isFirstObservedSpeech
+            ? trimBeforeSpeechStart(activity?.startTime ?? chunk.startTime)
+            : nil
+        trimIfNeeded()
+
+        var turnFinalTime: TimeInterval?
+        if shouldFinalizeForSilence, let final = emitChunk(isFinal: true, resetAfterEmit: false) {
+            hasActiveSpeechTurn = false
+            hasEmittedTurnFinal = true
+            turnFinalTime = final.startTime + final.audio.duration
+            emitted.append(final)
+            return AppendResult(
+                chunks: emitted,
+                audioGap: gap,
+                speechStartTime: startsSpeechTurn ? activity?.startTime : nil,
+                leadingSilenceTrimmed: leadingSilenceTrimmed,
+                turnFinalTime: turnFinalTime
+            )
+        }
+
+        if shouldEmitUpdate, let update = emitChunk(isFinal: false) {
+            emitted.append(update)
+        }
+
+        return AppendResult(
+            chunks: emitted,
+            audioGap: gap,
+            speechStartTime: startsSpeechTurn ? activity?.startTime : nil,
+            leadingSilenceTrimmed: leadingSilenceTrimmed,
+            turnFinalTime: turnFinalTime
+        )
+    }
+
+    public mutating func finish() -> [SpeechAudioChunk] {
+        if usesVoiceActivity && (!hasObservedSpeech || (!hasActiveSpeechTurn && hasEmittedTurnFinal)) {
+            reset()
+            return []
+        }
+        guard let final = emitChunk(isFinal: true, resetAfterEmit: true) else { return [] }
+        return [final]
+    }
+
+    private var duration: TimeInterval {
+        guard let sampleRate, sampleRate > 0 else { return 0 }
+        return Double(samples.count) / sampleRate
+    }
+
+    private var bufferEndTime: TimeInterval? {
+        guard let startTime else { return nil }
+        return startTime + duration
+    }
+
+    private var shouldEmitUpdate: Bool {
+        if usesVoiceActivity && !hasActiveSpeechTurn {
+            return false
+        }
+        guard let startTime, let bufferEndTime else { return false }
+        let lastEmissionEndTime = lastEmissionEndTime ?? startTime
+        return bufferEndTime - lastEmissionEndTime >= updateInterval
+    }
+
+    private var shouldFinalizeForSilence: Bool {
+        hasActiveSpeechTurn && !hasEmittedTurnFinal && silenceDuration >= finalSilenceDelay
+    }
+
+    private mutating func appendSamples(from chunk: AudioChunk) {
+        if sampleRate == nil || samples.isEmpty {
+            sampleRate = chunk.sampleRate
+            startTime = chunk.startTime
+        }
+        samples.append(contentsOf: monoSamples(from: chunk))
+    }
+
+    private mutating func apply(activity: VoiceActivityEvent?, duration: TimeInterval) {
+        guard let activity else { return }
+        usesVoiceActivity = true
+        if activity.state == .speech {
+            hasObservedSpeech = true
+            hasActiveSpeechTurn = true
+            hasEmittedTurnFinal = false
+            silenceDuration = 0
+        } else {
+            silenceDuration += duration
+        }
+    }
+
+    private mutating func trimBeforeSpeechStart(_ speechStart: TimeInterval) -> TimeInterval? {
+        guard let sampleRate, let startTime, sampleRate > 0 else { return nil }
+        let keepStart = max(startTime, speechStart - preSpeechPaddingDuration)
+        guard keepStart > startTime else { return nil }
+
+        let droppedSamples = max(0, min(
+            samples.count,
+            Int(((keepStart - startTime) * sampleRate).rounded(.down))
+        ))
+        guard droppedSamples > 0 else { return nil }
+
+        samples.removeFirst(droppedSamples)
+        self.startTime = startTime + Double(droppedSamples) / sampleRate
+        return Double(droppedSamples) / sampleRate
+    }
+
+    private mutating func trimIfNeeded() {
+        guard let sampleRate, let startTime else { return }
+        let maximumSamples = max(1, Int(maximumBufferDuration * sampleRate))
+        guard samples.count > maximumSamples else { return }
+
+        let droppedSamples = samples.count - maximumSamples
+        samples.removeFirst(droppedSamples)
+        self.startTime = startTime + Double(droppedSamples) / sampleRate
+    }
+
+    private mutating func emitChunk(isFinal: Bool, resetAfterEmit: Bool = true) -> SpeechAudioChunk? {
+        guard !samples.isEmpty else {
+            if isFinal && resetAfterEmit {
+                reset()
+            }
+            return nil
+        }
+
+        let resolvedSampleRate = sampleRate ?? 16_000
+        let resolvedStart = startTime ?? 0
+        let prepared = PreparedAudio(
+            samples: samples,
+            sampleRate: resolvedSampleRate,
+            duration: Double(samples.count) / resolvedSampleRate
+        )
+        lastEmissionEndTime = resolvedStart + prepared.duration
+
+        if isFinal && resetAfterEmit {
+            reset()
+        }
+
+        return SpeechAudioChunk(audio: prepared, startTime: resolvedStart, isFinal: isFinal)
+    }
+
+    private mutating func prepareForAppend(_ chunk: AudioChunk) -> TimeInterval? {
+        if sampleRate == nil || samples.isEmpty {
+            sampleRate = chunk.sampleRate
+            startTime = chunk.startTime
+            return nil
+        }
+
+        if let sampleRate, abs(sampleRate - chunk.sampleRate) > 0.0001 {
+            return 0
+        }
+
+        guard let startTime else {
+            self.startTime = chunk.startTime
+            return nil
+        }
+
+        let expectedStart = startTime + duration
+        let tolerance = audioContinuityTolerance(for: chunk)
+        if chunk.startTime > expectedStart + tolerance ||
+            chunk.startTime + chunk.duration < startTime - tolerance {
+            let gap = max(0, chunk.startTime - expectedStart)
+            return gap
+        }
+
+        return nil
+    }
+
+    private mutating func reset() {
+        samples.removeAll(keepingCapacity: true)
+        sampleRate = nil
+        startTime = nil
+        lastEmissionEndTime = nil
+        silenceDuration = 0
+        usesVoiceActivity = false
+        hasObservedSpeech = false
+        hasActiveSpeechTurn = false
+        hasEmittedTurnFinal = false
+    }
+}
