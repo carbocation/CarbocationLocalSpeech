@@ -635,7 +635,26 @@ public enum SpeechModelDownloader {
         displayName: String? = nil,
         expectedSHA256: String? = nil,
         to root: URL,
-        fileManager: FileManager = .default,
+        configuration: SpeechModelDownloadConfiguration = .default,
+        onProgress: @escaping @Sendable (SpeechDownloadProgress) -> Void = { _ in }
+    ) async throws -> SpeechModelDownloadResult {
+        try await download(
+            from: sourceURL,
+            displayName: displayName,
+            expectedSHA256: expectedSHA256,
+            to: root,
+            fileManager: .default,
+            configuration: configuration,
+            onProgress: onProgress
+        )
+    }
+
+    public static func download(
+        from sourceURL: URL,
+        displayName: String? = nil,
+        expectedSHA256: String? = nil,
+        to root: URL,
+        fileManager: FileManager,
         configuration: SpeechModelDownloadConfiguration = .default,
         onProgress: @escaping @Sendable (SpeechDownloadProgress) -> Void = { _ in }
     ) async throws -> SpeechModelDownloadResult {
