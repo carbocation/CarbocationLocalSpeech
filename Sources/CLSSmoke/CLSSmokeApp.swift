@@ -68,6 +68,7 @@ private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.selectedSpeechModelSelection") private var selectionStorageValue = SpeechSystemModelID.appleSpeech.rawValue
     @AppStorage("CLSSmoke.vadMode") private var vadModeStorageValue = CLSSmokeVADMode.automatic.rawValue
     @AppStorage("CLSSmoke.vadSensitivity") private var vadSensitivityStorageValue = CLSSmokeVADSensitivity.medium.rawValue
+    @AppStorage("CLSSmoke.werReferenceText") private var werReferenceText = ""
     @State private var systemOptions: [SpeechSystemModelOption] = []
     @State private var eventDescriptions: [String] = []
     @State private var transcriptSnapshot = LiveTranscriptDebugSnapshot()
@@ -94,6 +95,8 @@ private struct CLSSmokeRootView: View {
     @State private var isFileTranscribing = false
     @State private var fileTranscriptionTask: Task<Void, Never>?
     @State private var activeFileTranscriptionID: UUID?
+    @State private var werHypotheses: [CLSSmokeWERApproach: String] = [:]
+    @State private var werReports: [CLSSmokeWERApproach: CLSSmokeWERReport] = [:]
 
     private let maximumDisplayedEvents = 500
     private let diagnosticLogThrottleInterval: TimeInterval = 1.0
@@ -148,6 +151,8 @@ private struct CLSSmokeRootView: View {
                 Divider()
                 fileTranscriptionPanel
                 Divider()
+                werPanel
+                Divider()
                 LiveTranscriptDebugView(eventDescriptions: eventDescriptions, snapshot: transcriptSnapshot)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -159,6 +164,9 @@ private struct CLSSmokeRootView: View {
         .onDisappear {
             cancelFileTranscription(updateStatus: false)
             stopListening()
+        }
+        .onChange(of: werReferenceText) {
+            refreshWERReports()
         }
     }
 
@@ -215,6 +223,17 @@ private struct CLSSmokeRootView: View {
 
     private var isForcedVADUnavailable: Bool {
         selectedVADMode == .enabled && !selectedVADAvailability.isAvailable
+    }
+
+    private var werReferenceWordCount: Int {
+        CLSSmokeWERCalculator.referenceWordCount(in: werReferenceText)
+    }
+
+    private var currentTranscriptWERReport: CLSSmokeWERReport? {
+        CLSSmokeWERCalculator.report(
+            referenceText: werReferenceText,
+            hypothesisText: transcriptSnapshot.transcriptText
+        )
     }
 
     private var sessionStatus: some View {
@@ -344,6 +363,76 @@ private struct CLSSmokeRootView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var werPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("WER Reference", systemImage: "chart.bar.doc.horizontal")
+                    .font(.headline)
+
+                Spacer()
+
+                if !werReports.isEmpty {
+                    Button {
+                        werHypotheses.removeAll(keepingCapacity: true)
+                        werReports.removeAll(keepingCapacity: true)
+                    } label: {
+                        Label("Clear", systemImage: "trash")
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            TextEditor(text: $werReferenceText)
+                .font(.system(.caption, design: .monospaced))
+                .frame(height: 74)
+                .scrollContentBackground(.hidden)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            HStack(spacing: 12) {
+                Text(werReferenceWordCount > 0 ? "Reference: \(werReferenceWordCount) words" : "Reference: none")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(werReferenceWordCount > 0 ? Color.secondary : Color.orange)
+
+                if let currentTranscriptWERReport {
+                    Text("Current \(currentTranscriptWERReport.summaryText)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            if !werReports.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(CLSSmokeWERApproach.allCases) { approach in
+                        if let report = werReports[approach] {
+                            HStack {
+                                Text(approach.displayName)
+                                    .font(.caption.weight(.semibold))
+                                    .frame(width: 92, alignment: .leading)
+                                Text(report.summaryText)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                        }
+                    }
+                }
+            } else if werReferenceWordCount > 0 && currentTranscriptWERReport == nil {
+                Text("Waiting for visible or completed transcript text.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if werReferenceWordCount == 0 {
+                Text("Paste original text to compare the current transcript and completed runs.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
@@ -561,6 +650,12 @@ private struct CLSSmokeRootView: View {
                 try Task.checkCancellation()
                 guard activeSessionID == id else { return }
                 appendEvent(event)
+                if case .completed(let transcript) = event {
+                    recordWER(
+                        approach: liveWERApproach(for: vadMode),
+                        hypothesisText: transcript.text
+                    )
+                }
             }
 
             guard activeSessionID == id else { return }
@@ -756,6 +851,7 @@ private struct CLSSmokeRootView: View {
                 segmentCount: transcript.segments.count
             )))
             appendEvent(.completed(transcript))
+            recordWER(approach: .fileTranscription, hypothesisText: transcript.text)
 
             finishFileTranscription(
                 id: id,
@@ -856,6 +952,35 @@ private struct CLSSmokeRootView: View {
         if shouldApplyToTranscriptPanel(event) {
             transcriptSnapshot.apply(event)
         }
+    }
+
+    private func recordWER(approach: CLSSmokeWERApproach, hypothesisText: String) {
+        werHypotheses[approach] = hypothesisText
+        refreshWERReports()
+    }
+
+    private func liveWERApproach(for vadMode: CLSSmokeVADMode) -> CLSSmokeWERApproach {
+        switch vadMode {
+        case .enabled:
+            return .liveVADEnabled
+        case .disabled:
+            return .liveVADDisabled
+        case .automatic:
+            return .liveVADAutomatic
+        }
+    }
+
+    private func refreshWERReports() {
+        var reports: [CLSSmokeWERApproach: CLSSmokeWERReport] = [:]
+        for (approach, hypothesisText) in werHypotheses {
+            if let report = CLSSmokeWERCalculator.report(
+                referenceText: werReferenceText,
+                hypothesisText: hypothesisText
+            ) {
+                reports[approach] = report
+            }
+        }
+        werReports = reports
     }
 
     private func trimEventDescriptions() {

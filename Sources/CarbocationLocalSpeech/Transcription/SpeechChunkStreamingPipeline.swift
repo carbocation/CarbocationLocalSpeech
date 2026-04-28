@@ -285,7 +285,6 @@ import Foundation
                     resetVoiceActivityStateIfNeeded(detector, after: emitted)
                 }
                 if let silenceFlushTime = result.silenceFlushTime {
-                    await queue.enqueueFlushPending(time: silenceFlushTime)
                     continuation.yield(.diagnostic(TranscriptionDiagnostic(
                         source: "streaming.pipeline",
                         message: "contextual_silence_flush=\(silenceFlushTime.formattedStreamingDebug)s",
