@@ -43,7 +43,7 @@ import Foundation
                 var committedSegments: [TranscriptSegment] = []
                 var agreementState = LocalAgreementState(
                     policy: Self.resolvedCommitmentPolicy(options),
-                    allowsFallbackCommit: Self.localAgreementAllowsFallbackCommit(for: options)
+                    fallbackPolicy: Self.localAgreementFallbackPolicy(for: options)
                 )
 
                 do {
@@ -349,7 +349,7 @@ import Foundation
         var committedSegments: [TranscriptSegment] = []
         var agreementState = LocalAgreementState(
             policy: resolvedCommitmentPolicy(options),
-            allowsFallbackCommit: localAgreementAllowsFallbackCommit(for: options)
+            fallbackPolicy: localAgreementFallbackPolicy(for: options)
         )
 
         while let work = try await queue.next() {
@@ -361,6 +361,23 @@ import Foundation
                     backend: backend,
                     options: options,
                     transcribe: transcribe,
+                    committedSegments: &committedSegments,
+                    agreementState: &agreementState,
+                    continuation: continuation
+                )
+            case .transcribeAndFlush(let emitted, _):
+                try await process(
+                    emitted,
+                    backend: backend,
+                    options: options,
+                    transcribe: transcribe,
+                    committedSegments: &committedSegments,
+                    agreementState: &agreementState,
+                    continuation: continuation
+                )
+                flushPendingLocalAgreementIfNeeded(
+                    backend: backend,
+                    options: options,
                     committedSegments: &committedSegments,
                     agreementState: &agreementState,
                     continuation: continuation
@@ -871,12 +888,12 @@ import Foundation
         return "Previous stable transcript:\n\(suffix)"
     }
 
-    private static func localAgreementAllowsFallbackCommit(for options: StreamingTranscriptionOptions) -> Bool {
+    private static func localAgreementFallbackPolicy(for options: StreamingTranscriptionOptions) -> LocalAgreementFallbackPolicy {
         switch options.emulation.window {
         case .contextualRollingBuffer:
-            return false
+            return .shiftedWindowPrefix
         case .rollingBuffer, .vadUtterances:
-            return true
+            return .shiftedWindowOrPreviousHypothesis
         }
     }
 
@@ -1129,18 +1146,24 @@ import Foundation
         return false
     }
 
+    private enum LocalAgreementFallbackPolicy {
+        case none
+        case shiftedWindowPrefix
+        case shiftedWindowOrPreviousHypothesis
+    }
+
     private struct LocalAgreementState {
         private let requiredIterations: Int
-        private let allowsFallbackCommit: Bool
+        private let fallbackPolicy: LocalAgreementFallbackPolicy
         private var hypotheses: [String] = []
 
-        init(policy: TranscriptCommitmentPolicy, allowsFallbackCommit: Bool) {
+        init(policy: TranscriptCommitmentPolicy, fallbackPolicy: LocalAgreementFallbackPolicy) {
             if case .localAgreement(let iterations) = policy {
                 self.requiredIterations = max(2, iterations)
             } else {
                 self.requiredIterations = 2
             }
-            self.allowsFallbackCommit = allowsFallbackCommit
+            self.fallbackPolicy = fallbackPolicy
         }
 
         mutating func accept(hypothesis: String) -> (confirmedPrefix: String, unconfirmedText: String) {
@@ -1160,7 +1183,7 @@ import Foundation
             }
 
             let confirmedTokenCount = SpeechChunkStreamingPipeline.commonPrefixTokenCount(in: hypotheses)
-            if allowsFallbackCommit,
+            if fallbackPolicy != .none,
                confirmedTokenCount == 0,
                let previousHypothesis = hypotheses.dropLast().last {
                 let expired = SpeechChunkStreamingPipeline.expiredPrefixBeforeWindowShift(
@@ -1172,10 +1195,12 @@ import Foundation
                     return (expired.prefix, trimmedHypothesis)
                 }
 
-                let previous = previousHypothesis.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !previous.isEmpty {
-                    hypotheses = [trimmedHypothesis]
-                    return (previous, trimmedHypothesis)
+                if fallbackPolicy == .shiftedWindowOrPreviousHypothesis {
+                    let previous = previousHypothesis.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !previous.isEmpty {
+                        hypotheses = [trimmedHypothesis]
+                        return (previous, trimmedHypothesis)
+                    }
                 }
             }
 
@@ -1781,13 +1806,13 @@ private struct StaleReplayAnalysis {
 
 private enum QueuedTranscriptionWork: Sendable {
     case transcribe(SpeechAudioChunk)
+    case transcribeAndFlush(SpeechAudioChunk, time: TimeInterval)
     case flushPending(time: TimeInterval)
 }
 
 private actor CoalescingTranscriptionQueue {
-    private var pendingFinals: [SpeechAudioChunk] = []
+    private var durableWork: [QueuedTranscriptionWork] = []
     private var latestNonFinal: SpeechAudioChunk?
-    private var pendingFlushTime: TimeInterval?
     private var isFinished = false
     private var failure: Error?
     private var waiter: CheckedContinuation<Void, Never>?
@@ -1795,16 +1820,20 @@ private actor CoalescingTranscriptionQueue {
     func enqueue(_ chunk: SpeechAudioChunk) {
         if chunk.isFinal {
             latestNonFinal = nil
-            pendingFinals.append(chunk)
+            durableWork.append(.transcribe(chunk))
         } else {
-            pendingFlushTime = nil
             latestNonFinal = chunk
         }
         resumeWaiter()
     }
 
     func enqueueFlushPending(time: TimeInterval) {
-        pendingFlushTime = time
+        if let latestNonFinal {
+            self.latestNonFinal = nil
+            durableWork.append(.transcribeAndFlush(latestNonFinal, time: time))
+        } else {
+            durableWork.append(.flushPending(time: time))
+        }
         resumeWaiter()
     }
 
@@ -1816,9 +1845,8 @@ private actor CoalescingTranscriptionQueue {
     func fail(_ error: Error) {
         failure = error
         isFinished = true
-        pendingFinals.removeAll(keepingCapacity: true)
+        durableWork.removeAll(keepingCapacity: true)
         latestNonFinal = nil
-        pendingFlushTime = nil
         resumeWaiter()
     }
 
@@ -1827,16 +1855,12 @@ private actor CoalescingTranscriptionQueue {
             if let failure {
                 throw failure
             }
-            if !pendingFinals.isEmpty {
-                return .transcribe(pendingFinals.removeFirst())
+            if !durableWork.isEmpty {
+                return durableWork.removeFirst()
             }
             if let latestNonFinal {
                 self.latestNonFinal = nil
                 return .transcribe(latestNonFinal)
-            }
-            if let pendingFlushTime {
-                self.pendingFlushTime = nil
-                return .flushPending(time: pendingFlushTime)
             }
             if isFinished {
                 return nil

@@ -1312,6 +1312,83 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         })
     }
 
+    func testSpeechChunkStreamingPipelineCommitsExpiredPrefixForShiftedContextualWindows() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<3 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: 0.05, count: 8_000),
+                        sampleRate: 16_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.5,
+                        duration: 0.5
+                    ))
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1:
+                    text = "alpha beta gamma delta"
+                case 2:
+                    text = "gamma delta epsilon zeta"
+                default:
+                    text = "epsilon zeta eta theta"
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.stable.text == "alpha beta"
+                    && snapshot.volatile?.text == "gamma delta epsilon zeta"
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.stable.text == "alpha beta gamma delta"
+                    && snapshot.volatile?.text == "epsilon zeta eta theta"
+            }
+            return false
+        })
+        XCTAssertFalse(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.transcript.text.contains("gamma delta gamma delta")
+                    || snapshot.transcript.text.contains("epsilon zeta epsilon zeta")
+            }
+            return false
+        })
+    }
+
     func testSpeechChunkStreamingPipelineContextualWindowsRemoveCommittedPrefixAfterRevision() async throws {
         let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
             Task {
@@ -2311,6 +2388,87 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             }
             return false
         })
+    }
+
+    func testSpeechChunkStreamingPipelinePreservesSilenceFlushWhenDecodeConsumerFallsBehind() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<6 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: index == 2 || index == 3 ? 0 : 0.05, count: 100),
+                        sampleRate: 1_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.1,
+                        duration: 0.1
+                    ))
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                }
+
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .enabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 5.0, updateInterval: 0.1, finalSilenceDelay: 0.2)
+            )
+        )
+        let detector = SequenceVoiceActivityDetector(states: [
+            .speech,
+            .speech,
+            .silence,
+            .silence,
+            .speech,
+            .speech
+        ])
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { chunk, _ in
+                let callIndex = await callCounter.next()
+                if callIndex == 1 {
+                    try await Task.sleep(nanoseconds: 120_000_000)
+                    return Transcript(segments: [
+                        TranscriptSegment(text: "alpha beta", startTime: 0, endTime: chunk.audio.duration)
+                    ])
+                }
+
+                let text: String
+                if chunk.isFinal {
+                    text = ""
+                } else if chunk.audio.duration <= 0.45 {
+                    text = "alpha beta gamma"
+                } else {
+                    text = "delta epsilon"
+                }
+                return Transcript(segments: text.isEmpty ? [] : [
+                    TranscriptSegment(text: text, startTime: 0, endTime: chunk.audio.duration)
+                ])
+            },
+            voiceActivityDetector: detector
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        let completedText = events.compactMap { event -> String? in
+            if case .completed(let transcript) = event {
+                return transcript.text
+            }
+            return nil
+        }.last ?? ""
+
+        XCTAssertEqual(completedText, "alpha beta gamma delta epsilon")
     }
 
     func testSpeechChunkStreamingPipelineTrimsCommittedOverlap() async throws {
