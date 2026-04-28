@@ -2329,6 +2329,60 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         })
     }
 
+    func testSpeechChunkStreamingPipelineContextualWordAlignmentTrimsCommittedStableSuffixFromVolatile() async throws {
+        let audio = contextualTestAudio(chunkCount: 4)
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(timestampMode: .words, voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { _, _ in
+                let callIndex = await callCounter.next()
+                switch callIndex {
+                case 1, 2:
+                    return textOnlyResult("alpha beta")
+                default:
+                    return timedWordResult("alpha beta gamma delta", step: 0.20)
+                }
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        let volatileTranscripts = events.compactMap { event -> Transcript? in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.volatile
+            }
+            return nil
+        }
+        XCTAssertTrue(volatileTranscripts.contains { $0.text == "gamma delta" })
+        XCTAssertFalse(volatileTranscripts.contains { $0.text == "alpha beta gamma delta" })
+        XCTAssertEqual(
+            volatileTranscripts.first { $0.text == "gamma delta" }?.segments.first?.words.map(\.text),
+            ["gamma", "delta"]
+        )
+        XCTAssertTrue(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message == "volatile_trim=2"
+            }
+            return false
+        })
+    }
+
     func testSpeechChunkStreamingPipelineContextualWordAlignmentFiltersWhisperSpecialMarkersFromText() async throws {
         let audio = contextualTestAudio(chunkCount: 3)
         let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
@@ -3767,6 +3821,14 @@ private func contextualTestAudio(chunkCount: Int) -> AsyncThrowingStream<AudioCh
             continuation.finish()
         }
     }
+}
+
+private func textOnlyResult(_ text: String) -> SpeechChunkStreamingPipeline.StreamingChunkTranscriptionResult {
+    SpeechChunkStreamingPipeline.StreamingChunkTranscriptionResult(
+        transcript: Transcript(segments: [
+            TranscriptSegment(text: text, startTime: 0, endTime: 0)
+        ])
+    )
 }
 
 private func timedWordResult(

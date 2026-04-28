@@ -1097,10 +1097,22 @@ import Foundation
         committedSegments: [TranscriptSegment],
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) {
+        let cleaned = removeCommittedStablePrefix(from: words, committedSegments: committedSegments)
+        if cleaned.removedWordCount > 0 {
+            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                source: "streaming.pipeline",
+                message: "volatile_trim=\(cleaned.removedWordCount)",
+                time: words.first?.startTime
+            )))
+        }
+
         guard let segment = contextualSegment(
-            from: words,
+            from: cleaned.words,
             includeWords: options.transcription.timestampMode == .words
         ) else {
+            continuation.yield(.snapshot(StreamingTranscriptSnapshot(
+                stable: Transcript(segments: committedSegments, backend: backend)
+            )))
             return
         }
 
@@ -1137,6 +1149,54 @@ import Foundation
                 )
             } : []
         )
+    }
+
+    private static func removeCommittedStablePrefix(
+        from words: [ContextualAlignedWord],
+        committedSegments: [TranscriptSegment]
+    ) -> (words: [ContextualAlignedWord], removedWordCount: Int) {
+        let removedWordCount = committedStablePrefixOverlapWordCount(
+            in: words,
+            committedSegments: committedSegments
+        )
+        guard removedWordCount > 0 else {
+            return (words, 0)
+        }
+        return (Array(words.dropFirst(removedWordCount)), removedWordCount)
+    }
+
+    private static func committedStablePrefixOverlapWordCount(
+        in words: [ContextualAlignedWord],
+        committedSegments: [TranscriptSegment]
+    ) -> Int {
+        guard !words.isEmpty, !committedSegments.isEmpty else { return 0 }
+
+        let maximumStableSuffixUnitCount = 160
+        let minimumOverlapUnitCount = 2
+        let committedUnits = alignmentUnits(
+            in: committedSegments.suffix(8).map(\.text).joined(separator: " ")
+        )
+        let stableSuffixUnits = committedUnits.count > maximumStableSuffixUnitCount
+            ? Array(committedUnits.suffix(maximumStableSuffixUnitCount))
+            : committedUnits
+        let volatileUnits = contextualWordUnits(from: words)
+        let maximumOverlapUnitCount = min(stableSuffixUnits.count, volatileUnits.count)
+        guard maximumOverlapUnitCount >= minimumOverlapUnitCount else { return 0 }
+
+        for unitCount in stride(from: maximumOverlapUnitCount, through: minimumOverlapUnitCount, by: -1) {
+            let committedSuffix = stableSuffixUnits.suffix(unitCount)
+            let volatilePrefix = volatileUnits.prefix(unitCount)
+            guard let lastVolatileUnit = volatilePrefix.last,
+                  lastVolatileUnit.isWordEnd,
+                  zip(committedSuffix, volatilePrefix).allSatisfy({
+                      tokensAreEquivalent($0.0, $0.1.value)
+                  }) else {
+                continue
+            }
+            return lastVolatileUnit.wordIndex + 1
+        }
+
+        return 0
     }
 
     private static func flushPendingContextualAgreementIfNeeded(
@@ -1592,6 +1652,20 @@ import Foundation
         }
     }
 
+    private static func contextualWordUnits(from words: [ContextualAlignedWord]) -> [ContextualWordUnit] {
+        var units: [ContextualWordUnit] = []
+        for (wordIndex, word) in words.enumerated() {
+            for (unitIndex, unit) in word.normalizedUnits.enumerated() {
+                units.append(ContextualWordUnit(
+                    value: unit,
+                    wordIndex: wordIndex,
+                    isWordEnd: unitIndex == word.normalizedUnits.count - 1
+                ))
+            }
+        }
+        return units
+    }
+
     private static func joinedWordText(_ words: [String]) -> String {
         var result = ""
         for rawWord in words {
@@ -1974,17 +2048,7 @@ import Foundation
         }
 
         private static func flattenedUnits(from words: [ContextualAlignedWord]) -> [ContextualWordUnit] {
-            var units: [ContextualWordUnit] = []
-            for (wordIndex, word) in words.enumerated() {
-                for (unitIndex, unit) in word.normalizedUnits.enumerated() {
-                    units.append(ContextualWordUnit(
-                        value: unit,
-                        wordIndex: wordIndex,
-                        isWordEnd: unitIndex == word.normalizedUnits.count - 1
-                    ))
-                }
-            }
-            return units
+            SpeechChunkStreamingPipeline.contextualWordUnits(from: words)
         }
     }
 
