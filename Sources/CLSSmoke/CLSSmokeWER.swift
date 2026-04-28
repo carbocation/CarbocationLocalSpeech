@@ -6,17 +6,23 @@ struct CLSSmokeWERReport: Hashable {
     var insertions: Int
     var referenceWordCount: Int
     var hypothesisWordCount: Int
+    var skippedReason: String? = nil
 
     var editCount: Int {
-        substitutions + deletions + insertions
+        guard skippedReason == nil else { return 0 }
+        return substitutions + deletions + insertions
     }
 
     var wordErrorRate: Double? {
+        guard skippedReason == nil else { return nil }
         guard referenceWordCount > 0 else { return nil }
         return Double(editCount) / Double(referenceWordCount)
     }
 
     var summaryText: String {
+        if let skippedReason {
+            return "WER skipped: \(skippedReason)"
+        }
         let rate = wordErrorRate.map { String(format: "%.1f%%", $0 * 100) } ?? "n/a"
         return "S \(substitutions) D \(deletions) I \(insertions) WER \(rate)"
     }
@@ -45,141 +51,186 @@ enum CLSSmokeWERApproach: String, CaseIterable, Hashable, Identifiable {
 }
 
 enum CLSSmokeWERCalculator {
+    static let maximumComparedWords = 4_000
+    private static let maximumComparisonCells = 1_000_000
+
     static func referenceWordCount(in text: String) -> Int {
-        normalizedWords(in: text).count
+        normalizedWordCount(in: text, limit: maximumComparedWords + 1)
     }
 
     static func report(referenceText: String, hypothesisText: String) -> CLSSmokeWERReport? {
-        let referenceWords = normalizedWords(in: referenceText)
-        let hypothesisWords = normalizedWords(in: hypothesisText)
+        let wordLimit = maximumComparedWords + 1
+        let referenceWords = normalizedWords(in: referenceText, limit: wordLimit)
+        let hypothesisWords = normalizedWords(in: hypothesisText, limit: wordLimit)
         guard !referenceWords.isEmpty, !hypothesisWords.isEmpty else { return nil }
 
-        let table = editTable(reference: referenceWords, hypothesis: hypothesisWords)
-        var row = referenceWords.count
-        var column = hypothesisWords.count
-        var substitutions = 0
-        var deletions = 0
-        var insertions = 0
-
-        while row > 0 || column > 0 {
-            switch table[row][column].operation {
-            case .match:
-                row -= 1
-                column -= 1
-            case .substitution:
-                substitutions += 1
-                row -= 1
-                column -= 1
-            case .deletion:
-                deletions += 1
-                row -= 1
-            case .insertion:
-                insertions += 1
-                column -= 1
-            case .none:
-                return nil
-            }
+        if referenceWords.count > maximumComparedWords || hypothesisWords.count > maximumComparedWords {
+            return skippedReport(
+                reason: "limited to \(maximumComparedWords) words per side",
+                referenceWordCount: min(referenceWords.count, maximumComparedWords),
+                hypothesisWordCount: min(hypothesisWords.count, maximumComparedWords)
+            )
         }
 
+        guard referenceWords.count <= maximumComparisonCells / max(hypothesisWords.count, 1) else {
+            return skippedReport(
+                reason: "comparison exceeds \(maximumComparisonCells.formatted()) edit cells",
+                referenceWordCount: referenceWords.count,
+                hypothesisWordCount: hypothesisWords.count
+            )
+        }
+
+        let state = editState(reference: referenceWords, hypothesis: hypothesisWords)
         return CLSSmokeWERReport(
-            substitutions: substitutions,
-            deletions: deletions,
-            insertions: insertions,
+            substitutions: state.substitutions,
+            deletions: state.deletions,
+            insertions: state.insertions,
             referenceWordCount: referenceWords.count,
             hypothesisWordCount: hypothesisWords.count
         )
     }
 
-    private static func normalizedWords(in text: String) -> [String] {
-        var rawTokens: [String] = []
-        var current = ""
+    private static func normalizedWordCount(in text: String, limit: Int? = nil) -> Int {
+        scanNormalizedWords(in: text, limit: limit) { _ in }
+    }
 
-        for scalar in text.lowercased().unicodeScalars {
-            if CharacterSet.alphanumerics.contains(scalar) {
-                current.unicodeScalars.append(scalar)
-            } else if !current.isEmpty {
-                rawTokens.append(current)
-                current.removeAll(keepingCapacity: true)
-            }
-        }
-        if !current.isEmpty {
-            rawTokens.append(current)
-        }
-
+    private static func normalizedWords(in text: String, limit: Int? = nil) -> [String] {
         var tokens: [String] = []
-        var index = 0
-        while index < rawTokens.count {
-            if index + 1 < rawTokens.count,
-               rawTokens[index] == "u",
-               rawTokens[index + 1] == "s" {
-                tokens.append("us")
-                index += 2
-                continue
-            }
-
-            if rawTokens[index] == "anytime" {
-                tokens.append("any")
-                tokens.append("time")
-            } else {
-                tokens.append(rawTokens[index])
-            }
-            index += 1
+        if let limit {
+            tokens.reserveCapacity(limit)
         }
-
+        scanNormalizedWords(in: text, limit: limit) { token in
+            tokens.append(token)
+        }
         return tokens
     }
 
-    private static func editTable(reference: [String], hypothesis: [String]) -> [[EditCell]] {
-        var table = Array(
-            repeating: Array(repeating: EditCell(cost: 0, operation: .none), count: hypothesis.count + 1),
-            count: reference.count + 1
-        )
+    @discardableResult
+    private static func scanNormalizedWords(
+        in text: String,
+        limit: Int? = nil,
+        consume: (String) -> Void
+    ) -> Int {
+        var current = ""
+        var pendingUSpelling = false
+        var emittedCount = 0
 
-        if !reference.isEmpty {
-            for row in 1...reference.count {
-                table[row][0] = EditCell(cost: row, operation: .deletion)
+        func emit(_ token: String) -> Bool {
+            guard limit.map({ emittedCount < $0 }) ?? true else { return false }
+            consume(token)
+            emittedCount += 1
+            return limit.map { emittedCount < $0 } ?? true
+        }
+
+        func flushRawToken(_ rawToken: String) -> Bool {
+            if pendingUSpelling {
+                pendingUSpelling = false
+                if rawToken == "s" {
+                    return emit("us")
+                }
+                guard emit("u") else { return false }
+            }
+
+            if rawToken == "u" {
+                pendingUSpelling = true
+                return true
+            }
+
+            if rawToken == "anytime" {
+                guard emit("any") else { return false }
+                return emit("time")
+            }
+
+            return emit(rawToken)
+        }
+
+        func flushCurrentToken() -> Bool {
+            guard !current.isEmpty else { return true }
+            let shouldContinue = flushRawToken(current.lowercased())
+            current.removeAll(keepingCapacity: true)
+            return shouldContinue
+        }
+
+        for scalar in text.unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) {
+                current.unicodeScalars.append(scalar)
+            } else if !flushCurrentToken() {
+                return emittedCount
             }
         }
+
+        guard flushCurrentToken() else { return emittedCount }
+        if pendingUSpelling {
+            _ = emit("u")
+        }
+
+        return emittedCount
+    }
+
+    private static func skippedReport(
+        reason: String,
+        referenceWordCount: Int,
+        hypothesisWordCount: Int
+    ) -> CLSSmokeWERReport {
+        CLSSmokeWERReport(
+            substitutions: 0,
+            deletions: 0,
+            insertions: 0,
+            referenceWordCount: referenceWordCount,
+            hypothesisWordCount: hypothesisWordCount,
+            skippedReason: reason
+        )
+    }
+
+    private static func editState(reference: [String], hypothesis: [String]) -> EditState {
+        var previous = Array(repeating: EditState(), count: hypothesis.count + 1)
         if !hypothesis.isEmpty {
             for column in 1...hypothesis.count {
-                table[0][column] = EditCell(cost: column, operation: .insertion)
+                previous[column] = EditState(cost: column, insertions: column)
             }
         }
 
         if !reference.isEmpty && !hypothesis.isEmpty {
             for row in 1...reference.count {
+                var current = Array(repeating: EditState(), count: hypothesis.count + 1)
+                current[0] = EditState(cost: row, deletions: row)
+
                 for column in 1...hypothesis.count {
                     let isMatch = reference[row - 1] == hypothesis[column - 1]
-                    var best = EditCell(
-                        cost: table[row - 1][column - 1].cost + (isMatch ? 0 : 1),
-                        operation: isMatch ? .match : .substitution
-                    )
-                    let deletion = EditCell(cost: table[row - 1][column].cost + 1, operation: .deletion)
+                    var best = previous[column - 1]
+                    if !isMatch {
+                        best.cost += 1
+                        best.substitutions += 1
+                    }
+
+                    var deletion = previous[column]
+                    deletion.cost += 1
+                    deletion.deletions += 1
                     if deletion.cost < best.cost {
                         best = deletion
                     }
-                    let insertion = EditCell(cost: table[row][column - 1].cost + 1, operation: .insertion)
+
+                    var insertion = current[column - 1]
+                    insertion.cost += 1
+                    insertion.insertions += 1
                     if insertion.cost < best.cost {
                         best = insertion
                     }
-                    table[row][column] = best
+
+                    current[column] = best
                 }
+
+                previous = current
             }
         }
 
-        return table
+        return previous[hypothesis.count]
     }
 
-    private struct EditCell {
-        var cost: Int
-        var operation: EditOperation
-    }
-
-    private enum EditOperation {
-        case none
-        case match
-        case substitution
-        case deletion
-        case insertion
+    private struct EditState {
+        var cost = 0
+        var substitutions = 0
+        var deletions = 0
+        var insertions = 0
     }
 }

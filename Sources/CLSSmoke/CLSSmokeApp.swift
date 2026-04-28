@@ -233,6 +233,9 @@ private struct CLSSmokeRootView: View {
     @State private var activeFileTranscriptionID: UUID?
     @State private var werHypotheses: [CLSSmokeWERApproach: String] = [:]
     @State private var werReports: [CLSSmokeWERApproach: CLSSmokeWERReport] = [:]
+    @State private var werReferenceWordCount = 0
+    @State private var currentTranscriptWERReport: CLSSmokeWERReport?
+    @State private var lastCurrentTranscriptWERUpdateDate = Date.distantPast
     @State private var liveDiagnostics = CLSSmokeLiveDiagnosticsState()
 
     private let maximumRetainedEvents = 1_000
@@ -240,6 +243,7 @@ private struct CLSSmokeRootView: View {
     private let visibleEventLineLimit = 50
     private let eventDisplayUpdateInterval: TimeInterval = 0.25
     private let transcriptDisplayUpdateInterval: TimeInterval = 0.25
+    private let currentTranscriptWERUpdateInterval: TimeInterval = 1.0
     private let diagnosticLogThrottleInterval: TimeInterval = 1.0
     private let transcriptMetricThrottleInterval: TimeInterval = 1.0
     private static let supportedAudioFileExtensions: Set<String> = [
@@ -310,6 +314,7 @@ private struct CLSSmokeRootView: View {
         }
         .frame(minWidth: 980, minHeight: 650)
         .task {
+            refreshWERState()
             systemOptions = await LocalSpeechEngine.systemModelOptions(locale: .current)
         }
         .onDisappear {
@@ -317,7 +322,7 @@ private struct CLSSmokeRootView: View {
             stopListening()
         }
         .onChange(of: werReferenceText) {
-            refreshWERReports()
+            refreshWERState()
         }
     }
 
@@ -398,15 +403,12 @@ private struct CLSSmokeRootView: View {
         return false
     }
 
-    private var werReferenceWordCount: Int {
-        CLSSmokeWERCalculator.referenceWordCount(in: werReferenceText)
-    }
-
-    private var currentTranscriptWERReport: CLSSmokeWERReport? {
-        CLSSmokeWERCalculator.report(
-            referenceText: werReferenceText,
-            hypothesisText: visibleTranscriptSnapshot.transcriptText
-        )
+    private var werReferenceSummaryText: String {
+        guard werReferenceWordCount > 0 else { return "Reference: none" }
+        if werReferenceWordCount > CLSSmokeWERCalculator.maximumComparedWords {
+            return "Reference: \(CLSSmokeWERCalculator.maximumComparedWords)+ words"
+        }
+        return "Reference: \(werReferenceWordCount) words"
     }
 
     private var sessionStatus: some View {
@@ -599,7 +601,7 @@ private struct CLSSmokeRootView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
 
             HStack(spacing: 12) {
-                Text(werReferenceWordCount > 0 ? "Reference: \(werReferenceWordCount) words" : "Reference: none")
+                Text(werReferenceSummaryText)
                     .font(.caption.monospaced())
                     .foregroundStyle(werReferenceWordCount > 0 ? Color.secondary : Color.orange)
 
@@ -1228,6 +1230,11 @@ private struct CLSSmokeRootView: View {
     }
 
     private func refreshWERReports() {
+        guard werReferenceWordCount > 0 else {
+            werReports.removeAll(keepingCapacity: true)
+            return
+        }
+
         var reports: [CLSSmokeWERApproach: CLSSmokeWERReport] = [:]
         for (approach, hypothesisText) in werHypotheses {
             if let report = CLSSmokeWERCalculator.report(
@@ -1238,6 +1245,31 @@ private struct CLSSmokeRootView: View {
             }
         }
         werReports = reports
+    }
+
+    private func refreshWERState() {
+        werReferenceWordCount = CLSSmokeWERCalculator.referenceWordCount(in: werReferenceText)
+        refreshCurrentTranscriptWERReport(force: true)
+        refreshWERReports()
+    }
+
+    private func refreshCurrentTranscriptWERReport(force: Bool = false) {
+        guard werReferenceWordCount > 0 else {
+            currentTranscriptWERReport = nil
+            lastCurrentTranscriptWERUpdateDate = .distantPast
+            return
+        }
+
+        let now = Date()
+        guard force || now.timeIntervalSince(lastCurrentTranscriptWERUpdateDate) >= currentTranscriptWERUpdateInterval else {
+            return
+        }
+
+        currentTranscriptWERReport = CLSSmokeWERCalculator.report(
+            referenceText: werReferenceText,
+            hypothesisText: visibleTranscriptSnapshot.transcriptText
+        )
+        lastCurrentTranscriptWERUpdateDate = now
     }
 
     @discardableResult
@@ -1281,6 +1313,7 @@ private struct CLSSmokeRootView: View {
 
         visibleTranscriptSnapshot = liveDiagnostics.transcriptSnapshot
         liveDiagnostics.lastTranscriptDisplayUpdateDate = now
+        refreshCurrentTranscriptWERReport(force: force)
     }
 
     private func shouldForceTranscriptDisplayUpdate(
@@ -1497,6 +1530,8 @@ private struct CLSSmokeRootView: View {
         visibleEventDescriptions.removeAll(keepingCapacity: true)
         visibleEventDescriptionTotalCount = 0
         visibleTranscriptSnapshot = LiveTranscriptDebugSnapshot()
+        currentTranscriptWERReport = nil
+        lastCurrentTranscriptWERUpdateDate = .distantPast
         liveDiagnostics.reset()
         resetDiagnosticThrottleState()
     }
