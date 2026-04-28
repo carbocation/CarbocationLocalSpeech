@@ -59,6 +59,145 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
     }
 }
 
+@_spi(Internal) public struct VoiceActivitySmoothingConfiguration: Hashable, Sendable {
+    public var enterSpeechDuration: TimeInterval
+    public var exitSpeechDuration: TimeInterval
+
+    public init(
+        enterSpeechDuration: TimeInterval = 0.25,
+        exitSpeechDuration: TimeInterval = 0.8
+    ) {
+        self.enterSpeechDuration = max(0, enterSpeechDuration)
+        self.exitSpeechDuration = max(0, exitSpeechDuration)
+    }
+
+    public static let streamingDefault = VoiceActivitySmoothingConfiguration()
+}
+
+@_spi(Internal) public final class SmoothedVoiceActivityDetector: VoiceActivityAnalyzing, VoiceActivityDetectionStateResetting, @unchecked Sendable {
+    private let detector: VoiceActivityDetecting
+    private let configuration: VoiceActivitySmoothingConfiguration
+    private let lock = NSLock()
+
+    private var emittedState = VoiceActivityState.silence
+    private var pendingRawState: VoiceActivityState?
+    private var pendingStateStartTime: TimeInterval?
+    private var pendingStateDuration: TimeInterval = 0
+    private var lastInputEndTime: TimeInterval?
+
+    public init(
+        detector: VoiceActivityDetecting,
+        configuration: VoiceActivitySmoothingConfiguration = .streamingDefault
+    ) {
+        self.detector = detector
+        self.configuration = configuration
+    }
+
+    public func analyze(_ chunk: AudioChunk) throws -> VoiceActivityEvent {
+        try analyzeWithDiagnostics(chunk).activity
+    }
+
+    public func analyzeWithDiagnostics(_ chunk: AudioChunk) throws -> VoiceActivityAnalysis {
+        let rawActivity = try detector.analyze(chunk)
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        resetAfterDiscontinuityIfNeeded(for: chunk)
+        let smoothing = applySmoothing(to: rawActivity)
+        var diagnostics = [
+            TranscriptionDiagnostic(
+                source: "streaming.vad",
+                message: "raw_vad=\(rawActivity.state.rawValue) smoothed_vad=\(smoothing.activity.state.rawValue) confidence=\(format(rawActivity.confidence)) pending=\(format(smoothing.pendingDuration))s",
+                time: rawActivity.startTime
+            )
+        ]
+
+        if smoothing.didTransition {
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "streaming.vad",
+                message: "smoothed_vad_transition=\(smoothing.activity.state.rawValue) raw_vad=\(rawActivity.state.rawValue) pending=\(format(smoothing.pendingDuration))s",
+                time: smoothing.activity.startTime
+            ))
+        }
+
+        lastInputEndTime = chunk.startTime + chunk.duration
+        return VoiceActivityAnalysis(
+            rawActivity: rawActivity,
+            activity: smoothing.activity,
+            diagnostics: diagnostics
+        )
+    }
+
+    public func resetVoiceActivityState() {
+        lock.lock()
+        resetSmoothingState()
+        lock.unlock()
+
+        (detector as? VoiceActivityDetectionStateResetting)?.resetVoiceActivityState()
+    }
+
+    private func applySmoothing(to rawActivity: VoiceActivityEvent) -> (activity: VoiceActivityEvent, didTransition: Bool, pendingDuration: TimeInterval) {
+        let rawDuration = max(0, rawActivity.endTime - rawActivity.startTime)
+        if pendingRawState != rawActivity.state {
+            pendingRawState = rawActivity.state
+            pendingStateStartTime = rawActivity.startTime
+            pendingStateDuration = 0
+        }
+        pendingStateDuration += rawDuration
+
+        var didTransition = false
+        var smoothedStartTime = rawActivity.startTime
+
+        switch (emittedState, rawActivity.state) {
+        case (.silence, .speech):
+            if pendingStateDuration >= configuration.enterSpeechDuration {
+                emittedState = .speech
+                didTransition = true
+                smoothedStartTime = pendingStateStartTime ?? rawActivity.startTime
+            }
+        case (.speech, .silence):
+            if pendingStateDuration >= configuration.exitSpeechDuration {
+                emittedState = .silence
+                didTransition = true
+                smoothedStartTime = pendingStateStartTime ?? rawActivity.startTime
+            }
+        default:
+            break
+        }
+
+        let activity = VoiceActivityEvent(
+            state: emittedState,
+            startTime: smoothedStartTime,
+            endTime: rawActivity.endTime,
+            confidence: rawActivity.confidence
+        )
+        return (activity, didTransition, pendingStateDuration)
+    }
+
+    private func resetAfterDiscontinuityIfNeeded(for chunk: AudioChunk) {
+        guard let lastInputEndTime else { return }
+        let tolerance = audioContinuityTolerance(for: chunk)
+        if chunk.startTime > lastInputEndTime + tolerance ||
+            chunk.startTime + chunk.duration < lastInputEndTime - tolerance {
+            resetSmoothingState()
+        }
+    }
+
+    private func resetSmoothingState() {
+        emittedState = .silence
+        pendingRawState = nil
+        pendingStateStartTime = nil
+        pendingStateDuration = 0
+        lastInputEndTime = nil
+    }
+
+    private func format(_ value: Double?) -> String {
+        guard let value else { return "n/a" }
+        return String(format: "%.3f", value)
+    }
+}
+
 @_spi(Internal) public struct SpeechChunker: Sendable {
     public var configuration: SpeechChunkingConfiguration
 
@@ -518,6 +657,7 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
     private mutating func apply(activity: VoiceActivityEvent?, duration: TimeInterval) {
         guard let activity else { return }
         usesVoiceActivity = true
+        let activityDuration = max(duration, activity.endTime - activity.startTime)
         if activity.state == .speech {
             hasObservedSpeech = true
             hasActiveSpeechTurn = true
@@ -525,7 +665,7 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
             hasEmittedSilenceFlush = false
             silenceDuration = 0
         } else {
-            silenceDuration += duration
+            silenceDuration += activityDuration
         }
     }
 

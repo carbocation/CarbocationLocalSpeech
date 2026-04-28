@@ -170,9 +170,7 @@ import Foundation
             )
         }
 
-        let activity = try detector.analyze(chunk)
-        continuation.yield(.voiceActivity(activity))
-        return activity
+        return try reportVoiceActivity(for: chunk, detector: detector, continuation: continuation)
     }
 
     private static func reportVoiceActivityIfNeeded(
@@ -181,7 +179,7 @@ import Foundation
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) throws {
         guard let detector else { return }
-        continuation.yield(.voiceActivity(try detector.analyze(chunk)))
+        _ = try reportVoiceActivity(for: chunk, detector: detector, continuation: continuation)
     }
 
     private static func optionalVoiceActivity(
@@ -190,6 +188,23 @@ import Foundation
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) throws -> VoiceActivityEvent? {
         guard let detector else { return nil }
+        return try reportVoiceActivity(for: chunk, detector: detector, continuation: continuation)
+    }
+
+    private static func reportVoiceActivity(
+        for chunk: AudioChunk,
+        detector: VoiceActivityDetecting,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) throws -> VoiceActivityEvent {
+        if let analyzer = detector as? VoiceActivityAnalyzing {
+            let analysis = try analyzer.analyzeWithDiagnostics(chunk)
+            for diagnostic in analysis.diagnostics {
+                continuation.yield(.diagnostic(diagnostic))
+            }
+            continuation.yield(.voiceActivity(analysis.activity))
+            return analysis.activity
+        }
+
         let activity = try detector.analyze(chunk)
         continuation.yield(.voiceActivity(activity))
         return activity
@@ -395,7 +410,12 @@ import Foundation
         try Task.checkCancellation()
 
         let startedAt = Date()
-        let transcript = try await transcribe(emitted, options.transcription)
+        let transcriptionOptions = stableContextTranscriptionOptions(
+            from: options.transcription,
+            streamingOptions: options,
+            committedSegments: committedSegments
+        )
+        let transcript = try await transcribe(emitted, transcriptionOptions)
         let processingDuration = Date().timeIntervalSince(startedAt)
         let segments = transcript.segments
             .map { offset($0, by: emitted.startTime) }
@@ -738,6 +758,55 @@ import Foundation
         case .providerFinals, .localAgreement, .silence, .immediate:
             return options.commitment
         }
+    }
+
+    private static func stableContextTranscriptionOptions(
+        from transcriptionOptions: TranscriptionOptions,
+        streamingOptions: StreamingTranscriptionOptions,
+        committedSegments: [TranscriptSegment]
+    ) -> TranscriptionOptions {
+        guard usesStablePromptContext(for: streamingOptions),
+              let stableContext = stablePromptContext(from: committedSegments) else {
+            return transcriptionOptions
+        }
+
+        var updated = transcriptionOptions
+        if let initialPrompt = transcriptionOptions.initialPrompt?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !initialPrompt.isEmpty {
+            updated.initialPrompt = "\(initialPrompt)\n\(stableContext)"
+        } else {
+            updated.initialPrompt = stableContext
+        }
+        return updated
+    }
+
+    private static func usesStablePromptContext(for options: StreamingTranscriptionOptions) -> Bool {
+        switch options.emulation.window {
+        case .rollingBuffer, .contextualRollingBuffer:
+            return true
+        case .vadUtterances:
+            return false
+        }
+    }
+
+    private static func stablePromptContext(from committedSegments: [TranscriptSegment]) -> String? {
+        let committedText = committedSegments
+            .map(\.text)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !committedText.isEmpty else { return nil }
+
+        let maximumTokenCount = 96
+        let textTokens = tokens(in: committedText)
+        guard textTokens.count > maximumTokenCount else {
+            return "Previous stable transcript:\n\(committedText)"
+        }
+
+        let suffixStart = textTokens[textTokens.count - maximumTokenCount].range.lowerBound
+        let suffix = String(committedText[suffixStart...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !suffix.isEmpty else { return nil }
+        return "Previous stable transcript:\n\(suffix)"
     }
 
     private static func localAgreementAllowsFallbackCommit(for options: StreamingTranscriptionOptions) -> Bool {

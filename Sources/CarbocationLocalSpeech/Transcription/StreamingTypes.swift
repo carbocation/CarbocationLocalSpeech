@@ -286,6 +286,26 @@ public protocol VoiceActivityDetecting: Sendable {
     func analyze(_ chunk: AudioChunk) throws -> VoiceActivityEvent
 }
 
+@_spi(Internal) public struct VoiceActivityAnalysis: Sendable {
+    public var rawActivity: VoiceActivityEvent
+    public var activity: VoiceActivityEvent
+    public var diagnostics: [TranscriptionDiagnostic]
+
+    public init(
+        rawActivity: VoiceActivityEvent,
+        activity: VoiceActivityEvent,
+        diagnostics: [TranscriptionDiagnostic] = []
+    ) {
+        self.rawActivity = rawActivity
+        self.activity = activity
+        self.diagnostics = diagnostics
+    }
+}
+
+@_spi(Internal) public protocol VoiceActivityAnalyzing: VoiceActivityDetecting {
+    func analyzeWithDiagnostics(_ chunk: AudioChunk) throws -> VoiceActivityAnalysis
+}
+
 @_spi(Internal) public protocol VoiceActivityDetectionStateResetting: Sendable {
     func resetVoiceActivityState()
 }

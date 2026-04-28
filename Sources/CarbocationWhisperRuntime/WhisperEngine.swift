@@ -555,11 +555,20 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
                     sensitivity: options.transcription.voiceActivityDetection.sensitivity,
                     threadCount: threadCount(isStreaming: true)
                 )
+                let smoothingConfiguration = VoiceActivitySmoothingConfiguration.streamingDefault
+                let smoothedDetector = SmoothedVoiceActivityDetector(
+                    detector: detector,
+                    configuration: smoothingConfiguration
+                )
                 diagnostics.append(TranscriptionDiagnostic(
                     source: "whisper.streaming",
                     message: "outer_vad=whisper"
                 ))
-                return (detector, diagnostics)
+                diagnostics.append(TranscriptionDiagnostic(
+                    source: "whisper.streaming",
+                    message: "outer_vad_smoothing=enabled enter=\(smoothingConfiguration.enterSpeechDuration.formattedWhisperDebug)s exit=\(smoothingConfiguration.exitSpeechDuration.formattedWhisperDebug)s"
+                ))
+                return (smoothedDetector, diagnostics)
             } catch {
                 diagnostics.append(TranscriptionDiagnostic(
                     source: "whisper.streaming",
@@ -578,12 +587,8 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
     }
 
     private nonisolated static func shouldKeepDecoderContext(for options: StreamingTranscriptionOptions) -> Bool {
-        switch options.emulation.window {
-        case .rollingBuffer, .contextualRollingBuffer:
-            return true
-        case .vadUtterances:
-            return false
-        }
+        _ = options
+        return false
     }
 
     private nonisolated static func streamingDiagnostics(

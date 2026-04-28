@@ -315,6 +315,62 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(try EnergyVoiceActivityDetector(sensitivity: .high).analyze(borderline).state, .speech)
     }
 
+    func testSmoothedVADRequiresSustainedTransitions() throws {
+        let detector = SmoothedVoiceActivityDetector(
+            detector: SequenceVoiceActivityDetector(states: [
+                .speech,
+                .silence,
+                .speech,
+                .speech,
+                .silence,
+                .silence,
+                .speech,
+                .silence,
+                .silence,
+                .silence,
+                .silence,
+                .silence,
+                .silence
+            ]),
+            configuration: VoiceActivitySmoothingConfiguration(
+                enterSpeechDuration: 0.25,
+                exitSpeechDuration: 0.75
+            )
+        )
+        let duration = 0.125
+
+        let analyses = try (0..<13).map { index in
+            try detector.analyzeWithDiagnostics(AudioChunk(
+                samples: Array(repeating: 0.05, count: 1_000),
+                sampleRate: 8_000,
+                channelCount: 1,
+                startTime: TimeInterval(index) * duration,
+                duration: duration
+            ))
+        }
+
+        XCTAssertEqual(analyses[0].rawActivity.state, .speech)
+        XCTAssertEqual(analyses[0].activity.state, .silence)
+        XCTAssertEqual(analyses[3].activity.state, .speech)
+        XCTAssertEqual(analyses[3].activity.startTime, 0.25, accuracy: 0.000_1)
+        XCTAssertEqual(analyses[4].activity.state, .speech)
+        XCTAssertEqual(analyses[5].activity.state, .speech)
+        XCTAssertEqual(analyses[6].activity.state, .speech)
+        XCTAssertEqual(analyses[11].activity.state, .speech)
+        XCTAssertEqual(analyses[12].activity.state, .silence)
+        XCTAssertEqual(analyses[12].activity.startTime, 0.875, accuracy: 0.000_1)
+
+        XCTAssertTrue(analyses[0].diagnostics.contains { diagnostic in
+            diagnostic.message.contains("raw_vad=speech smoothed_vad=silence")
+        })
+        XCTAssertTrue(analyses[3].diagnostics.contains { diagnostic in
+            diagnostic.message.contains("smoothed_vad_transition=speech")
+        })
+        XCTAssertTrue(analyses[12].diagnostics.contains { diagnostic in
+            diagnostic.message.contains("smoothed_vad_transition=silence")
+        })
+    }
+
     func testSpeechChunkerEmitsOnChunkBoundaryAndKeepsOverlap() throws {
         var chunker = SpeechChunker(configuration: SpeechChunkingConfiguration(
             maximumChunkDuration: 1.0,
@@ -1640,6 +1696,79 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         })
     }
 
+    func testSpeechChunkStreamingPipelineDoesNotFlushContextualWindowForBriefSmoothedSilence() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<7 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: index >= 2 && index <= 4 ? 0 : 0.05, count: 1_600),
+                        sampleRate: 16_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.1,
+                        duration: 0.1
+                    ))
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .enabled),
+            commitment: .immediate,
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 2.0, updateInterval: 0.1, finalSilenceDelay: 0.3)
+            )
+        )
+        let detector = SmoothedVoiceActivityDetector(
+            detector: SequenceVoiceActivityDetector(states: [
+                .speech,
+                .speech,
+                .silence,
+                .silence,
+                .silence,
+                .speech,
+                .speech
+            ]),
+            configuration: VoiceActivitySmoothingConfiguration(
+                enterSpeechDuration: 0.2,
+                exitSpeechDuration: 0.5
+            )
+        )
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { chunk, _ in
+                Transcript(segments: [
+                    TranscriptSegment(text: "context", startTime: 0, endTime: chunk.audio.duration)
+                ])
+            },
+            voiceActivityDetector: detector
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertFalse(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message.hasPrefix("contextual_silence_flush=")
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message.contains("raw_vad=silence smoothed_vad=speech")
+            }
+            return false
+        })
+    }
+
     func testSpeechChunkStreamingPipelineTrimsCommittedOverlap() async throws {
         let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
             continuation.yield(AudioChunk(
@@ -1709,6 +1838,120 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             }
             return false
         })
+    }
+
+    func testSpeechChunkStreamingPipelineDoesNotCarryVolatileTextIntoLaterPrompts() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 8_000),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 0.5
+            ))
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 8_000),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0.5,
+                duration: 0.5
+            ))
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(
+                useCase: .dictation,
+                initialPrompt: "User prompt",
+                voiceActivityDetection: .disabled
+            ),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 4.0, updateInterval: 0.5, overlap: 0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+        let promptRecorder = TranscriptionPromptRecorder()
+
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribe: { _, options in
+                await promptRecorder.record(options)
+                let callIndex = await callCounter.next()
+                let text = callIndex == 1 ? "wrong provisional" : "correct transcript"
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            })
+
+        for try await _ in stream {}
+
+        let prompts = await promptRecorder.prompts()
+        XCTAssertGreaterThanOrEqual(prompts.count, 2)
+        XCTAssertEqual(prompts[0], "User prompt")
+        XCTAssertEqual(prompts[1], "User prompt")
+        XCTAssertFalse(prompts[1]?.contains("wrong provisional") ?? false)
+    }
+
+    func testSpeechChunkStreamingPipelineCarriesOnlyStableTextIntoLaterPrompts() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 8_000),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 0.5
+            ))
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 8_000),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0.5,
+                duration: 0.5
+            ))
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(
+                useCase: .dictation,
+                initialPrompt: "User prompt",
+                contextualStrings: ["Friedrich Merz"],
+                voiceActivityDetection: .disabled
+            ),
+            commitment: .immediate,
+            strategy: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 4.0, updateInterval: 0.5, overlap: 0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+        let promptRecorder = TranscriptionPromptRecorder()
+
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribe: { _, options in
+                await promptRecorder.record(options)
+                let callIndex = await callCounter.next()
+                let text = callIndex == 1 ? "stable alpha" : "stable alpha beta"
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            })
+
+        for try await _ in stream {}
+
+        let prompts = await promptRecorder.prompts()
+        let contextualStrings = await promptRecorder.contextualStrings()
+        XCTAssertGreaterThanOrEqual(prompts.count, 2)
+        XCTAssertEqual(prompts[0], "User prompt")
+        XCTAssertEqual(prompts[1], "User prompt\nPrevious stable transcript:\nstable alpha")
+        XCTAssertEqual(contextualStrings[1], ["Friedrich Merz"])
     }
 
     func testSpeechChunkStreamingPipelineUsesLocalAgreementForRollingBuffer() async throws {
@@ -2172,6 +2415,24 @@ private actor SpeechChunkStreamingPipelineStartRecorder {
 
     func recordedValue() -> TimeInterval? {
         value
+    }
+}
+
+private actor TranscriptionPromptRecorder {
+    private var recordedPrompts: [String?] = []
+    private var recordedContextualStrings: [[String]] = []
+
+    func record(_ options: TranscriptionOptions) {
+        recordedPrompts.append(options.initialPrompt)
+        recordedContextualStrings.append(options.contextualStrings)
+    }
+
+    func prompts() -> [String?] {
+        recordedPrompts
+    }
+
+    func contextualStrings() -> [[String]] {
+        recordedContextualStrings
     }
 }
 
