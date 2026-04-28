@@ -213,14 +213,7 @@ struct WhisperStreamingOptionsResolver {
         var resolved = options
 
         if resolved.implementation == .automatic {
-            switch resolved.transcription.voiceActivityDetection.mode {
-            case .disabled:
-                resolved.emulation = options.strategy.defaultEmulatedStreamingOptions
-            case .automatic, .enabled:
-                resolved.emulation = EmulatedStreamingOptions(
-                    window: .vadUtterances(options.strategy.defaultChunkingConfiguration)
-                )
-            }
+            resolved.emulation = options.strategy.defaultContextualStreamingOptions
         }
 
         if resolved.commitment == .automatic {
@@ -474,6 +467,7 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
             loadedInfo: loadedInfo,
             options: resolvedOptions
         )
+        let startupDiagnostics = outerVAD.diagnostics + Self.streamingDiagnostics(for: resolvedOptions)
         return AsyncThrowingStream { continuation in
             let task = Task {
                 let pipelineStream = SpeechChunkStreamingPipeline.stream(
@@ -499,7 +493,7 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
                         )
                     },
                     voiceActivityDetector: outerVAD.detector,
-                    startupDiagnostics: outerVAD.diagnostics)
+                    startupDiagnostics: startupDiagnostics)
 
                 do {
                     for try await event in pipelineStream {
@@ -585,11 +579,53 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
 
     private nonisolated static func shouldKeepDecoderContext(for options: StreamingTranscriptionOptions) -> Bool {
         switch options.emulation.window {
-        case .rollingBuffer:
+        case .rollingBuffer, .contextualRollingBuffer:
             return true
         case .vadUtterances:
             return false
         }
+    }
+
+    private nonisolated static func streamingDiagnostics(
+        for options: StreamingTranscriptionOptions
+    ) -> [TranscriptionDiagnostic] {
+        var diagnostics: [TranscriptionDiagnostic] = []
+
+        switch options.emulation.window {
+        case .contextualRollingBuffer(let maxDuration, let updateInterval, let finalSilenceDelay):
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "window=contextual-rolling max=\(maxDuration.formattedWhisperDebug)s update=\(updateInterval.formattedWhisperDebug)s final_silence=\(finalSilenceDelay.formattedWhisperDebug)s"
+            ))
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "decode_queue=coalescing"
+            ))
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "commit_policy=strict-contextual"
+            ))
+        case .rollingBuffer(let maxDuration, let updateInterval, let overlap):
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "window=rolling max=\(maxDuration.formattedWhisperDebug)s update=\(updateInterval.formattedWhisperDebug)s overlap=\(overlap.formattedWhisperDebug)s"
+            ))
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "decode_queue=inline"
+            ))
+        case .vadUtterances(let configuration):
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "window=vad-utterances max=\(configuration.maximumChunkDuration.formattedWhisperDebug)s silence=\(configuration.silenceCommitDelay.formattedWhisperDebug)s overlap=\(configuration.overlapDuration.formattedWhisperDebug)s"
+            ))
+            diagnostics.append(TranscriptionDiagnostic(
+                source: "whisper.streaming",
+                message: "decode_queue=inline"
+            ))
+        }
+
+        return diagnostics
     }
 
     private func transcribeStreamingChunk(

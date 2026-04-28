@@ -125,33 +125,35 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         ))
     }
 
-    func testWhisperStreamingOptionsPreferVADUtterancesForDefaultAutomaticStream() {
+    func testWhisperStreamingOptionsPreferContextualRollingForDefaultAutomaticStream() {
         let resolved = WhisperStreamingOptionsResolver.resolve(StreamingTranscriptionOptions(
             strategy: .balanced
         ))
 
         XCTAssertEqual(resolved.commitment, .localAgreement(iterations: 2))
-        guard case .vadUtterances(let configuration) = resolved.emulation.window else {
-            XCTFail("Expected Whisper default streaming to use VAD utterances.")
+        guard case .contextualRollingBuffer(let maxDuration, let updateInterval, let finalSilenceDelay) = resolved.emulation.window else {
+            XCTFail("Expected Whisper default streaming to use contextual rolling windows.")
             return
         }
-        XCTAssertEqual(configuration, StreamingTranscriptionStrategy.balanced.defaultChunkingConfiguration)
+        XCTAssertEqual(maxDuration, 20.0)
+        XCTAssertEqual(updateInterval, 2.0)
+        XCTAssertEqual(finalSilenceDelay, 0.8)
     }
 
-    func testWhisperStreamingOptionsUseRollingBufferWhenVADIsDisabled() {
+    func testWhisperStreamingOptionsUseContextualRollingWhenVADIsDisabled() {
         let resolved = WhisperStreamingOptionsResolver.resolve(StreamingTranscriptionOptions(
             transcription: TranscriptionOptions(voiceActivityDetection: .disabled),
             strategy: .balanced
         ))
 
         XCTAssertEqual(resolved.commitment, .localAgreement(iterations: 2))
-        guard case .rollingBuffer(let maxDuration, let updateInterval, let overlap) = resolved.emulation.window else {
-            XCTFail("Expected Whisper streaming with disabled VAD to use rolling buffer windows.")
+        guard case .contextualRollingBuffer(let maxDuration, let updateInterval, let finalSilenceDelay) = resolved.emulation.window else {
+            XCTFail("Expected Whisper streaming with disabled VAD to use contextual rolling windows.")
             return
         }
-        XCTAssertEqual(maxDuration, 8.0)
-        XCTAssertEqual(updateInterval, 1.5)
-        XCTAssertEqual(overlap, 1.0)
+        XCTAssertEqual(maxDuration, 20.0)
+        XCTAssertEqual(updateInterval, 2.0)
+        XCTAssertEqual(finalSilenceDelay, 0.8)
     }
 
     func testWhisperStreamingOptionsKeepExplicitRollingBufferWithLocalAgreement() {
@@ -174,6 +176,28 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         XCTAssertEqual(maxDuration, 8.0)
         XCTAssertEqual(updateInterval, 1.5)
         XCTAssertEqual(overlap, 1.0)
+    }
+
+    func testWhisperStreamingOptionsKeepExplicitContextualRollingBufferWithLocalAgreement() {
+        let options = StreamingTranscriptionOptions(
+            strategy: .balanced,
+            implementation: .emulated,
+            commitment: .automatic,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 12.0, updateInterval: 2.0, finalSilenceDelay: 0.8)
+            )
+        )
+
+        let resolved = WhisperStreamingOptionsResolver.resolve(options)
+
+        XCTAssertEqual(resolved.commitment, .localAgreement(iterations: 2))
+        guard case .contextualRollingBuffer(let maxDuration, let updateInterval, let finalSilenceDelay) = resolved.emulation.window else {
+            XCTFail("Expected explicit contextual rolling-buffer configuration to be preserved.")
+            return
+        }
+        XCTAssertEqual(maxDuration, 12.0)
+        XCTAssertEqual(updateInterval, 2.0)
+        XCTAssertEqual(finalSilenceDelay, 0.8)
     }
 
     func testWhisperStreamingOptionsPreserveExplicitCommitmentPolicy() {

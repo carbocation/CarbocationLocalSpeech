@@ -87,6 +87,27 @@ public enum StreamingTranscriptionStrategy: String, Codable, CaseIterable, Hasha
             )
         }
     }
+
+    @_spi(Internal) public var defaultContextualStreamingOptions: EmulatedStreamingOptions {
+        switch self {
+        case .automatic, .balanced:
+            return EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 20.0, updateInterval: 2.0, finalSilenceDelay: 0.8)
+            )
+        case .lowestLatency:
+            return EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 6.0, updateInterval: 1.0, finalSilenceDelay: 0.5)
+            )
+        case .accurate:
+            return EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 20.0, updateInterval: 3.0, finalSilenceDelay: 1.0)
+            )
+        case .fileQuality:
+            return EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 30.0, updateInterval: 5.0, finalSilenceDelay: 1.2)
+            )
+        }
+    }
 }
 
 @_spi(Internal) public enum StreamingImplementationPreference: String, Codable, Hashable, Sendable {
@@ -119,6 +140,7 @@ public enum StreamingTranscriptionStrategy: String, Codable, CaseIterable, Hasha
 @_spi(Internal) public enum AudioWindowingPolicy: Hashable, Sendable {
     case vadUtterances(SpeechChunkingConfiguration)
     case rollingBuffer(maxDuration: TimeInterval, updateInterval: TimeInterval, overlap: TimeInterval)
+    case contextualRollingBuffer(maxDuration: TimeInterval, updateInterval: TimeInterval, finalSilenceDelay: TimeInterval)
 
     public var overlapDuration: TimeInterval {
         switch self {
@@ -126,6 +148,8 @@ public enum StreamingTranscriptionStrategy: String, Codable, CaseIterable, Hasha
             return configuration.overlapDuration
         case .rollingBuffer(_, _, let overlap):
             return max(0, overlap)
+        case .contextualRollingBuffer(let maxDuration, _, _):
+            return max(0, maxDuration)
         }
     }
 }

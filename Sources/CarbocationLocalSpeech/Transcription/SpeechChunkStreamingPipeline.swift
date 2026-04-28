@@ -41,7 +41,10 @@ import Foundation
                     ? nil
                     : injectedVoiceActivityDetector ?? EnergyVoiceActivityDetector(sensitivity: options.transcription.voiceActivityDetection.sensitivity)
                 var committedSegments: [TranscriptSegment] = []
-                var agreementState = LocalAgreementState(policy: Self.resolvedCommitmentPolicy(options))
+                var agreementState = LocalAgreementState(
+                    policy: Self.resolvedCommitmentPolicy(options),
+                    allowsFallbackCommit: Self.localAgreementAllowsFallbackCommit(for: options)
+                )
 
                 do {
                     switch options.emulation.window {
@@ -117,6 +120,19 @@ import Foundation
                             )
                             resetVoiceActivityStateIfNeeded(detector, after: emitted)
                         }
+                    case .contextualRollingBuffer(let maxDuration, let updateInterval, let finalSilenceDelay):
+                        try await streamContextualRollingBuffer(
+                            audio: audio,
+                            backend: backend,
+                            options: options,
+                            transcribe: transcribe,
+                            detector: detector,
+                            maximumBufferDuration: maxDuration,
+                            updateInterval: updateInterval,
+                            finalSilenceDelay: finalSilenceDelay,
+                            continuation: continuation
+                        )
+                        return
                     }
 
                     flushPendingLocalAgreementIfNeeded(
@@ -168,12 +184,184 @@ import Foundation
         continuation.yield(.voiceActivity(try detector.analyze(chunk)))
     }
 
+    private static func optionalVoiceActivity(
+        for chunk: AudioChunk,
+        detector: VoiceActivityDetecting?,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) throws -> VoiceActivityEvent? {
+        guard let detector else { return nil }
+        let activity = try detector.analyze(chunk)
+        continuation.yield(.voiceActivity(activity))
+        return activity
+    }
+
     private static func resetVoiceActivityStateIfNeeded(
         _ detector: VoiceActivityDetecting?,
         after emitted: SpeechAudioChunk
     ) {
         guard emitted.isFinal else { return }
         (detector as? VoiceActivityDetectionStateResetting)?.resetVoiceActivityState()
+    }
+
+    private static func streamContextualRollingBuffer(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
+        transcribe: @escaping TimedChunkTranscription,
+        detector: VoiceActivityDetecting?,
+        maximumBufferDuration: TimeInterval,
+        updateInterval: TimeInterval,
+        finalSilenceDelay: TimeInterval,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) async throws {
+        let queue = CoalescingTranscriptionQueue()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await produceContextualRollingChunks(
+                    audio: audio,
+                    queue: queue,
+                    detector: detector,
+                    maximumBufferDuration: maximumBufferDuration,
+                    updateInterval: updateInterval,
+                    finalSilenceDelay: finalSilenceDelay,
+                    continuation: continuation
+                )
+            }
+
+            group.addTask {
+                try await consumeQueuedTranscriptions(
+                    queue: queue,
+                    backend: backend,
+                    options: options,
+                    transcribe: transcribe,
+                    continuation: continuation
+                )
+            }
+
+            do {
+                while try await group.next() != nil {}
+            } catch {
+                group.cancelAll()
+                await queue.fail(error)
+                throw error
+            }
+        }
+    }
+
+    private static func produceContextualRollingChunks(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        queue: CoalescingTranscriptionQueue,
+        detector: VoiceActivityDetecting?,
+        maximumBufferDuration: TimeInterval,
+        updateInterval: TimeInterval,
+        finalSilenceDelay: TimeInterval,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) async throws {
+        var window = SpeechContextualRollingWindow(
+            maximumBufferDuration: maximumBufferDuration,
+            updateInterval: updateInterval,
+            finalSilenceDelay: finalSilenceDelay
+        )
+
+        do {
+            for try await chunk in audio {
+                try Task.checkCancellation()
+
+                continuation.yield(.audioLevel(AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)))
+                let activity = try optionalVoiceActivity(for: chunk, detector: detector, continuation: continuation)
+                let result = window.append(chunk, activity: activity)
+                if let audioGap = result.audioGap {
+                    continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                        source: "streaming.pipeline",
+                        message: "audio_gap=\(audioGap.formattedStreamingDebug)s",
+                        time: chunk.startTime
+                    )))
+                }
+                emitContextualWindowDiagnostics(result, continuation: continuation)
+                for emitted in result.chunks {
+                    await queue.enqueue(emitted)
+                    resetVoiceActivityStateIfNeeded(detector, after: emitted)
+                }
+            }
+
+            for emitted in window.finish() {
+                await queue.enqueue(emitted)
+                resetVoiceActivityStateIfNeeded(detector, after: emitted)
+            }
+            await queue.finish()
+        } catch {
+            await queue.fail(error)
+            throw error
+        }
+    }
+
+    private static func consumeQueuedTranscriptions(
+        queue: CoalescingTranscriptionQueue,
+        backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
+        transcribe: @escaping TimedChunkTranscription,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) async throws {
+        var committedSegments: [TranscriptSegment] = []
+        var agreementState = LocalAgreementState(
+            policy: resolvedCommitmentPolicy(options),
+            allowsFallbackCommit: localAgreementAllowsFallbackCommit(for: options)
+        )
+
+        while let emitted = try await queue.next() {
+            try Task.checkCancellation()
+            try await process(
+                emitted,
+                backend: backend,
+                options: options,
+                transcribe: transcribe,
+                committedSegments: &committedSegments,
+                agreementState: &agreementState,
+                continuation: continuation
+            )
+        }
+
+        flushPendingLocalAgreementIfNeeded(
+            backend: backend,
+            options: options,
+            committedSegments: &committedSegments,
+            agreementState: &agreementState,
+            continuation: continuation
+        )
+        continuation.yield(.completed(Transcript(
+            segments: committedSegments,
+            backend: backend
+        )))
+        continuation.finish()
+    }
+
+    private static func emitContextualWindowDiagnostics(
+        _ result: SpeechContextualRollingWindow.AppendResult,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) {
+        if let speechStartTime = result.speechStartTime {
+            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                source: "streaming.pipeline",
+                message: "speech_start=\(speechStartTime.formattedStreamingDebug)s",
+                time: speechStartTime
+            )))
+        }
+
+        if let leadingSilenceTrimmed = result.leadingSilenceTrimmed {
+            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                source: "streaming.pipeline",
+                message: "leading_silence_trimmed=\(leadingSilenceTrimmed.formattedStreamingDebug)s"
+            )))
+        }
+
+        if let turnFinalTime = result.turnFinalTime {
+            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                source: "streaming.pipeline",
+                message: "turn_final=\(turnFinalTime.formattedStreamingDebug)s",
+                time: turnFinalTime
+            )))
+        }
     }
 
     private static func process(
@@ -208,16 +396,11 @@ import Foundation
             return
         }
 
-        let overlapDuration = options.emulation.overlapDeduplication
-            ? options.emulation.window.overlapDuration
-            : 0
-        let candidateSegments = segments.compactMap { segment in
-            removeCommittedOverlap(
-                from: segment,
-                committedSegments: committedSegments,
-                overlapDuration: overlapDuration
-            )
-        }
+        let candidateSegments = candidateSegments(
+            from: segments,
+            options: options,
+            committedSegments: committedSegments
+        )
 
         guard !candidateSegments.isEmpty else {
             return
@@ -241,14 +424,17 @@ import Foundation
             }
         case .localAgreement:
             if emitted.isFinal {
-                commitFinalLocalAgreement(
+                let didCommitFinal = commitFinalLocalAgreement(
                     candidateSegments,
                     backend: backend,
                     committedSegments: &committedSegments,
                     agreementState: &agreementState,
+                    allowsUnconfirmedFinalCommit: localAgreementAllowsUnconfirmedFinalCommit(for: options),
                     continuation: continuation
                 )
-                agreementState.reset()
+                if didCommitFinal || localAgreementAllowsUnconfirmedFinalCommit(for: options) {
+                    agreementState.reset()
+                }
             } else {
                 processLocalAgreement(
                     candidateSegments,
@@ -273,18 +459,80 @@ import Foundation
         }
     }
 
+    private static func candidateSegments(
+        from segments: [TranscriptSegment],
+        options: StreamingTranscriptionOptions,
+        committedSegments: [TranscriptSegment]
+    ) -> [TranscriptSegment] {
+        switch options.emulation.window {
+        case .contextualRollingBuffer:
+            return contextualCandidateSegments(
+                from: segments,
+                committedSegments: committedSegments
+            )
+        case .rollingBuffer, .vadUtterances:
+            let overlapDuration = options.emulation.overlapDeduplication
+                ? options.emulation.window.overlapDuration
+                : 0
+            return segments.compactMap { segment in
+                removeCommittedOverlap(
+                    from: segment,
+                    committedSegments: committedSegments,
+                    overlapDuration: overlapDuration
+                )
+            }
+        }
+    }
+
+    private static func contextualCandidateSegments(
+        from segments: [TranscriptSegment],
+        committedSegments: [TranscriptSegment]
+    ) -> [TranscriptSegment] {
+        guard let firstSegment = segments.first,
+              let lastSegment = segments.last else {
+            return []
+        }
+
+        let hypothesis = segments.map(\.text).joined(separator: " ")
+        let trimResult = removeCommittedContextPrefix(
+            in: hypothesis,
+            after: committedSegments
+        )
+        let candidateText = trimResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidateText.isEmpty else { return [] }
+
+        let startTime = estimateStartTime(
+            afterRemovingPrefixTokenCount: trimResult.removedTokenCount,
+            from: hypothesis,
+            firstSegment: firstSegment,
+            lastSegment: lastSegment
+        )
+
+        return [TranscriptSegment(
+            text: candidateText,
+            startTime: startTime,
+            endTime: max(startTime, lastSegment.endTime)
+        )]
+    }
+
     private static func commitFinalLocalAgreement(
         _ segments: [TranscriptSegment],
         backend: SpeechBackendDescriptor,
         committedSegments: inout [TranscriptSegment],
         agreementState: inout LocalAgreementState,
+        allowsUnconfirmedFinalCommit: Bool,
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
-    ) {
+    ) -> Bool {
         let finalHypothesis = removeCommittedTextPrefix(
             in: segments.map(\.text).joined(separator: " "),
             after: committedSegments
         )
-        let mergedFinalText = agreementState.flush(currentHypothesis: finalHypothesis)
+        let mergedFinalText = allowsUnconfirmedFinalCommit
+            ? agreementState.flush(currentHypothesis: finalHypothesis)
+            : agreementState.flushConfirmed(
+                currentHypothesis: finalHypothesis,
+                clearWhenEmpty: false
+            )
         let finalText = removeCommittedTextPrefix(
             in: mergedFinalText,
             after: committedSegments
@@ -296,7 +544,7 @@ import Foundation
             continuation.yield(.snapshot(StreamingTranscriptSnapshot(
                 stable: Transcript(segments: committedSegments, backend: backend)
             )))
-            return
+            return false
         }
 
         commit(
@@ -309,6 +557,7 @@ import Foundation
             committedSegments: &committedSegments,
             continuation: continuation
         )
+        return true
     }
 
     private static func commit(
@@ -335,7 +584,6 @@ import Foundation
         guard case .localAgreement = resolvedCommitmentPolicy(options) else {
             return
         }
-
         let finalText = removeCommittedTextPrefix(
             in: agreementState.flushPending(),
             after: committedSegments
@@ -453,13 +701,31 @@ import Foundation
         switch options.commitment {
         case .automatic:
             switch options.emulation.window {
-            case .rollingBuffer:
+            case .rollingBuffer, .contextualRollingBuffer:
                 return .localAgreement(iterations: 2)
             case .vadUtterances:
                 return .providerFinals
             }
         case .providerFinals, .localAgreement, .silence, .immediate:
             return options.commitment
+        }
+    }
+
+    private static func localAgreementAllowsFallbackCommit(for options: StreamingTranscriptionOptions) -> Bool {
+        switch options.emulation.window {
+        case .contextualRollingBuffer:
+            return false
+        case .rollingBuffer, .vadUtterances:
+            return true
+        }
+    }
+
+    private static func localAgreementAllowsUnconfirmedFinalCommit(for options: StreamingTranscriptionOptions) -> Bool {
+        switch options.emulation.window {
+        case .contextualRollingBuffer:
+            return false
+        case .rollingBuffer, .vadUtterances:
+            return true
         }
     }
 
@@ -472,10 +738,28 @@ import Foundation
             return ("", text.trimmingCharacters(in: .whitespacesAndNewlines))
         }
 
-        let prefixEnd = tokens[tokenCount - 1].range.upperBound
+        let prefixEnd = endIndexIncludingTrailingPunctuation(
+            after: tokens[tokenCount - 1].range.upperBound,
+            in: text
+        )
         let prefix = String(text[..<prefixEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
         let remainder = trimLeadingOverlapSeparators(String(text[prefixEnd...]))
         return (prefix, remainder)
+    }
+
+    private static func endIndexIncludingTrailingPunctuation(
+        after index: String.Index,
+        in text: String
+    ) -> String.Index {
+        var endIndex = index
+        while endIndex < text.endIndex {
+            let character = text[endIndex]
+            guard character.unicodeScalars.allSatisfy({ CharacterSet.punctuationCharacters.contains($0) }) else {
+                break
+            }
+            endIndex = text.index(after: endIndex)
+        }
+        return endIndex
     }
 
     private static func commonPrefixTokenCount(in texts: [String]) -> Int {
@@ -496,14 +780,16 @@ import Foundation
 
     private struct LocalAgreementState {
         private let requiredIterations: Int
+        private let allowsFallbackCommit: Bool
         private var hypotheses: [String] = []
 
-        init(policy: TranscriptCommitmentPolicy) {
+        init(policy: TranscriptCommitmentPolicy, allowsFallbackCommit: Bool) {
             if case .localAgreement(let iterations) = policy {
                 self.requiredIterations = max(2, iterations)
             } else {
                 self.requiredIterations = 2
             }
+            self.allowsFallbackCommit = allowsFallbackCommit
         }
 
         mutating func accept(hypothesis: String) -> (confirmedPrefix: String, unconfirmedText: String) {
@@ -523,7 +809,8 @@ import Foundation
             }
 
             let confirmedTokenCount = SpeechChunkStreamingPipeline.commonPrefixTokenCount(in: hypotheses)
-            if confirmedTokenCount == 0,
+            if allowsFallbackCommit,
+               confirmedTokenCount == 0,
                let previousHypothesis = hypotheses.dropLast().last {
                 let expired = SpeechChunkStreamingPipeline.expiredPrefixBeforeWindowShift(
                     previous: previousHypothesis,
@@ -556,6 +843,39 @@ import Foundation
                 pendingHypothesis,
                 currentHypothesis
             )
+        }
+
+        mutating func flushConfirmed(
+            currentHypothesis: String,
+            clearWhenEmpty: Bool = true
+        ) -> String {
+            let trimmedHypotheses = (hypotheses + [currentHypothesis])
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+
+            guard trimmedHypotheses.count >= 2 else {
+                if clearWhenEmpty {
+                    hypotheses.removeAll(keepingCapacity: true)
+                }
+                return ""
+            }
+
+            let confirmedTokenCount = SpeechChunkStreamingPipeline.commonPrefixTokenCount(
+                in: trimmedHypotheses
+            )
+            let split = SpeechChunkStreamingPipeline.splitConfirmedPrefix(
+                in: trimmedHypotheses.last ?? "",
+                tokenCount: confirmedTokenCount
+            )
+            if split.prefix.isEmpty {
+                if clearWhenEmpty {
+                    hypotheses.removeAll(keepingCapacity: true)
+                }
+                return ""
+            }
+
+            hypotheses.removeAll(keepingCapacity: true)
+            return split.prefix
         }
 
         mutating func flushPending() -> String {
@@ -689,6 +1009,174 @@ import Foundation
 
         let startIndex = textTokens[count - 1].range.upperBound
         return trimLeadingOverlapSeparators(String(text[startIndex...]))
+    }
+
+    private static func removeCommittedContextPrefix(
+        in text: String,
+        after committedSegments: [TranscriptSegment]
+    ) -> (text: String, removedTokenCount: Int) {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return ("", 0) }
+
+        let committedText = committedSegments
+            .map(\.text)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidateTokens = tokens(in: text)
+        let committedTokens = tokens(in: committedText)
+        guard !candidateTokens.isEmpty, !committedTokens.isEmpty else {
+            return (text, 0)
+        }
+
+        let candidateNormalizedTokens = candidateTokens.map(\.normalized)
+        let committedNormalizedTokens = Array(committedTokens.suffix(160)).map(\.normalized)
+        let removableTokenCount = max(
+            removableContextPrefixTokenCount(
+                candidateTokens: candidateNormalizedTokens,
+                committedTokens: committedNormalizedTokens
+            ),
+            removableContextReplayTokenCount(
+                candidateTokens: candidateNormalizedTokens,
+                committedTokens: committedNormalizedTokens
+            )
+        )
+        guard removableTokenCount > 0 else {
+            return (text, 0)
+        }
+
+        let trimmedText = dropPrefixTokens(removableTokenCount, from: text)
+        return (trimmedText, removableTokenCount)
+    }
+
+    private static func removableContextPrefixTokenCount(
+        candidateTokens: [String],
+        committedTokens: [String]
+    ) -> Int {
+        guard let firstCandidateToken = candidateTokens.first,
+              !committedTokens.isEmpty else {
+            return 0
+        }
+
+        let maximumCandidateTokenCount = min(candidateTokens.count, 80)
+        var bestMatchCount = 0
+
+        for startIndex in committedTokens.indices {
+            guard tokensAreEquivalent(committedTokens[startIndex], firstCandidateToken) else {
+                continue
+            }
+
+            let matchCount = contiguousMatchTokenCount(
+                candidateTokens: candidateTokens,
+                candidateStartIndex: 0,
+                committedTokens: committedTokens,
+                committedStartIndex: startIndex,
+                maximumCandidateTokenCount: maximumCandidateTokenCount
+            )
+            bestMatchCount = max(bestMatchCount, matchCount)
+        }
+
+        if bestMatchCount >= 2 {
+            return bestMatchCount
+        }
+
+        let overlapCount = suffixPrefixOverlapTokenCount(
+            previousTokens: committedTokens,
+            currentTokens: candidateTokens
+        )
+        return overlapCount
+    }
+
+    private static func removableContextReplayTokenCount(
+        candidateTokens: [String],
+        committedTokens: [String]
+    ) -> Int {
+        guard candidateTokens.count >= 6, committedTokens.count >= 6 else {
+            return 0
+        }
+
+        let maximumCandidateStartIndex = min(8, candidateTokens.count - 1)
+        let maximumCandidateTokenCount = min(candidateTokens.count, 96)
+        var bestRemovalTokenCount = 0
+
+        for candidateStartIndex in 1...maximumCandidateStartIndex {
+            for committedStartIndex in committedTokens.indices {
+                guard tokensAreEquivalent(candidateTokens[candidateStartIndex], committedTokens[committedStartIndex]) else {
+                    continue
+                }
+
+                let matchCount = contiguousMatchTokenCount(
+                    candidateTokens: candidateTokens,
+                    candidateStartIndex: candidateStartIndex,
+                    committedTokens: committedTokens,
+                    committedStartIndex: committedStartIndex,
+                    maximumCandidateTokenCount: maximumCandidateTokenCount
+                )
+                let committedTrailingTokenCount = committedTokens.count - (committedStartIndex + matchCount)
+                guard matchCount >= 6,
+                      committedTrailingTokenCount <= 2 else {
+                    continue
+                }
+
+                bestRemovalTokenCount = max(
+                    bestRemovalTokenCount,
+                    candidateStartIndex + matchCount
+                )
+            }
+        }
+
+        return bestRemovalTokenCount
+    }
+
+    private static func contiguousMatchTokenCount(
+        candidateTokens: [String],
+        candidateStartIndex: Int,
+        committedTokens: [String],
+        committedStartIndex: Int,
+        maximumCandidateTokenCount: Int
+    ) -> Int {
+        var committedIndex = committedStartIndex
+        var candidateIndex = candidateStartIndex
+        var skippedCommittedTokenCount = 0
+        var matchedTokenCount = 0
+
+        while candidateIndex < maximumCandidateTokenCount,
+              candidateIndex < candidateTokens.count,
+              committedIndex < committedTokens.count {
+            if tokensAreEquivalent(committedTokens[committedIndex], candidateTokens[candidateIndex]) {
+                matchedTokenCount += 1
+                candidateIndex += 1
+                committedIndex += 1
+                continue
+            }
+
+            skippedCommittedTokenCount += 1
+            if skippedCommittedTokenCount > 12 {
+                break
+            }
+            committedIndex += 1
+        }
+
+        return matchedTokenCount
+    }
+
+    private static func estimateStartTime(
+        afterRemovingPrefixTokenCount removedTokenCount: Int,
+        from text: String,
+        firstSegment: TranscriptSegment,
+        lastSegment: TranscriptSegment
+    ) -> TimeInterval {
+        guard removedTokenCount > 0 else {
+            return firstSegment.startTime
+        }
+
+        let totalTokenCount = tokens(in: text).count
+        guard totalTokenCount > 0 else {
+            return firstSegment.startTime
+        }
+
+        let duration = max(0, lastSegment.endTime - firstSegment.startTime)
+        let ratio = min(1, Double(removedTokenCount) / Double(totalTokenCount))
+        return min(lastSegment.endTime, firstSegment.startTime + duration * ratio)
     }
 
     private static func removeCommittedOverlap(
@@ -891,4 +1379,69 @@ import Foundation
 private struct TranscriptTextToken {
     var normalized: String
     var range: Range<String.Index>
+}
+
+private actor CoalescingTranscriptionQueue {
+    private var pendingFinals: [SpeechAudioChunk] = []
+    private var latestNonFinal: SpeechAudioChunk?
+    private var isFinished = false
+    private var failure: Error?
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func enqueue(_ chunk: SpeechAudioChunk) {
+        if chunk.isFinal {
+            latestNonFinal = nil
+            pendingFinals.append(chunk)
+        } else {
+            latestNonFinal = chunk
+        }
+        resumeWaiter()
+    }
+
+    func finish() {
+        isFinished = true
+        resumeWaiter()
+    }
+
+    func fail(_ error: Error) {
+        failure = error
+        isFinished = true
+        pendingFinals.removeAll(keepingCapacity: true)
+        latestNonFinal = nil
+        resumeWaiter()
+    }
+
+    func next() async throws -> SpeechAudioChunk? {
+        while true {
+            if let failure {
+                throw failure
+            }
+            if !pendingFinals.isEmpty {
+                return pendingFinals.removeFirst()
+            }
+            if let latestNonFinal {
+                self.latestNonFinal = nil
+                return latestNonFinal
+            }
+            if isFinished {
+                return nil
+            }
+
+            await withCheckedContinuation { continuation in
+                waiter = continuation
+            }
+        }
+    }
+
+    private func resumeWaiter() {
+        let waiter = waiter
+        self.waiter = nil
+        waiter?.resume()
+    }
+}
+
+private extension Double {
+    var formattedStreamingDebug: String {
+        String(format: "%.3f", self)
+    }
 }
