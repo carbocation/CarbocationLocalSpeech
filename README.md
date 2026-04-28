@@ -382,6 +382,31 @@ Scripts/sync-whisper-headers.sh
 Scripts/sync-whisper-headers.sh --check
 ```
 
+### Bump whisper.cpp
+
+To move the vendored whisper.cpp submodule to the latest stable upstream tag
+and sync the checked-in headers:
+
+```sh
+Scripts/bump-whisper-upstream.sh
+```
+
+To pin a specific tag:
+
+```sh
+Scripts/bump-whisper-upstream.sh vX.Y.Z
+```
+
+For a full local release-path validation after the bump:
+
+```sh
+Scripts/bump-whisper-upstream.sh vX.Y.Z --validate
+```
+
+The validation mode builds `whisper.xcframework` and runs `swift test` with
+`CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH` set. Use `--dry-run` to see the
+tag that would be selected without changing the submodule.
+
 ### Use a Local Binary Artifact
 
 To test the package as a binary-target consumer before publishing:
@@ -474,6 +499,7 @@ Sources/
   whisper/                        module map and synced C headers for whisper.cpp
 Tests/
 Scripts/
+  bump-whisper-upstream.sh        Updates the whisper.cpp submodule tag and synced headers
 Vendor/
   whisper.cpp/                    git submodule
 ```
