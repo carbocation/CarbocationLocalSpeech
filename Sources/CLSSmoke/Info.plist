@@ -22,6 +22,8 @@
     <string>Copyright Carbocation</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>CLSSmoke uses the microphone for local speech diagnostics.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>CLSSmoke uses system audio capture for local speech diagnostics.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>CLSSmoke uses speech recognition to test Apple Speech transcription.</string>
 </dict>

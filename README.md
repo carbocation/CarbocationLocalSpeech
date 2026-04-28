@@ -29,6 +29,7 @@ Current public release: none yet. Use the first published release tag once the
 - Swift 5.9 or newer.
 - Xcode command line tools.
 - `NSMicrophoneUsageDescription` if your app captures microphone audio.
+- `NSAudioCaptureUsageDescription` if your app captures macOS system audio.
 - `NSSpeechRecognitionUsageDescription` if your app offers Apple Speech.
 - Outgoing network access if a sandboxed app downloads Whisper models.
 - An App Group entitlement if you want multiple apps to share the same installed speech models.
@@ -511,7 +512,7 @@ Keep shared speech infrastructure in this package:
 - speech model download, import, deletion, and metadata
 - provider-aware model selection
 - Apple Speech availability and asset readiness
-- microphone capture and file-audio preparation
+- microphone, system-audio capture, and file-audio preparation
 - sample-rate conversion
 - VAD, chunking, and emulated streaming windows
 - stable transcript, word timestamp, and speaker-attribution types

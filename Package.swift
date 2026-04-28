@@ -175,6 +175,8 @@ let package = Package(
             name: "CarbocationLocalSpeech",
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("CoreAudio"),
                 .linkedFramework("Accelerate")
             ]
         ),

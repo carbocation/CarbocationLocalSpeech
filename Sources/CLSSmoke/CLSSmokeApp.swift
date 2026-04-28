@@ -68,6 +68,7 @@ private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.selectedSpeechModelSelection") private var selectionStorageValue = SpeechSystemModelID.appleSpeech.rawValue
     @AppStorage("CLSSmoke.vadMode") private var vadModeStorageValue = CLSSmokeVADMode.automatic.rawValue
     @AppStorage("CLSSmoke.vadSensitivity") private var vadSensitivityStorageValue = CLSSmokeVADSensitivity.medium.rawValue
+    @AppStorage("CLSSmoke.liveInput") private var liveInputStorageValue = CLSSmokeLiveInput.microphone.rawValue
     @AppStorage("CLSSmoke.werReferenceText") private var werReferenceText = ""
     @State private var systemOptions: [SpeechSystemModelOption] = []
     @State private var eventDescriptions: [String] = []
@@ -78,7 +79,7 @@ private struct CLSSmokeRootView: View {
     @State private var statusTone = CLSSmokeStatusTone.secondary
     @State private var isStarting = false
     @State private var isListening = false
-    @State private var captureSession: AVAudioEngineCaptureSession?
+    @State private var captureSession: (any AudioCapturing)?
     @State private var transcriptionTask: Task<Void, Never>?
     @State private var activeSessionID: UUID?
     @State private var lastLoggedAudioLevelTime: TimeInterval?
@@ -181,7 +182,7 @@ private struct CLSSmokeRootView: View {
     }
 
     private var isConfirmDisabled: Bool {
-        isStarting || isFileTranscribing || isForcedVADUnavailable
+        isStarting || isFileTranscribing || isForcedVADUnavailable || isSelectedLiveInputUnavailable
     }
 
     private var selectedSelection: SpeechModelSelection? {
@@ -194,6 +195,10 @@ private struct CLSSmokeRootView: View {
 
     private var selectedVADSensitivity: CLSSmokeVADSensitivity {
         CLSSmokeVADSensitivity(rawValue: vadSensitivityStorageValue) ?? .medium
+    }
+
+    private var selectedLiveInput: CLSSmokeLiveInput {
+        CLSSmokeLiveInput(rawValue: liveInputStorageValue) ?? .microphone
     }
 
     private var vadModeBinding: Binding<CLSSmokeVADMode> {
@@ -210,6 +215,13 @@ private struct CLSSmokeRootView: View {
         )
     }
 
+    private var liveInputBinding: Binding<CLSSmokeLiveInput> {
+        Binding(
+            get: { selectedLiveInput },
+            set: { liveInputStorageValue = $0.rawValue }
+        )
+    }
+
     private var selectedVADAvailability: CLSSmokeVADAvailability {
         guard let selectedSelection else {
             return CLSSmokeVADAvailability(
@@ -223,6 +235,17 @@ private struct CLSSmokeRootView: View {
 
     private var isForcedVADUnavailable: Bool {
         selectedVADMode == .enabled && !selectedVADAvailability.isAvailable
+    }
+
+    private var isSelectedLiveInputUnavailable: Bool {
+        selectedLiveInput == .systemAudio && !systemAudioInputIsAvailable
+    }
+
+    private var systemAudioInputIsAvailable: Bool {
+        if #available(macOS 15.0, *) {
+            return true
+        }
+        return false
     }
 
     private var werReferenceWordCount: Int {
@@ -265,12 +288,45 @@ private struct CLSSmokeRootView: View {
                 .disabled(!isStarting && !isListening)
             }
 
+            liveInputSettings
+
             vadSettings
 
-            MicrophonePermissionStatusView(status: microphoneStatus)
+            if selectedLiveInput == .microphone {
+                MicrophonePermissionStatusView(status: microphoneStatus)
+            }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
+    }
+
+    private var liveInputSettings: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Text("Input")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 80, alignment: .leading)
+
+                Picker("Input", selection: liveInputBinding) {
+                    ForEach(CLSSmokeLiveInput.allCases) { input in
+                        Text(input.displayName)
+                            .tag(input)
+                            .disabled(input == .systemAudio && !systemAudioInputIsAvailable)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 260)
+                .disabled(isStarting || isListening || isFileTranscribing)
+            }
+
+            if isSelectedLiveInputUnavailable {
+                Text("System audio input requires macOS 15 or newer.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            }
+        }
     }
 
     private var vadSettings: some View {
@@ -529,6 +585,12 @@ private struct CLSSmokeRootView: View {
         let vadMode = selectedVADMode
         let vadSensitivity = selectedVADSensitivity
         let vadAvailability = vadAvailability(for: selection)
+        let liveInput = selectedLiveInput
+        guard liveInput != .systemAudio || systemAudioInputIsAvailable else {
+            statusTone = .error
+            statusMessage = "System audio input requires macOS 15 or newer."
+            return
+        }
         guard vadMode != .enabled || vadAvailability.isAvailable else {
             statusTone = .error
             statusMessage = "Model VAD is not available for the selected provider."
@@ -551,6 +613,7 @@ private struct CLSSmokeRootView: View {
             await runLiveTranscriptionSession(
                 id: sessionID,
                 selection: selection,
+                liveInput: liveInput,
                 vadMode: vadMode,
                 vadSensitivity: vadSensitivity,
                 vadAvailability: vadAvailability
@@ -585,14 +648,17 @@ private struct CLSSmokeRootView: View {
     private func runLiveTranscriptionSession(
         id: UUID,
         selection: SpeechModelSelection,
+        liveInput: CLSSmokeLiveInput,
         vadMode: CLSSmokeVADMode,
         vadSensitivity: CLSSmokeVADSensitivity,
         vadAvailability: CLSSmokeVADAvailability
     ) async {
         do {
-            guard await ensureMicrophoneAccess() else {
-                finishSession(id: id, message: "Microphone access is required to listen.", tone: .error)
-                return
+            if liveInput == .microphone {
+                guard await ensureMicrophoneAccess() else {
+                    finishSession(id: id, message: "Microphone access is required to listen.", tone: .error)
+                    return
+                }
             }
 
             guard activeSessionID == id else { return }
@@ -618,13 +684,17 @@ private struct CLSSmokeRootView: View {
                 source: "smoke.vad",
                 message: "mode=\(vadMode.diagnosticValue) sensitivity=\(vadSensitivity.diagnosticValue) provider=\(loaded.backend.displayName) availability=\(vadAvailability.diagnosticValue)"
             )))
+            appendEvent(.diagnostic(TranscriptionDiagnostic(
+                source: "smoke.input",
+                message: "input=\(liveInput.diagnosticValue)"
+            )))
 
-            let capture = AVAudioEngineCaptureSession()
+            let capture = try makeCaptureSession(for: liveInput)
             captureSession = capture
             isStarting = false
             isListening = true
             statusTone = .listening
-            statusMessage = "Listening with \(loaded.displayName)."
+            statusMessage = "Listening to \(liveInput.statusDisplayName) with \(loaded.displayName)."
 
             let audio = capture.start(configuration: AudioCaptureConfiguration(
                 preferredSampleRate: 16_000,
@@ -667,6 +737,20 @@ private struct CLSSmokeRootView: View {
             guard activeSessionID == id else { return }
             await LocalSpeechEngine.shared.unload()
             finishSession(id: id, message: error.localizedDescription, tone: .error)
+        }
+    }
+
+    private func makeCaptureSession(for input: CLSSmokeLiveInput) throws -> any AudioCapturing {
+        switch input {
+        case .microphone:
+            return AVAudioEngineCaptureSession()
+        case .systemAudio:
+            guard #available(macOS 15.0, *) else {
+                throw CLSSmokeLiveInputError.systemAudioRequiresMacOS15
+            }
+            return SystemAudioCaptureSession(options: SystemAudioCaptureOptions(
+                excludesCurrentProcessAudio: true
+            ))
         }
     }
 
@@ -1147,6 +1231,46 @@ private struct CLSSmokeVADAvailability: Hashable {
     var isAvailable: Bool
     var message: String
     var diagnosticValue: String
+}
+
+private enum CLSSmokeLiveInput: String, CaseIterable, Identifiable {
+    case microphone
+    case systemAudio
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .microphone:
+            return "Microphone"
+        case .systemAudio:
+            return "System Audio"
+        }
+    }
+
+    var statusDisplayName: String {
+        switch self {
+        case .microphone:
+            return "the microphone"
+        case .systemAudio:
+            return "system audio"
+        }
+    }
+
+    var diagnosticValue: String {
+        rawValue
+    }
+}
+
+private enum CLSSmokeLiveInputError: Error, LocalizedError {
+    case systemAudioRequiresMacOS15
+
+    var errorDescription: String? {
+        switch self {
+        case .systemAudioRequiresMacOS15:
+            return "System audio input requires macOS 15 or newer."
+        }
+    }
 }
 
 private enum CLSSmokeVADMode: String, CaseIterable, Identifiable {
