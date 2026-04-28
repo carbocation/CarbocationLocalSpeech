@@ -5,19 +5,35 @@ import SwiftUI
 public struct LiveTranscriptDebugView: View {
     public var events: [TranscriptEvent]
     private var eventDescriptions: [String]?
+    private var totalEventDescriptionCount: Int?
+    private var copyAllEventDescriptions: (() -> Void)?
+    private var copyTranscriptAction: (() -> Void)?
     private var transcriptEvents: [TranscriptEvent]
     private var snapshot: LiveTranscriptDebugSnapshot?
+    private let liveEventLineLimit = 50
 
     public init(events: [TranscriptEvent], transcriptEvents: [TranscriptEvent]? = nil) {
         self.events = events
         self.eventDescriptions = nil
+        self.totalEventDescriptionCount = nil
+        self.copyAllEventDescriptions = nil
+        self.copyTranscriptAction = nil
         self.transcriptEvents = transcriptEvents ?? events
         self.snapshot = nil
     }
 
-    public init(eventDescriptions: [String], snapshot: LiveTranscriptDebugSnapshot) {
+    public init(
+        eventDescriptions: [String],
+        snapshot: LiveTranscriptDebugSnapshot,
+        totalEventDescriptionCount: Int? = nil,
+        copyAllEventDescriptions: (() -> Void)? = nil,
+        copyTranscript: (() -> Void)? = nil
+    ) {
         self.events = []
         self.eventDescriptions = eventDescriptions
+        self.totalEventDescriptionCount = totalEventDescriptionCount
+        self.copyAllEventDescriptions = copyAllEventDescriptions
+        self.copyTranscriptAction = copyTranscript
         self.transcriptEvents = []
         self.snapshot = snapshot
     }
@@ -40,6 +56,19 @@ public struct LiveTranscriptDebugView: View {
 
                 Spacer(minLength: 12)
 
+                if snapshot.hasTranscriptText {
+                    Button {
+                        if let copyTranscriptAction {
+                            copyTranscriptAction()
+                        } else {
+                            copyTranscript(snapshot)
+                        }
+                    } label: {
+                        Label("Copy Transcript", systemImage: "doc.on.doc")
+                    }
+                    .controlSize(.small)
+                }
+
                 HStack(spacing: 14) {
                     metric("Segments", "\(snapshot.segmentCount)")
                     if let processedDuration = snapshot.processedDuration {
@@ -55,13 +84,12 @@ public struct LiveTranscriptDebugView: View {
                 transcriptText(snapshot)
                     .font(.system(size: 18, weight: .medium))
                     .lineSpacing(4)
-                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.trailing, 8)
             }
             .frame(minHeight: 88, maxHeight: 150)
 
-            if let latestText = snapshot.latestText {
+            if let latestText = snapshot.latestDisplayText {
                 Divider()
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Label(snapshot.hasVolatileText ? "Live" : "Latest", systemImage: snapshot.hasVolatileText ? "waveform" : "checkmark.circle")
@@ -72,7 +100,6 @@ public struct LiveTranscriptDebugView: View {
                     Text(latestText)
                         .font(.callout)
                         .lineLimit(2)
-                        .textSelection(.enabled)
 
                     Spacer(minLength: 8)
 
@@ -91,8 +118,8 @@ public struct LiveTranscriptDebugView: View {
     }
 
     @ViewBuilder private func transcriptText(_ snapshot: LiveTranscriptDebugSnapshot) -> some View {
-        let stableText = snapshot.stableText
-        let volatileText = snapshot.volatileText
+        let stableText = snapshot.stableDisplayText
+        let volatileText = snapshot.volatileDisplayText
 
         if stableText.isEmpty && volatileText.isEmpty {
             Text("Waiting for speech...")
@@ -144,7 +171,33 @@ public struct LiveTranscriptDebugView: View {
                 Text("Provider activity will appear here.")
             }
         } else {
-            SelectableEventLogView(lines: lines)
+            let liveLines = Array(lines.suffix(liveEventLineLimit))
+            let totalLineCount = totalEventDescriptionCount ?? lines.count
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Label("Events", systemImage: "list.bullet.rectangle")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text("\(liveLines.count)/\(totalLineCount)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 12)
+                    Button {
+                        if let copyAllEventDescriptions {
+                            copyAllEventDescriptions()
+                        } else {
+                            copyEventLogLines(lines)
+                        }
+                    } label: {
+                        Label("Copy All", systemImage: "doc.on.doc")
+                    }
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                Divider()
+                LiveEventLogTailView(lines: liveLines)
+            }
         }
     }
 
@@ -153,6 +206,20 @@ public struct LiveTranscriptDebugView: View {
             return eventDescriptions
         }
         return events.map(Self.describe)
+    }
+
+    private func copyEventLogLines(_ lines: [String]) {
+        copyToPasteboard(lines.joined(separator: "\n"))
+    }
+
+    private func copyTranscript(_ snapshot: LiveTranscriptDebugSnapshot) {
+        copyToPasteboard(snapshot.transcriptText)
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
     }
 
     public static func describe(_ event: TranscriptEvent) -> String {
@@ -190,140 +257,66 @@ public struct LiveTranscriptDebugView: View {
     }
 }
 
-private struct SelectableEventLogView: NSViewRepresentable {
+private struct LiveEventLogTailView: View {
     var lines: [String]
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator()
-    }
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.drawsBackground = false
-
-        let textView = NSTextView()
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.isRichText = false
-        textView.importsGraphics = false
-        textView.drawsBackground = false
-        textView.font = NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
-        textView.textColor = .labelColor
-        textView.textContainerInset = NSSize(width: 12, height: 12)
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(
-            width: scrollView.contentSize.width,
-            height: CGFloat.greatestFiniteMagnitude
-        )
-
-        scrollView.documentView = textView
-        context.coordinator.textView = textView
-        return scrollView
-    }
-
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        context.coordinator.update(lines, in: scrollView)
-    }
-
-    final class Coordinator {
-        weak var textView: NSTextView?
-        private var renderedLines: [String] = []
-
-        func update(_ lines: [String], in scrollView: NSScrollView) {
-            guard let textView else { return }
-
-            if lines.isEmpty {
-                guard !renderedLines.isEmpty else { return }
-                textView.string = ""
-                renderedLines.removeAll(keepingCapacity: true)
-                return
-            }
-
-            if canAppend(lines) {
-                append(Array(lines.dropFirst(renderedLines.count)), to: textView, in: scrollView)
-            } else if let overlapCount = suffixPrefixOverlapCount(previous: renderedLines, current: lines),
-                      overlapCount > 0 {
-                removeRenderedPrefix(renderedLines.count - overlapCount, from: textView)
-                append(Array(lines.dropFirst(overlapCount)), to: textView, in: scrollView)
-            } else {
-                textView.string = lines.joined(separator: "\n")
-                renderedLines = lines
-                scrollToBottom(scrollView)
-            }
-        }
-
-        private func canAppend(_ lines: [String]) -> Bool {
-            guard lines.count >= renderedLines.count else { return false }
-            return zip(renderedLines, lines).allSatisfy(==)
-        }
-
-        private func suffixPrefixOverlapCount(previous: [String], current: [String]) -> Int? {
-            let maximumOverlap = min(previous.count, current.count)
-            guard maximumOverlap > 0 else { return nil }
-
-            for count in stride(from: maximumOverlap, through: 1, by: -1) {
-                if Array(previous.suffix(count)) == Array(current.prefix(count)) {
-                    return count
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
+                        Text(line)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .id(index)
+                    }
                 }
+                .padding(12)
             }
-
-            return nil
-        }
-
-        private func removeRenderedPrefix(_ count: Int, from textView: NSTextView) {
-            guard count > 0, count <= renderedLines.count else { return }
-            let removedTextLength = renderedLines.prefix(count).joined(separator: "\n").utf16.count
-            let separatorLength = count < renderedLines.count ? 1 : 0
-            textView.textStorage?.deleteCharacters(in: NSRange(
-                location: 0,
-                length: removedTextLength + separatorLength
-            ))
-            renderedLines.removeFirst(count)
-        }
-
-        private func append(_ newLines: [String], to textView: NSTextView, in scrollView: NSScrollView) {
-            guard !newLines.isEmpty else { return }
-
-            let prefix = renderedLines.isEmpty ? "" : "\n"
-            let appendedText = prefix + newLines.joined(separator: "\n")
-            textView.textStorage?.append(NSAttributedString(string: appendedText, attributes: attributes(for: textView)))
-            renderedLines.append(contentsOf: newLines)
-            scrollToBottom(scrollView)
-        }
-
-        private func attributes(for textView: NSTextView) -> [NSAttributedString.Key: Any] {
-            var attributes: [NSAttributedString.Key: Any] = [:]
-            if let font = textView.font {
-                attributes[.font] = font
+            .onAppear {
+                scrollToBottom(proxy)
             }
-            if let textColor = textView.textColor {
-                attributes[.foregroundColor] = textColor
+            .onChange(of: lines) {
+                scrollToBottom(proxy)
             }
-            return attributes
         }
+    }
 
-        private func scrollToBottom(_ scrollView: NSScrollView) {
-            textView?.scrollRangeToVisible(NSRange(location: textView?.string.utf16.count ?? 0, length: 0))
-        }
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        guard let lastIndex = lines.indices.last else { return }
+        proxy.scrollTo(lastIndex, anchor: .bottom)
     }
 }
 
 public struct LiveTranscriptDebugSnapshot: Equatable {
     public private(set) var stableText = ""
     public private(set) var volatileText = ""
+    public private(set) var stableDisplayText = ""
+    public private(set) var volatileDisplayText = ""
     public private(set) var processedDuration: TimeInterval?
     public private(set) var realTimeFactor: Double?
     public private(set) var segmentCount = 0
 
-    private var stableSnapshotSignature = ""
+    private var stableSnapshotSignature = StableSnapshotSignature()
     private var latestStableText: String?
+    private var latestStableDisplayText: String?
     private var latestStableTimeRange: String?
     private var volatileTimeRange: String?
+
+    private static let stableDisplayCharacterLimit = 1_500
+    private static let volatileDisplayCharacterLimit = 700
+    private static let latestDisplayCharacterLimit = 300
+
+    private struct StableSnapshotSignature: Equatable {
+        var segmentCount = 0
+        var lastSegmentID: UUID?
+        var lastSegmentText = ""
+        var lastSegmentStartTime: TimeInterval = 0
+        var lastSegmentEndTime: TimeInterval = 0
+    }
 
     public init(events: [TranscriptEvent] = []) {
         for event in events {
@@ -343,12 +336,24 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         return "\(stableText) \(volatileText)"
     }
 
+    public var hasTranscriptText: Bool {
+        !stableText.isEmpty || !volatileText.isEmpty
+    }
+
     public var latestText: String? {
         if !volatileText.isEmpty {
             return volatileText
         }
 
         return latestStableText
+    }
+
+    public var latestDisplayText: String? {
+        if !volatileDisplayText.isEmpty {
+            return volatileDisplayText
+        }
+
+        return latestStableDisplayText
     }
 
     public var latestTimeRange: String? {
@@ -368,7 +373,7 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         case .snapshot(let snapshot):
             let signature = Self.stableSnapshotSignature(for: snapshot.stable.segments)
             if signature != stableSnapshotSignature {
-                applyStableSegments(snapshot.stable.segments)
+                applyStableSegments(snapshot.stable.segments, signature: signature)
             }
             applyVolatileTranscript(snapshot.volatile)
         case .progress(let progress):
@@ -378,7 +383,10 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         case .completed(let transcript):
             let nonEmptySegments = transcript.segments.filter { !Self.trim($0.text).isEmpty }
             if !nonEmptySegments.isEmpty && nonEmptySegments.count != segmentCount {
-                applyStableSegments(nonEmptySegments)
+                applyStableSegments(
+                    transcript.segments,
+                    signature: Self.stableSnapshotSignature(for: transcript.segments)
+                )
             }
             applyVolatileTranscript(nil)
         case .started, .audioLevel, .voiceActivity, .diagnostic:
@@ -386,7 +394,9 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         }
     }
 
-    private mutating func applyStableSegments(_ segments: [TranscriptSegment]) {
+    private mutating func applyStableSegments(_ segments: [TranscriptSegment], signature: StableSnapshotSignature) {
+        guard !appendStableSegmentsIfPossible(segments, signature: signature) else { return }
+
         let nonEmptySegments = segments.compactMap { segment -> (segment: TranscriptSegment, text: String)? in
             let text = Self.trim(segment.text)
             guard !text.isEmpty else { return nil }
@@ -394,24 +404,75 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         }
 
         stableText = nonEmptySegments.map(\.text).joined(separator: " ")
+        stableDisplayText = Self.displayText(stableText, characterLimit: Self.stableDisplayCharacterLimit)
         segmentCount = nonEmptySegments.count
-        stableSnapshotSignature = Self.stableSnapshotSignature(for: nonEmptySegments.map(\.segment))
+        stableSnapshotSignature = signature
 
         if let latest = nonEmptySegments.last {
-            latestStableText = latest.text
-            latestStableTimeRange = Self.formatTimeRange(
-                start: latest.segment.startTime,
-                end: latest.segment.endTime
-            )
+            applyLatestStableSegment(latest.segment, text: latest.text)
         } else {
             latestStableText = nil
+            latestStableDisplayText = nil
             latestStableTimeRange = nil
         }
+    }
+
+    private mutating func appendStableSegmentsIfPossible(
+        _ segments: [TranscriptSegment],
+        signature: StableSnapshotSignature
+    ) -> Bool {
+        let previousSourceSegmentCount = stableSnapshotSignature.segmentCount
+        guard signature.segmentCount >= previousSourceSegmentCount else { return false }
+
+        if previousSourceSegmentCount > 0 {
+            let previousLastIndex = previousSourceSegmentCount - 1
+            guard segments.indices.contains(previousLastIndex),
+                  Self.segment(segments[previousLastIndex], matches: stableSnapshotSignature) else {
+                return false
+            }
+        }
+
+        var appendedNonEmptyCount = 0
+        for segment in segments.dropFirst(previousSourceSegmentCount) {
+            let text = Self.trim(segment.text)
+            guard !text.isEmpty else { continue }
+
+            appendStableText(text)
+            appendedNonEmptyCount += 1
+            applyLatestStableSegment(segment, text: text)
+        }
+
+        segmentCount += appendedNonEmptyCount
+        stableSnapshotSignature = signature
+        return true
+    }
+
+    private mutating func appendStableText(_ text: String) {
+        if stableText.isEmpty {
+            stableText = text
+            stableDisplayText = Self.displayText(text, characterLimit: Self.stableDisplayCharacterLimit)
+        } else {
+            stableText += " " + text
+            stableDisplayText = Self.displayText(
+                stableDisplayText + " " + text,
+                characterLimit: Self.stableDisplayCharacterLimit
+            )
+        }
+    }
+
+    private mutating func applyLatestStableSegment(_ segment: TranscriptSegment, text: String) {
+        latestStableText = text
+        latestStableDisplayText = Self.displayText(text, characterLimit: Self.latestDisplayCharacterLimit)
+        latestStableTimeRange = Self.formatTimeRange(
+            start: segment.startTime,
+            end: segment.endTime
+        )
     }
 
     private mutating func applyVolatileTranscript(_ transcript: Transcript?) {
         guard let transcript else {
             volatileText = ""
+            volatileDisplayText = ""
             volatileTimeRange = nil
             return
         }
@@ -420,11 +481,13 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         guard let first = segments.first,
               let last = segments.last else {
             volatileText = ""
+            volatileDisplayText = ""
             volatileTimeRange = nil
             return
         }
 
         volatileText = segments.map { Self.trim($0.text) }.joined(separator: " ")
+        volatileDisplayText = Self.displayText(volatileText, characterLimit: Self.volatileDisplayCharacterLimit)
         volatileTimeRange = Self.formatTimeRange(start: first.startTime, end: last.endTime)
     }
 
@@ -432,12 +495,33 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func stableSnapshotSignature(for segments: [TranscriptSegment]) -> String {
-        segments
-            .map { segment in
-                "\(segment.id.uuidString)|\(trim(segment.text))|\(format(segment.startTime))|\(format(segment.endTime))"
-            }
-            .joined(separator: "\n")
+    private static func displayText(_ text: String, characterLimit: Int) -> String {
+        guard text.count > characterLimit else {
+            return text
+        }
+
+        return "... " + text.suffix(characterLimit).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func stableSnapshotSignature(for segments: [TranscriptSegment]) -> StableSnapshotSignature {
+        guard let last = segments.last else {
+            return StableSnapshotSignature()
+        }
+
+        return StableSnapshotSignature(
+            segmentCount: segments.count,
+            lastSegmentID: last.id,
+            lastSegmentText: trim(last.text),
+            lastSegmentStartTime: last.startTime,
+            lastSegmentEndTime: last.endTime
+        )
+    }
+
+    private static func segment(_ segment: TranscriptSegment, matches signature: StableSnapshotSignature) -> Bool {
+        signature.lastSegmentID == segment.id &&
+            signature.lastSegmentText == trim(segment.text) &&
+            signature.lastSegmentStartTime == segment.startTime &&
+            signature.lastSegmentEndTime == segment.endTime
     }
 
     private static func formatTimeRange(start: TimeInterval, end: TimeInterval) -> String {

@@ -5,6 +5,134 @@ import CarbocationLocalSpeechUI
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum CLSSmokeConsoleDiagnostics {
+    static func log(_ message: String) {
+        NSLog("%@", "[CLSSmokeDiagnostics] \(message)")
+    }
+}
+
+private final class CLSSmokeLiveDiagnosticsState {
+    var eventDescriptions: [String] = []
+    var eventCount = 0
+    var lastEventDisplayUpdateDate = Date.distantPast
+    var transcriptSnapshot = LiveTranscriptDebugSnapshot()
+    var lastTranscriptDisplayUpdateDate = Date.distantPast
+    var lastSummaryLogDate = Date.distantPast
+    var lastSegmentCount = 0
+    var hasLoggedEventCap = false
+
+    func reset() {
+        eventDescriptions.removeAll(keepingCapacity: true)
+        eventCount = 0
+        lastEventDisplayUpdateDate = Date.distantPast
+        transcriptSnapshot = LiveTranscriptDebugSnapshot()
+        lastTranscriptDisplayUpdateDate = Date.distantPast
+        lastSummaryLogDate = Date.distantPast
+        lastSegmentCount = 0
+        hasLoggedEventCap = false
+    }
+}
+
+private final class CLSSmokeHangSampler {
+    private let monitorQueue = DispatchQueue(label: "CLSSmoke.HangSampler", qos: .utility)
+    private var heartbeatTimer: DispatchSourceTimer?
+    private var monitorTimer: DispatchSourceTimer?
+    private var lastMainHeartbeat = CFAbsoluteTimeGetCurrent()
+    private var isSampling = false
+    private var lastSampleDate = Date.distantPast
+
+    private let stallThreshold: TimeInterval = 5
+    private let sampleCooldown: TimeInterval = 20
+    private let sampleDurationSeconds = 5
+    private let sampleIntervalMilliseconds = 20
+
+    func start() {
+        CLSSmokeConsoleDiagnostics.log(
+            "hangSampler started pid=\(ProcessInfo.processInfo.processIdentifier) stallThresholdSeconds=\(stallThreshold)"
+        )
+
+        let heartbeatTimer = DispatchSource.makeTimerSource(queue: .main)
+        heartbeatTimer.schedule(deadline: .now(), repeating: .milliseconds(500))
+        heartbeatTimer.setEventHandler { [weak self] in
+            let now = CFAbsoluteTimeGetCurrent()
+            self?.monitorQueue.async {
+                self?.lastMainHeartbeat = now
+            }
+        }
+        heartbeatTimer.resume()
+        self.heartbeatTimer = heartbeatTimer
+
+        let monitorTimer = DispatchSource.makeTimerSource(queue: monitorQueue)
+        monitorTimer.schedule(deadline: .now() + 2, repeating: .seconds(2))
+        monitorTimer.setEventHandler { [weak self] in
+            self?.checkForStall()
+        }
+        monitorTimer.resume()
+        self.monitorTimer = monitorTimer
+    }
+
+    func stop() {
+        heartbeatTimer?.cancel()
+        monitorTimer?.cancel()
+        heartbeatTimer = nil
+        monitorTimer = nil
+    }
+
+    private func checkForStall() {
+        let staleSeconds = CFAbsoluteTimeGetCurrent() - lastMainHeartbeat
+        guard staleSeconds >= stallThreshold else { return }
+        guard !isSampling else { return }
+        guard Date().timeIntervalSince(lastSampleDate) >= sampleCooldown else { return }
+
+        isSampling = true
+        lastSampleDate = Date()
+        writeSample(staleSeconds: staleSeconds)
+        isSampling = false
+    }
+
+    private func writeSample(staleSeconds: TimeInterval) {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let fileURL = URL(fileURLWithPath: "/tmp/CLSSmoke-hang-\(pid)-\(Int(Date().timeIntervalSince1970)).sample.txt")
+        CLSSmokeConsoleDiagnostics.log(
+            "hangSampler detectedMainThreadStall staleSeconds=\(Self.format(staleSeconds)) sampleFile=\(fileURL.path)"
+        )
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sample")
+        process.arguments = [
+            "\(pid)",
+            "\(sampleDurationSeconds)",
+            "\(sampleIntervalMilliseconds)",
+            "-mayDie",
+            "-fullPaths",
+            "-file",
+            fileURL.path
+        ]
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            CLSSmokeConsoleDiagnostics.log(
+                "hangSampler sampleFinished status=\(process.terminationStatus) sampleFile=\(fileURL.path) output=\(output)"
+            )
+        } catch {
+            CLSSmokeConsoleDiagnostics.log(
+                "hangSampler sampleFailed sampleFile=\(fileURL.path) error=\(error)"
+            )
+        }
+    }
+
+    private static func format(_ value: TimeInterval) -> String {
+        String(format: "%.1f", value)
+    }
+}
+
 @main
 private enum CLSSmokeApp {
     @MainActor
@@ -23,9 +151,11 @@ private enum CLSSmokeApp {
 @MainActor
 private final class CLSSmokeAppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
+    private let hangSampler = CLSSmokeHangSampler()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMainMenu()
+        hangSampler.start()
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
@@ -46,6 +176,10 @@ private final class CLSSmokeAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        hangSampler.stop()
     }
 
     private func configureMainMenu() {
@@ -71,8 +205,9 @@ private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.liveInput") private var liveInputStorageValue = CLSSmokeLiveInput.microphone.rawValue
     @AppStorage("CLSSmoke.werReferenceText") private var werReferenceText = ""
     @State private var systemOptions: [SpeechSystemModelOption] = []
-    @State private var eventDescriptions: [String] = []
-    @State private var transcriptSnapshot = LiveTranscriptDebugSnapshot()
+    @State private var visibleEventDescriptions: [String] = []
+    @State private var visibleEventDescriptionTotalCount = 0
+    @State private var visibleTranscriptSnapshot = LiveTranscriptDebugSnapshot()
     @State private var microphoneStatus = MicrophonePermissionHelper.authorizationStatus()
     @State private var loadedInfo: LocalSpeechLoadedModelInfo?
     @State private var statusMessage = "Select a provider, then start listening."
@@ -98,8 +233,13 @@ private struct CLSSmokeRootView: View {
     @State private var activeFileTranscriptionID: UUID?
     @State private var werHypotheses: [CLSSmokeWERApproach: String] = [:]
     @State private var werReports: [CLSSmokeWERApproach: CLSSmokeWERReport] = [:]
+    @State private var liveDiagnostics = CLSSmokeLiveDiagnosticsState()
 
-    private let maximumDisplayedEvents = 500
+    private let maximumRetainedEvents = 1_000
+    private let retainedEventTrimBatchSize = 100
+    private let visibleEventLineLimit = 50
+    private let eventDisplayUpdateInterval: TimeInterval = 0.25
+    private let transcriptDisplayUpdateInterval: TimeInterval = 0.25
     private let diagnosticLogThrottleInterval: TimeInterval = 1.0
     private let transcriptMetricThrottleInterval: TimeInterval = 1.0
     private static let supportedAudioFileExtensions: Set<String> = [
@@ -154,7 +294,17 @@ private struct CLSSmokeRootView: View {
                 Divider()
                 werPanel
                 Divider()
-                LiveTranscriptDebugView(eventDescriptions: eventDescriptions, snapshot: transcriptSnapshot)
+                LiveTranscriptDebugView(
+                    eventDescriptions: visibleEventDescriptions,
+                    snapshot: visibleTranscriptSnapshot,
+                    totalEventDescriptionCount: visibleEventDescriptionTotalCount,
+                    copyAllEventDescriptions: {
+                        copyEventDescriptions(liveDiagnostics.eventDescriptions)
+                    },
+                    copyTranscript: {
+                        copyTranscript(liveDiagnostics.transcriptSnapshot)
+                    }
+                )
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -255,7 +405,7 @@ private struct CLSSmokeRootView: View {
     private var currentTranscriptWERReport: CLSSmokeWERReport? {
         CLSSmokeWERCalculator.report(
             referenceText: werReferenceText,
-            hypothesisText: transcriptSnapshot.transcriptText
+            hypothesisText: visibleTranscriptSnapshot.transcriptText
         )
     }
 
@@ -1028,13 +1178,36 @@ private struct CLSSmokeRootView: View {
     }
 
     private func appendEvent(_ event: TranscriptEvent) {
-        if shouldLogEvent(event) {
-            eventDescriptions.append(LiveTranscriptDebugView.describe(event))
-            trimEventDescriptions()
+        let didLogEvent = shouldLogEvent(event)
+        let hadVisibleTranscriptText = visibleTranscriptSnapshot.hasTranscriptText
+        var trimmedEventOverflow = 0
+        if didLogEvent {
+            liveDiagnostics.eventDescriptions.append(LiveTranscriptDebugView.describe(event))
+            trimmedEventOverflow = trimEventDescriptions()
         }
 
-        if shouldApplyToTranscriptPanel(event) {
-            transcriptSnapshot.apply(event)
+        let didApplyToTranscriptPanel = shouldApplyToTranscriptPanel(event)
+        if didApplyToTranscriptPanel {
+            liveDiagnostics.transcriptSnapshot.apply(event)
+        }
+
+        logLiveDiagnosticsIfNeeded(
+            event: event,
+            didLogEvent: didLogEvent,
+            didApplyToTranscriptPanel: didApplyToTranscriptPanel,
+            trimmedEventOverflow: trimmedEventOverflow
+        )
+
+        if didLogEvent {
+            refreshVisibleEventDescriptionsIfNeeded(force: visibleEventDescriptions.isEmpty)
+        }
+        if didApplyToTranscriptPanel {
+            refreshVisibleTranscriptSnapshotIfNeeded(
+                force: shouldForceTranscriptDisplayUpdate(
+                    for: event,
+                    hadVisibleTranscriptText: hadVisibleTranscriptText
+                )
+            )
         }
     }
 
@@ -1067,10 +1240,170 @@ private struct CLSSmokeRootView: View {
         werReports = reports
     }
 
-    private func trimEventDescriptions() {
-        let overflow = eventDescriptions.count - maximumDisplayedEvents
-        if overflow > 0 {
-            eventDescriptions.removeFirst(overflow)
+    @discardableResult
+    private func trimEventDescriptions() -> Int {
+        let overflow = liveDiagnostics.eventDescriptions.count - maximumRetainedEvents
+        guard overflow > 0 else { return 0 }
+
+        let removalCount = min(liveDiagnostics.eventDescriptions.count, overflow + retainedEventTrimBatchSize)
+        liveDiagnostics.eventDescriptions.removeFirst(removalCount)
+        return removalCount
+    }
+
+    private func refreshVisibleEventDescriptionsIfNeeded(force: Bool = false) {
+        let now = Date()
+        guard force || now.timeIntervalSince(liveDiagnostics.lastEventDisplayUpdateDate) >= eventDisplayUpdateInterval else {
+            return
+        }
+
+        visibleEventDescriptions = Array(liveDiagnostics.eventDescriptions.suffix(visibleEventLineLimit))
+        visibleEventDescriptionTotalCount = liveDiagnostics.eventDescriptions.count
+        liveDiagnostics.lastEventDisplayUpdateDate = now
+    }
+
+    private func copyEventDescriptions(_ descriptions: [String]) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(descriptions.joined(separator: "\n"), forType: .string)
+    }
+
+    private func copyTranscript(_ snapshot: LiveTranscriptDebugSnapshot) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(snapshot.transcriptText, forType: .string)
+    }
+
+    private func refreshVisibleTranscriptSnapshotIfNeeded(force: Bool = false) {
+        let now = Date()
+        guard force || now.timeIntervalSince(liveDiagnostics.lastTranscriptDisplayUpdateDate) >= transcriptDisplayUpdateInterval else {
+            return
+        }
+
+        visibleTranscriptSnapshot = liveDiagnostics.transcriptSnapshot
+        liveDiagnostics.lastTranscriptDisplayUpdateDate = now
+    }
+
+    private func shouldForceTranscriptDisplayUpdate(
+        for event: TranscriptEvent,
+        hadVisibleTranscriptText: Bool
+    ) -> Bool {
+        if !hadVisibleTranscriptText, liveDiagnostics.transcriptSnapshot.hasTranscriptText {
+            return true
+        }
+
+        switch event {
+        case .completed, .stats:
+            return true
+        case .started, .audioLevel, .voiceActivity, .diagnostic, .snapshot, .progress:
+            return false
+        }
+    }
+
+    private func logLiveDiagnosticsIfNeeded(
+        event: TranscriptEvent,
+        didLogEvent: Bool,
+        didApplyToTranscriptPanel: Bool,
+        trimmedEventOverflow: Int
+    ) {
+        liveDiagnostics.eventCount += 1
+
+        let now = Date()
+        let segmentCountChanged = liveDiagnostics.transcriptSnapshot.segmentCount != liveDiagnostics.lastSegmentCount
+        let reachedEventCap = liveDiagnostics.eventDescriptions.count >= maximumRetainedEvents
+        let nearEventCap = liveDiagnostics.eventDescriptions.count >= maximumRetainedEvents - retainedEventTrimBatchSize
+        let elapsed = now.timeIntervalSince(liveDiagnostics.lastSummaryLogDate)
+
+        var reasons: [String] = []
+        if liveDiagnostics.eventCount == 1 {
+            reasons.append("first")
+        }
+        if segmentCountChanged {
+            reasons.append("segment-change")
+        }
+        if reachedEventCap && !liveDiagnostics.hasLoggedEventCap {
+            reasons.append("event-cap")
+        }
+        if nearEventCap && elapsed >= diagnosticLogThrottleInterval {
+            reasons.append("near-cap")
+        }
+
+        guard !reasons.isEmpty else { return }
+
+        let metrics = eventLogMetrics()
+        CLSSmokeConsoleDiagnostics.log(
+            "sourceEvent reason=\(reasons.joined(separator: ",")) " +
+            "eventIndex=\(liveDiagnostics.eventCount) kind=\(Self.eventKind(event)) " +
+            "logged=\(didLogEvent) applied=\(didApplyToTranscriptPanel) trimmed=\(trimmedEventOverflow) " +
+            "eventLines=\(metrics.lineCount) eventTextUTF16=\(metrics.totalUTF16) " +
+            "maxEventLineUTF16=\(metrics.maxLineUTF16) segments=\(liveDiagnostics.transcriptSnapshot.segmentCount) " +
+            "stableUTF16=\(liveDiagnostics.transcriptSnapshot.stableText.utf16.count) " +
+            "volatileUTF16=\(liveDiagnostics.transcriptSnapshot.volatileText.utf16.count)" +
+            Self.eventMetricsSuffix(for: event)
+        )
+
+        liveDiagnostics.lastSummaryLogDate = now
+        liveDiagnostics.lastSegmentCount = liveDiagnostics.transcriptSnapshot.segmentCount
+        if reachedEventCap {
+            liveDiagnostics.hasLoggedEventCap = true
+        }
+    }
+
+    private func eventLogMetrics() -> (lineCount: Int, totalUTF16: Int, maxLineUTF16: Int) {
+        var totalUTF16 = 0
+        var maxLineUTF16 = 0
+
+        for description in liveDiagnostics.eventDescriptions {
+            let lineLength = description.utf16.count
+            totalUTF16 += lineLength
+            maxLineUTF16 = max(maxLineUTF16, lineLength)
+        }
+
+        if liveDiagnostics.eventDescriptions.count > 1 {
+            totalUTF16 += liveDiagnostics.eventDescriptions.count - 1
+        }
+
+        return (liveDiagnostics.eventDescriptions.count, totalUTF16, maxLineUTF16)
+    }
+
+    private static func eventKind(_ event: TranscriptEvent) -> String {
+        switch event {
+        case .started:
+            return "started"
+        case .audioLevel:
+            return "audioLevel"
+        case .voiceActivity:
+            return "voiceActivity"
+        case .diagnostic:
+            return "diagnostic"
+        case .snapshot:
+            return "snapshot"
+        case .progress:
+            return "progress"
+        case .stats:
+            return "stats"
+        case .completed:
+            return "completed"
+        }
+    }
+
+    private static func eventMetricsSuffix(for event: TranscriptEvent) -> String {
+        switch event {
+        case .snapshot(let snapshot):
+            return " sourceStableSegments=\(snapshot.stable.segments.count) sourceVolatileSegments=\(snapshot.volatile?.segments.count ?? 0) sourceVolatileUTF16=\(snapshot.volatile?.text.utf16.count ?? 0)"
+        case .stats(let stats):
+            return " statsSegments=\(stats.segmentCount) statsRTF=\(stats.realTimeFactor.map { String(format: "%.2f", $0) } ?? "n/a")"
+        case .completed(let transcript):
+            return " completedSegments=\(transcript.segments.count) completedTextUTF16=\(transcript.text.utf16.count)"
+        case .diagnostic(let diagnostic):
+            return " diagnosticSource=\(diagnostic.source) diagnosticMessageUTF16=\(diagnostic.message.utf16.count)"
+        case .progress(let progress):
+            return " processedDuration=\(formatDuration(progress.processedDuration))"
+        case .audioLevel(let level):
+            return " audioTime=\(formatDuration(level.time))"
+        case .voiceActivity(let activity):
+            return " vadState=\(activity.state.rawValue) vadEnd=\(formatDuration(activity.endTime))"
+        case .started(let backend):
+            return " backend=\(backend.displayName)"
         }
     }
 
@@ -1161,8 +1494,10 @@ private struct CLSSmokeRootView: View {
     }
 
     private func resetTranscriptDiagnostics() {
-        eventDescriptions.removeAll(keepingCapacity: true)
-        transcriptSnapshot = LiveTranscriptDebugSnapshot()
+        visibleEventDescriptions.removeAll(keepingCapacity: true)
+        visibleEventDescriptionTotalCount = 0
+        visibleTranscriptSnapshot = LiveTranscriptDebugSnapshot()
+        liveDiagnostics.reset()
         resetDiagnosticThrottleState()
     }
 
