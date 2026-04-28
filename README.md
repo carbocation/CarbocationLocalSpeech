@@ -1,10 +1,27 @@
 # CarbocationLocalSpeech
 
-`CarbocationLocalSpeech` is a Swift package for local speech transcription in Carbocation macOS apps. It provides shared model storage, Whisper model management, provider selection, transcription types, a unified runtime facade, and SwiftUI settings surfaces.
+Shared local-speech infrastructure for Carbocation macOS apps.
+
+This package provides neutral speech model storage, Whisper model management,
+provider selection, transcription types, a unified runtime facade for Whisper and
+Apple Speech, and shared SwiftUI settings surfaces.
 
 Host apps remain responsible for product behavior: hotkeys, paste/type behavior, dictation policy, command parsing, prompts, onboarding, and post-transcription cleanup.
 
-## For App Developers
+## Consuming Apps
+
+Use a tagged release for normal app integration. A release tag points SwiftPM at
+a published `whisper.xcframework.zip` asset, so the host app does not need a
+sibling checkout, a `whisper.cpp` submodule, or a build script for the Whisper
+runtime.
+
+A GitHub release does not replace the Swift package dependency. The host app
+still adds `CarbocationLocalSpeech` by Git URL and selects a release version;
+Xcode/SwiftPM then reads that tag's `Package.swift` and downloads the binary
+artifact automatically.
+
+Current public release: none yet. Use the first published release tag once the
+`Publish Whisper Binary Artifact` workflow has created it.
 
 ### Requirements
 
@@ -20,17 +37,55 @@ Apple Speech is exposed only when the current SDK, operating system, locale, per
 
 Whisper model weights are not bundled with the package. Apps can import local whisper.cpp `.bin` files, use the curated Hugging Face downloads, or provide their own download UI.
 
-### Install
+### Add The Release In Xcode
 
-For app integration, prefer a tagged GitHub release. Release tags are expected to have `Package.swift` stamped with a SwiftPM binary artifact URL and checksum for the `whisper` XCFramework, so consumers do not need to build `whisper.cpp` locally.
+1. Open the host macOS app project in Xcode.
+2. Choose `File > Add Package Dependencies...`.
+3. Paste the package URL:
 
-In Xcode:
+```text
+https://github.com/carbocation/CarbocationLocalSpeech.git
+```
 
-1. Open `File > Add Package Dependencies...`.
-2. Add `https://github.com/carbocation/CarbocationLocalSpeech.git`.
-3. Select a release tag.
-4. Add `CarbocationLocalSpeechRuntime` to your app target.
-5. Add `CarbocationLocalSpeechUI` if you want the shared SwiftUI picker/settings views.
+4. Choose a release version/tag.
+   Prefer `Exact Version` while integrating, or `Up to Next Major Version` once the app has a tested upgrade policy.
+5. Add the package products to the app target that will use them.
+
+Do not choose a branch rule for `main` for a shipping app. `main` stays
+source-build friendly for library development, while release tags are the path
+that should resolve the Whisper runtime through the binary artifact.
+
+Do not download or drag `whisper.xcframework` into the app project manually. The
+release asset is referenced by the package manifest and is fetched by SwiftPM
+during package resolution.
+
+### Pick Products
+
+- `CarbocationLocalSpeech`: core model-library, provider-selection, audio, transcript, streaming, VAD, and diarization types.
+- `CarbocationLocalSpeechRuntime`: preferred facade for apps. It routes provider-aware selections to Whisper or Apple Speech.
+- `CarbocationLocalSpeechUI`: SwiftUI settings, provider picker, model picker, permission/status, and diagnostics surfaces.
+- `CarbocationWhisperRuntime`: lower-level whisper.cpp runtime.
+- `CarbocationAppleSpeechRuntime`: lower-level Apple Speech runtime.
+- `CLSSmoke`: local smoke-test app for package development.
+
+Most apps should add `CarbocationLocalSpeechRuntime` and optionally
+`CarbocationLocalSpeechUI` to the app target. Add `CarbocationLocalSpeech`
+explicitly when host app code imports the core model-library or transcript types
+directly. Apps that only need shared model storage or metadata can use
+`CarbocationLocalSpeech` alone. Use `CarbocationWhisperRuntime` or
+`CarbocationAppleSpeechRuntime` directly only when the host app needs
+provider-specific control that is not exposed through the unified runtime.
+
+Host app source should import module names only:
+
+```swift
+import CarbocationLocalSpeech
+import CarbocationLocalSpeechRuntime
+import CarbocationLocalSpeechUI
+```
+
+Filesystem paths such as `../CarbocationLocalSpeech` should not appear in app
+source or Xcode package dependencies for the binary-release path.
 
 In `Package.swift`:
 
@@ -45,6 +100,7 @@ targets: [
     .target(
         name: "YourApp",
         dependencies: [
+            .product(name: "CarbocationLocalSpeech", package: "CarbocationLocalSpeech"),
             .product(name: "CarbocationLocalSpeechRuntime", package: "CarbocationLocalSpeech"),
             .product(name: "CarbocationLocalSpeechUI", package: "CarbocationLocalSpeech")
         ]
@@ -52,18 +108,34 @@ targets: [
 ]
 ```
 
-For unreleased development, you can point at `branch: "main"`, but Whisper inference requires either a stamped binary artifact, a local binary artifact, or a locally built source artifact. Apple Speech and the core APIs can still be developed without a Whisper artifact when the runtime reports Whisper as unavailable.
+### What Xcode Should Build
 
-### Products
+For a release tag, Xcode should:
 
-- `CarbocationLocalSpeech`: core model-library, provider-selection, audio, transcript, streaming, VAD, and diarization types.
-- `CarbocationLocalSpeechRuntime`: preferred facade for apps. It routes provider-aware selections to Whisper or Apple Speech.
-- `CarbocationLocalSpeechUI`: SwiftUI settings, provider picker, model picker, permission/status, and diagnostics surfaces.
-- `CarbocationWhisperRuntime`: lower-level whisper.cpp runtime.
-- `CarbocationAppleSpeechRuntime`: lower-level Apple Speech runtime.
-- `CLSSmoke`: local smoke-test app for package development.
+1. Resolve `CarbocationLocalSpeech` from GitHub.
+2. Download `whisper.xcframework.zip` from the release asset URL recorded in that tag's `Package.swift`.
+3. Link the selected products into the host app target.
+4. Build the app normally.
 
-Most apps should depend on `CarbocationLocalSpeechRuntime` and optionally `CarbocationLocalSpeechUI`.
+The host app should not add `Scripts/build-whisper-from-xcode.sh`, initialize
+`Vendor/whisper.cpp`, set `CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH`, or
+prebuild `Vendor/whisper-artifacts/current`. Those steps are only for local
+package development or temporary adjacent-checkout migration work.
+
+The binary artifact is a static XCFramework. SwiftPM handles the package link
+step, and the Whisper runtime declares its own system links for `Metal`,
+`Accelerate`, `AVFoundation`, `CoreML`, `Foundation`, and `libc++`.
+
+Apple Speech has no package artifact. When the app is built with a compatible SDK
+and runs on an operating system, locale, permission state, and asset state that
+support Apple Speech, `CarbocationLocalSpeechRuntime` exposes it as an available
+system model.
+
+For unreleased development, you can point at `branch: "main"`, but Whisper
+inference requires either a stamped binary artifact, a local binary artifact, or
+a locally built source artifact. Apple Speech and the core APIs can still be
+developed without a Whisper artifact when the runtime reports Whisper as
+unavailable.
 
 ### Create a Model Library
 
@@ -289,7 +361,7 @@ The script writes:
 
 ```text
 Vendor/whisper-artifacts/current/lib/libwhisper-combined.a
-Vendor/whisper-artifacts/current/include/whisper.h
+Vendor/whisper-artifacts/current/include/
 ```
 
 Those files are intentionally ignored by git.
@@ -301,34 +373,83 @@ WHISPER_COREML=ON Scripts/build-whisper-macos.sh
 MACOSX_DEPLOYMENT_TARGET=14.0 Scripts/build-whisper-macos.sh
 ```
 
+The package's SwiftPM `whisper` module imports a checked-in copy of the
+upstream public headers. After updating `Vendor/whisper.cpp`, sync and verify
+that header bundle:
+
+```sh
+Scripts/sync-whisper-headers.sh
+Scripts/sync-whisper-headers.sh --check
+```
+
 ### Use a Local Binary Artifact
 
 To test the package as a binary-target consumer before publishing:
 
 ```sh
 Scripts/build-whisper-xcframework.sh
-CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH=Vendor/whisper-artifacts/whisper.xcframework swift test
+CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH=Vendor/whisper-artifacts/release/whisper.xcframework swift test
 ```
 
 `Package.swift` switches to a local `.binaryTarget` when `CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH` is set.
 
 ### Prepare a GitHub Release Artifact
 
-Build and zip the XCFramework:
+Build, zip, and checksum the XCFramework:
 
 ```sh
 Scripts/build-whisper-xcframework.sh
-ditto -c -k --sequesterRsrc --keepParent Vendor/whisper-artifacts/whisper.xcframework CarbocationLocalSpeech-whisper.xcframework.zip
-swift package compute-checksum CarbocationLocalSpeech-whisper.xcframework.zip
 ```
 
-Upload the zip to the GitHub release, then stamp `Package.swift` with the release asset URL and checksum:
+The packaging script emits:
+
+```text
+Vendor/whisper-artifacts/release/whisper.xcframework
+Vendor/whisper-artifacts/release/whisper.xcframework.zip
+Vendor/whisper-artifacts/release/whisper.xcframework.zip.checksum
+```
+
+To prepare a release manifest manually:
 
 ```sh
-Scripts/set-whisper-binary-artifact.sh <artifact-url> <swiftpm-checksum>
+Scripts/set-whisper-binary-artifact.sh \
+  "https://github.com/carbocation/CarbocationLocalSpeech/releases/download/vX.Y.Z/whisper.xcframework.zip" \
+  "$(cat Vendor/whisper-artifacts/release/whisper.xcframework.zip.checksum)"
 ```
 
-Commit that stamped manifest on the release tag. Consumers that depend on that tag will have SwiftPM download the GitHub release artifact automatically.
+### Publish A Binary Release
+
+The preferred release path is the `Publish Whisper Binary Artifact` GitHub workflow.
+
+First run it with:
+
+- `tag`: the intended release tag, for example `vX.Y.Z`
+- `prerelease`: `true` for shakedown releases
+- `dry_run`: `true`
+
+The dry run verifies synced headers, builds the artifact, stamps `Package.swift`,
+and validates the package against the local XCFramework without pushing anything.
+
+Then run the workflow again with the same tag and `dry_run=false`. The release run
+creates a tag-only release commit with the binary URL/checksum, creates the tag,
+uploads the release asset, and validates the published release from a clean
+temporary consumer package.
+
+Keeping the manifest change on the release tag lets `main` stay source-build
+friendly while tagged consumers get the binary target.
+
+### Validate A Published Release
+
+After publishing, verify the release from a clean temporary consumer package:
+
+```sh
+Scripts/test-binary-release.sh vX.Y.Z
+```
+
+The release workflow runs the same smoke test after uploading the GitHub release
+asset. This catches problems that local binary validation cannot see, including
+tag resolution, checksum mismatch, release asset availability, downstream product
+imports, and whisper symbol linkage from the published binary target.
 
 ### Runtime Modes
 
@@ -350,7 +471,7 @@ Sources/
   CarbocationAppleSpeechRuntime/  Apple Speech-backed runtime
   CarbocationLocalSpeechUI/       SwiftUI settings and picker views
   CLSSmoke/                       Xcode-friendly smoke app
-  whisper/                        module map and C header for whisper.cpp
+  whisper/                        module map and synced C headers for whisper.cpp
 Tests/
 Scripts/
 Vendor/

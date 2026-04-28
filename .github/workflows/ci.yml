@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Swift Package
+    runs-on: macos-14
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify whisper.cpp headers are synced
+        run: Scripts/sync-whisper-headers.sh --check
+
+      - name: Verify whisper module header parses
+        run: clang -fsyntax-only -x c -I Sources/whisper/include -include whisper.h /dev/null
+
+      - name: Run tests
+        run: swift test

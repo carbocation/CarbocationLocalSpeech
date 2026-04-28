@@ -28,7 +28,18 @@ cmake -S "$WHISPER_DIR" -B "$BUILD_DIR" \
 cmake --build "$BUILD_DIR" --config Release --parallel
 
 mkdir -p "$OUT_DIR/include" "$OUT_DIR/lib"
-cp "$WHISPER_DIR/include/whisper.h" "$OUT_DIR/include/whisper.h"
+"$ROOT/Scripts/sync-whisper-headers.sh" --dest "$OUT_DIR/include"
+cat > "$OUT_DIR/include/module.modulemap" <<'EOF'
+module whisper [system] {
+  header "whisper.h"
+  header "ggml.h"
+  header "ggml-alloc.h"
+  header "ggml-backend.h"
+  header "ggml-cpu.h"
+  link "c++"
+  export *
+}
+EOF
 
 LIBS=()
 while IFS= read -r lib; do

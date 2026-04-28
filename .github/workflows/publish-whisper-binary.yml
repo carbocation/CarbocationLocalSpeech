@@ -1,0 +1,138 @@
+name: Publish Whisper Binary Artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create, for example v0.1.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as a prerelease"
+        required: true
+        default: true
+        type: boolean
+      dry_run:
+        description: "Build and validate without committing, tagging, or uploading"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Build and publish whisper.xcframework
+    runs-on: macos-14
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Verify whisper.cpp headers are synced
+        run: Scripts/sync-whisper-headers.sh --check
+
+      - name: Build XCFramework archive
+        run: Scripts/build-whisper-xcframework.sh
+
+      - name: Configure Package.swift binary target
+        id: artifact
+        run: |
+          TAG="${{ inputs.tag }}"
+          URL="https://github.com/${{ github.repository }}/releases/download/$TAG/whisper.xcframework.zip"
+          CHECKSUM="$(cat Vendor/whisper-artifacts/release/whisper.xcframework.zip.checksum)"
+
+          Scripts/set-whisper-binary-artifact.sh "$URL" "$CHECKSUM"
+
+          {
+            echo "tag=$TAG"
+            echo "url=$URL"
+            echo "checksum=$CHECKSUM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate package against local binary artifact
+        run: |
+          CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH="Vendor/whisper-artifacts/release/whisper.xcframework" swift test
+
+      - name: Summarize dry run
+        if: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "## Dry run complete"
+            echo ""
+            echo "- Tag: ${{ steps.artifact.outputs.tag }}"
+            echo "- Asset: Vendor/whisper-artifacts/release/whisper.xcframework.zip"
+            echo "- URL: ${{ steps.artifact.outputs.url }}"
+            echo "- Checksum: ${{ steps.artifact.outputs.checksum }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit release manifest and tag release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          TAG="${{ steps.artifact.outputs.tag }}"
+
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "error: tag already exists locally: $TAG" >&2
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "error: tag already exists on origin: $TAG" >&2
+            exit 1
+          fi
+
+          git add Package.swift
+          git diff --cached --check
+          git commit -m "Publish whisper binary artifact $TAG"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.artifact.outputs.tag }}"
+          TITLE="$TAG"
+          PRERELEASE_FLAG=""
+
+          if [[ "${{ inputs.prerelease }}" == "true" ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          cat > release-notes.md <<EOF
+          SwiftPM binary artifact for CarbocationLocalSpeech's whisper.cpp runtime.
+
+          Checksum:
+          \`${{ steps.artifact.outputs.checksum }}\`
+          EOF
+
+          gh release create "$TAG" \
+            "Vendor/whisper-artifacts/release/whisper.xcframework.zip" \
+            --title "$TITLE" \
+            --notes-file release-notes.md \
+            $PRERELEASE_FLAG
+
+      - name: Validate published binary release
+        if: ${{ !inputs.dry_run }}
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if Scripts/test-binary-release.sh "${{ steps.artifact.outputs.tag }}"; then
+              exit 0
+            fi
+
+            echo "release smoke failed on attempt $attempt; retrying after release asset propagation delay"
+            sleep 10
+          done
+
+          echo "release smoke failed after retries" >&2
+          exit 1
