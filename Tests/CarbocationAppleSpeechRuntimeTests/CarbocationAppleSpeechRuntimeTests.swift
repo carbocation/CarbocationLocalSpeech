@@ -10,7 +10,9 @@ final class CarbocationAppleSpeechRuntimeTests: XCTestCase {
         let option = await AppleSpeechEngine.systemModelOption(locale: locale)
 
         XCTAssertEqual(option != nil, availability.shouldOfferModelOption)
-        XCTAssertEqual(option?.selection, .system(.appleSpeech))
+        if let option {
+            XCTAssertEqual(option.selection, .system(.appleSpeech))
+        }
     }
 
     func testUnsupportedFeatureMapping() {

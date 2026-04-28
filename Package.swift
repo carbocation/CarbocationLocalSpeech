@@ -9,10 +9,132 @@ let whisperBinaryArtifactURL = ""
 let whisperBinaryArtifactChecksum = ""
 let whisperBinaryArtifactPath = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH"] ?? ""
 let forceSourceWhisper = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_SOURCE_WHISPER"] == "1"
+let forceDisableModernSpeechSDK = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_DISABLE_MODERN_SPEECH"] == "1"
 let sourceWhisperLibraryExists = FileManager.default.fileExists(atPath: whisperCombinedLibrary)
 let whisperCAPIIsLinked = sourceWhisperLibraryExists || forceSourceWhisper || !whisperBinaryArtifactPath.isEmpty || (!whisperBinaryArtifactURL.isEmpty && !whisperBinaryArtifactChecksum.isEmpty)
 let whisperRuntimeSwiftSettings: [SwiftSetting] = whisperCAPIIsLinked ? [.define("CARBOCATION_HAS_WHISPER_C_API")] : []
+let modernSpeechSDKIsAvailable = !forceDisableModernSpeechSDK && macOSSDKContainsModernSpeechSymbols()
+let appleSpeechRuntimeSwiftSettings: [SwiftSetting] = modernSpeechSDKIsAvailable ? [.define("CARBOCATION_HAS_MODERN_SPEECH")] : []
 let clsSmokeInfoPlist = "\(packageRoot)/Sources/CLSSmoke/Info.plist"
+
+// canImport(Speech) is true on older SDKs that lack the macOS 26 analyzer API.
+func macOSSDKContainsModernSpeechSymbols() -> Bool {
+    guard let sdkPath = activeMacOSSDKPath() else { return false }
+    let speechModuleURL = URL(fileURLWithPath: sdkPath)
+        .appendingPathComponent("System/Library/Frameworks/Speech.framework/Modules/Speech.swiftmodule")
+    return swiftModule(at: speechModuleURL, containsAll: [
+        "SpeechModule",
+        "SpeechTranscriber",
+        "SpeechAnalyzer",
+        "SpeechDetector",
+        "DictationTranscriber",
+        "AnalyzerInput",
+        "AssetInventory"
+    ])
+}
+
+func activeMacOSSDKPath() -> String? {
+    let environment = ProcessInfo.processInfo.environment
+    if let sdkRoot = environment["SDKROOT"],
+       !sdkRoot.isEmpty,
+       FileManager.default.fileExists(atPath: sdkRoot) {
+        return sdkRoot
+    }
+    if let developerDir = environment["DEVELOPER_DIR"],
+       let sdkPath = macOSSDKPath(developerDir: developerDir) {
+        return sdkPath
+    }
+    if let sdkPath = xcrunMacOSSDKPath() {
+        return sdkPath
+    }
+    if let sdkPath = macOSSDKPath(developerDir: "/Applications/Xcode.app/Contents/Developer") {
+        return sdkPath
+    }
+    for developerDir in installedXcodeDeveloperDirectories() {
+        if let sdkPath = macOSSDKPath(developerDir: developerDir) {
+            return sdkPath
+        }
+    }
+    return nil
+}
+
+func macOSSDKPath(developerDir: String) -> String? {
+    let sdkPath = URL(fileURLWithPath: developerDir)
+        .appendingPathComponent("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+        .path
+    return FileManager.default.fileExists(atPath: sdkPath) ? sdkPath : nil
+}
+
+func installedXcodeDeveloperDirectories() -> [String] {
+    guard let applications = try? FileManager.default.contentsOfDirectory(atPath: "/Applications") else {
+        return []
+    }
+
+    return applications
+        .filter { $0.hasPrefix("Xcode") && $0.hasSuffix(".app") }
+        .sorted()
+        .map { "/Applications/\($0)/Contents/Developer" }
+}
+
+func xcrunMacOSSDKPath() -> String? {
+    guard FileManager.default.isExecutableFile(atPath: "/usr/bin/xcrun") else {
+        return nil
+    }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    process.arguments = ["--sdk", "macosx", "--show-sdk-path"]
+
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = Pipe()
+
+    do {
+        try process.run()
+    } catch {
+        return nil
+    }
+
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else { return nil }
+
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    guard let path = String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+        !path.isEmpty,
+        FileManager.default.fileExists(atPath: path) else {
+        return nil
+    }
+
+    return path
+}
+
+func swiftModule(at directory: URL, containsAll symbols: [String]) -> Bool {
+    guard let enumerator = FileManager.default.enumerator(
+        at: directory,
+        includingPropertiesForKeys: [.isRegularFileKey],
+        options: [.skipsHiddenFiles]
+    ) else {
+        return false
+    }
+
+    var remainingSymbols = Set(symbols)
+    for case let fileURL as URL in enumerator {
+        guard ["swiftinterface", "swiftmodule"].contains(fileURL.pathExtension) else { continue }
+        guard let data = try? Data(contentsOf: fileURL) else { continue }
+
+        for symbol in Array(remainingSymbols) {
+            if data.range(of: Data(symbol.utf8)) != nil {
+                remainingSymbols.remove(symbol)
+            }
+        }
+
+        if remainingSymbols.isEmpty {
+            return true
+        }
+    }
+
+    return false
+}
 
 let whisperTarget: Target
 let whisperUnsafeLinkerSettings: [LinkerSetting]
@@ -76,6 +198,7 @@ let package = Package(
         .target(
             name: "CarbocationAppleSpeechRuntime",
             dependencies: ["CarbocationLocalSpeech"],
+            swiftSettings: appleSpeechRuntimeSwiftSettings,
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreMedia"),

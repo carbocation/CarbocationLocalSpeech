@@ -3,7 +3,7 @@ import AVFoundation
 import CoreMedia
 import Foundation
 
-#if canImport(Speech)
+#if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
 import Speech
 #endif
 
@@ -77,7 +77,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
     }
 
     public nonisolated static var isBuiltWithModernSpeechSDK: Bool {
-        #if canImport(Speech)
+        #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
         true
         #else
         false
@@ -85,7 +85,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
     }
 
     public nonisolated static func availability(locale: Locale) async -> SpeechProviderAvailability {
-        #if canImport(Speech)
+        #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
         guard #available(macOS 26.0, *) else {
             return .unavailable(.operatingSystemUnavailable)
         }
@@ -116,7 +116,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
     }
 
     public func prepare(locale: Locale, installAssetsIfNeeded: Bool) async throws {
-        #if canImport(Speech)
+        #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
         if #available(macOS 26.0, *) {
             try await Self.requestSpeechRecognitionAuthorizationIfNeeded()
         }
@@ -129,7 +129,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
         }
 
         if availability == .unavailable(.assetDownloadRequired), installAssetsIfNeeded {
-            #if canImport(Speech)
+            #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
             guard #available(macOS 26.0, *) else {
                 throw AppleSpeechEngineError.unavailable(.unavailable(.operatingSystemUnavailable))
             }
@@ -159,7 +159,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
             try await prepare(locale: locale, installAssetsIfNeeded: false)
         }
 
-        #if canImport(Speech)
+        #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
         guard #available(macOS 26.0, *) else {
             throw AppleSpeechEngineError.unavailable(.unavailable(.operatingSystemUnavailable))
         }
@@ -209,7 +209,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
 
         if options.implementation != .emulated {
             let locale = preparedLocale ?? Locale(identifier: options.transcription.language ?? Locale.current.identifier)
-            #if canImport(Speech)
+            #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
             if #available(macOS 26.0, *) {
                 return Self.streamWithModernSpeech(
                     audio: audio,
@@ -221,8 +221,13 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
             #endif
 
             if options.implementation == .native {
+                #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
+                let availability: SpeechProviderAvailability = .unavailable(.operatingSystemUnavailable)
+                #else
+                let availability: SpeechProviderAvailability = .unavailable(.sdkUnavailable)
+                #endif
                 return AsyncThrowingStream { continuation in
-                    continuation.finish(throwing: AppleSpeechEngineError.unavailable(.unavailable(.operatingSystemUnavailable)))
+                    continuation.finish(throwing: AppleSpeechEngineError.unavailable(availability))
                 }
             }
         }
@@ -318,7 +323,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
     }
 }
 
-#if canImport(Speech)
+#if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
 extension AppleSpeechEngine {
     @available(macOS 26.0, *)
     private nonisolated static func modernAvailability(locale: Locale) async -> SpeechProviderAvailability {
