@@ -1,5 +1,12 @@
 import Foundation
 
+public enum CuratedSpeechModelRecommendation: Hashable, Sendable {
+    case bestLiveEnglish
+    case bestLiveMultilingual
+    case bestFileEnglish
+    case bestFileMultilingual
+}
+
 public struct CuratedSpeechModel: Identifiable, Hashable, Sendable {
     public var id: String
     public var displayName: String
@@ -14,7 +21,7 @@ public struct CuratedSpeechModel: Identifiable, Hashable, Sendable {
     public var hfFilename: String?
     public var sha256: String?
     public var capabilities: SpeechModelCapabilities
-    public var recommendationPriority: Int
+    public var recommendation: CuratedSpeechModelRecommendation?
 
     public init(
         id: String,
@@ -30,7 +37,7 @@ public struct CuratedSpeechModel: Identifiable, Hashable, Sendable {
         hfFilename: String? = nil,
         sha256: String? = nil,
         capabilities: SpeechModelCapabilities = .whisperCppDefault,
-        recommendationPriority: Int = 0
+        recommendation: CuratedSpeechModelRecommendation? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -45,7 +52,7 @@ public struct CuratedSpeechModel: Identifiable, Hashable, Sendable {
         self.hfFilename = hfFilename
         self.sha256 = sha256
         self.capabilities = capabilities
-        self.recommendationPriority = recommendationPriority
+        self.recommendation = recommendation
     }
 
     public var recommendedRAMBytes: UInt64 {
@@ -117,68 +124,55 @@ public enum CuratedSpeechModelCatalog {
             approxSizeBytes: 75_000_000,
             recommendedRAMGB: 4,
             hfRepo: whisperCppRepo,
-            hfFilename: "ggml-tiny.en.bin",
-            recommendationPriority: 10
+            hfFilename: "ggml-tiny.en.bin"
         ),
         CuratedSpeechModel(
             id: "small.en",
             displayName: "Whisper small.en (English-only)",
-            subtitle: "Balanced stock English-only model while remaining practical on most Macs.",
+            subtitle: "Recommended English-only model for live streaming transcription.",
             variant: "small.en",
             languageScope: .englishOnly,
             approxSizeBytes: 485_000_000,
             recommendedRAMGB: 8,
             hfRepo: whisperCppRepo,
             hfFilename: "ggml-small.en.bin",
-            recommendationPriority: 20
-        ),
-        CuratedSpeechModel(
-            id: "medium.en",
-            displayName: "Whisper medium.en (English-only)",
-            subtitle: "Highest-quality stock English-only Whisper model for file and meeting audio.",
-            variant: "medium.en",
-            languageScope: .englishOnly,
-            approxSizeBytes: 1_530_000_000,
-            recommendedRAMGB: 16,
-            hfRepo: whisperCppRepo,
-            hfFilename: "ggml-medium.en.bin",
-            recommendationPriority: 30
+            recommendation: .bestLiveEnglish
         ),
         CuratedSpeechModel(
             id: "distil-large-v3",
             displayName: "Distil-Whisper large-v3 (English-only)",
-            subtitle: "English-only distilled large-v3 checkpoint with strong long-form accuracy.",
+            subtitle: "Recommended English-only model for offline file transcription.",
             variant: "distil-large-v3",
             languageScope: .englishOnly,
             approxSizeBytes: 1_520_000_000,
             recommendedRAMGB: 16,
             hfRepo: distilLargeV3GGMLRepo,
             hfFilename: "ggml-distil-large-v3.bin",
-            recommendationPriority: 45
+            recommendation: .bestFileEnglish
         ),
         CuratedSpeechModel(
             id: "large-v2",
             displayName: "Whisper large-v2 (multilingual)",
-            subtitle: "Full multilingual v2 checkpoint for compatibility and translation workflows.",
+            subtitle: "Recommended multilingual model for offline file and translation workflows.",
             variant: "large-v2",
             languageScope: .multilingual,
             approxSizeBytes: 3_090_000_000,
             recommendedRAMGB: 16,
             hfRepo: whisperCppRepo,
             hfFilename: "ggml-large-v2.bin",
-            recommendationPriority: 35
+            recommendation: .bestFileMultilingual
         ),
         CuratedSpeechModel(
             id: "large-v3-turbo",
             displayName: "Whisper large-v3 turbo (multilingual)",
-            subtitle: "Fast multilingual v3-derived model for broad speech workflows.",
+            subtitle: "Recommended multilingual model for live streaming transcription.",
             variant: "large-v3-turbo",
             languageScope: .multilingual,
             approxSizeBytes: 1_620_000_000,
             recommendedRAMGB: 16,
             hfRepo: whisperCppRepo,
             hfFilename: "ggml-large-v3-turbo.bin",
-            recommendationPriority: 50
+            recommendation: .bestLiveMultilingual
         )
     ]
 
@@ -186,30 +180,57 @@ public enum CuratedSpeechModelCatalog {
         models.first { $0.id == id }
     }
 
-    public static func recommendedModel(
-        forPhysicalMemoryBytes physicalMemoryBytes: UInt64,
+    public static func recommendedModels(
+        among models: [CuratedSpeechModel] = all
+    ) -> [CuratedSpeechModel] {
+        [
+            bestLiveEnglishModel(among: models),
+            bestLiveMultilingualModel(among: models),
+            bestFileEnglishModel(among: models),
+            bestFileMultilingualModel(among: models)
+        ].compactMap { $0 }
+    }
+
+    public static func bestLiveEnglishModel(
         among models: [CuratedSpeechModel] = all
     ) -> CuratedSpeechModel? {
-        guard physicalMemoryBytes > 0 else { return nil }
-
-        var bestFit: CuratedSpeechModel?
-        for model in models where model.recommendedRAMBytes <= physicalMemoryBytes {
-            if bestFit == nil || model.isBetterRecommendation(than: bestFit!) {
-                bestFit = model
-            }
-        }
-        return bestFit
+        models.first { $0.recommendation == .bestLiveEnglish }
     }
-}
 
-extension CuratedSpeechModel {
-    public func isBetterRecommendation(than other: CuratedSpeechModel) -> Bool {
-        if recommendationPriority != other.recommendationPriority {
-            return recommendationPriority > other.recommendationPriority
-        }
-        if recommendedRAMBytes != other.recommendedRAMBytes {
-            return recommendedRAMBytes > other.recommendedRAMBytes
-        }
-        return approxSizeBytes > other.approxSizeBytes
+    public static func bestLiveMultilingualModel(
+        among models: [CuratedSpeechModel] = all
+    ) -> CuratedSpeechModel? {
+        models.first { $0.recommendation == .bestLiveMultilingual }
+    }
+
+    public static func bestFileEnglishModel(
+        among models: [CuratedSpeechModel] = all
+    ) -> CuratedSpeechModel? {
+        models.first { $0.recommendation == .bestFileEnglish }
+    }
+
+    public static func bestFileMultilingualModel(
+        among models: [CuratedSpeechModel] = all
+    ) -> CuratedSpeechModel? {
+        models.first { $0.recommendation == .bestFileMultilingual }
+    }
+
+    public static func bestEnglishModel(
+        among models: [CuratedSpeechModel] = all
+    ) -> CuratedSpeechModel? {
+        bestLiveEnglishModel(among: models)
+    }
+
+    public static func bestMultilingualModel(
+        among models: [CuratedSpeechModel] = all
+    ) -> CuratedSpeechModel? {
+        bestLiveMultilingualModel(among: models)
+    }
+
+    public static func recommendedModel(
+        forPhysicalMemoryBytes _: UInt64,
+        among models: [CuratedSpeechModel] = all
+    ) -> CuratedSpeechModel? {
+        recommendedModels(among: models).first
     }
 }

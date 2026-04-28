@@ -78,19 +78,8 @@ public struct SpeechModelLibraryPickerView: View {
         return nil
     }
 
-    private var recommendedCuratedModel: CuratedSpeechModel? {
-        CuratedSpeechModelCatalog.recommendedModel(
-            forPhysicalMemoryBytes: physicalMemoryBytes,
-            among: curatedCatalog
-        )
-    }
-
-    private var bestInstalledCuratedModel: CuratedSpeechModel? {
-        SpeechModelPickerLabelPolicy.bestInstalledCuratedModel(
-            forPhysicalMemoryBytes: physicalMemoryBytes,
-            installedModels: library.models,
-            curatedModels: curatedCatalog
-        )
+    private var recommendedCuratedModels: [CuratedSpeechModel] {
+        CuratedSpeechModelCatalog.recommendedModels(among: curatedCatalog)
     }
 
     public var body: some View {
@@ -305,8 +294,7 @@ public struct SpeechModelLibraryPickerView: View {
         let isSelected = selection.storageValue == selectionStorageValue
         let statusLabel = labelPolicy.installedModelLabel(
             for: model,
-            recommendedCuratedModel: recommendedCuratedModel,
-            bestInstalledCuratedModel: bestInstalledCuratedModel
+            recommendedCuratedModels: recommendedCuratedModels
         )
 
         return Button {
@@ -414,7 +402,6 @@ public struct SpeechModelLibraryPickerView: View {
 
     @ViewBuilder
     private var downloadSection: some View {
-        let recommendedID = recommendedCuratedModel?.id
         VStack(alignment: .leading, spacing: 10) {
             Text("Download a Model")
                 .font(.headline)
@@ -426,7 +413,7 @@ public struct SpeechModelLibraryPickerView: View {
                 activeDownloadRow(activeDownload)
             } else {
                 ForEach(curatedCatalog) { model in
-                    curatedModelRow(model, isRecommended: recommendedID == model.id)
+                    curatedModelRow(model)
                 }
                 Button {
                     requestCustomDownload()
@@ -438,10 +425,11 @@ public struct SpeechModelLibraryPickerView: View {
         }
     }
 
-    private func curatedModelRow(_ model: CuratedSpeechModel, isRecommended: Bool) -> some View {
+    private func curatedModelRow(_ model: CuratedSpeechModel) -> some View {
         let alreadyInstalled = library.models.contains {
             SpeechModelPickerLabelPolicy.installedModel($0, matches: model)
         }
+        let statusLabel = labelPolicy.curatedModelLabel(for: model)
 
         return HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
@@ -449,8 +437,8 @@ public struct SpeechModelLibraryPickerView: View {
                     Text(model.displayName)
                         .font(.body)
                         .lineLimit(1)
-                    if isRecommended, let recommendedLabel = labelPolicy.recommendedLabel {
-                        statusBadge(recommendedLabel)
+                    if let statusLabel {
+                        statusBadge(statusLabel)
                     }
                 }
                 Text(model.subtitle)
@@ -743,11 +731,21 @@ public struct SpeechModelLibraryPickerView: View {
     }
 
     private func recommendationSummary() -> String {
-        let memory = formatBytes(Int64(min(physicalMemoryBytes, UInt64(Int64.max))))
-        if let recommendedCuratedModel {
-            return "\(memory) RAM detected. Recommended for this Mac: \(recommendedCuratedModel.displayName)."
+        let liveEnglish = recommendedCuratedModels.first { $0.recommendation == .bestLiveEnglish }?.displayName
+        let liveMultilingual = recommendedCuratedModels.first { $0.recommendation == .bestLiveMultilingual }?.displayName
+        let fileEnglish = recommendedCuratedModels.first { $0.recommendation == .bestFileEnglish }?.displayName
+        let fileMultilingual = recommendedCuratedModels.first { $0.recommendation == .bestFileMultilingual }?.displayName
+
+        if let liveEnglish, let liveMultilingual, let fileEnglish, let fileMultilingual {
+            return "Live: \(liveEnglish) for English, \(liveMultilingual) for multilingual. Files: \(fileEnglish) for English, \(fileMultilingual) for multilingual."
         }
-        return "\(memory) RAM detected."
+        if let liveEnglish, let liveMultilingual {
+            return "Live transcription: \(liveEnglish) for English, \(liveMultilingual) for multilingual."
+        }
+        if let fileEnglish, let fileMultilingual {
+            return "File transcription: \(fileEnglish) for English, \(fileMultilingual) for multilingual."
+        }
+        return "Curated downloads include approximate size and RAM guidance."
     }
 
     private func languageScopeLabel(_ scope: SpeechLanguageScope) -> String {

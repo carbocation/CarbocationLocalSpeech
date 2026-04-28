@@ -27,10 +27,21 @@ public struct SpeechModelPickerStatusLabel: Equatable, Hashable, Sendable {
 public struct SpeechModelPickerLabelPolicy: Equatable, Sendable {
     public static let builtInLabel = SpeechModelPickerStatusLabel("Built In", tone: .secondary)
     public static let recommendedLabel = SpeechModelPickerStatusLabel("Recommended", tone: .accent)
+    public static let bestLiveEnglishLabel = SpeechModelPickerStatusLabel("Best Live English", tone: .accent)
+    public static let bestLiveMultilingualLabel = SpeechModelPickerStatusLabel("Best Live Multilingual", tone: .accent)
+    public static let bestFileEnglishLabel = SpeechModelPickerStatusLabel("Best File English", tone: .accent)
+    public static let bestFileMultilingualLabel = SpeechModelPickerStatusLabel("Best File Multilingual", tone: .accent)
     public static let bestInstalledLabel = SpeechModelPickerStatusLabel("Best Installed", tone: .positive)
 
     public static let defaultSystemProviderLabels: [SpeechModelSelection: SpeechModelPickerStatusLabel] = [
         .system(.appleSpeech): builtInLabel
+    ]
+
+    public static let defaultRecommendationLabels: [CuratedSpeechModelRecommendation: SpeechModelPickerStatusLabel] = [
+        .bestLiveEnglish: bestLiveEnglishLabel,
+        .bestLiveMultilingual: bestLiveMultilingualLabel,
+        .bestFileEnglish: bestFileEnglishLabel,
+        .bestFileMultilingual: bestFileMultilingualLabel
     ]
 
     public static let `default` = SpeechModelPickerLabelPolicy()
@@ -38,19 +49,27 @@ public struct SpeechModelPickerLabelPolicy: Equatable, Sendable {
     public var recommendedLabel: SpeechModelPickerStatusLabel?
     public var bestInstalledLabel: SpeechModelPickerStatusLabel?
     public var systemProviderLabels: [SpeechModelSelection: SpeechModelPickerStatusLabel]
+    public var recommendationLabels: [CuratedSpeechModelRecommendation: SpeechModelPickerStatusLabel]
 
     public init(
         recommendedLabel: SpeechModelPickerStatusLabel? = Self.recommendedLabel,
         bestInstalledLabel: SpeechModelPickerStatusLabel? = Self.bestInstalledLabel,
-        systemProviderLabels: [SpeechModelSelection: SpeechModelPickerStatusLabel] = Self.defaultSystemProviderLabels
+        systemProviderLabels: [SpeechModelSelection: SpeechModelPickerStatusLabel] = Self.defaultSystemProviderLabels,
+        recommendationLabels: [CuratedSpeechModelRecommendation: SpeechModelPickerStatusLabel] = Self.defaultRecommendationLabels
     ) {
         self.recommendedLabel = recommendedLabel
         self.bestInstalledLabel = bestInstalledLabel
         self.systemProviderLabels = systemProviderLabels
+        self.recommendationLabels = recommendationLabels
     }
 
     public func systemProviderLabel(for option: SpeechSystemModelOption) -> SpeechModelPickerStatusLabel? {
         systemProviderLabels[option.selection]
+    }
+
+    public func curatedModelLabel(for model: CuratedSpeechModel) -> SpeechModelPickerStatusLabel? {
+        guard let recommendation = model.recommendation else { return nil }
+        return recommendationLabels[recommendation] ?? recommendedLabel
     }
 
     public func curatedModelLabel(
@@ -61,6 +80,16 @@ public struct SpeechModelPickerLabelPolicy: Equatable, Sendable {
               model.id == recommendedCuratedModel.id
         else { return nil }
         return recommendedLabel
+    }
+
+    public func installedModelLabel(
+        for model: InstalledSpeechModel,
+        recommendedCuratedModels: [CuratedSpeechModel]
+    ) -> SpeechModelPickerStatusLabel? {
+        for recommendedModel in recommendedCuratedModels where Self.installedModel(model, matches: recommendedModel) {
+            return curatedModelLabel(for: recommendedModel)
+        }
+        return nil
     }
 
     public func installedModelLabel(
@@ -81,31 +110,24 @@ public struct SpeechModelPickerLabelPolicy: Equatable, Sendable {
         return nil
     }
 
+    public static func recommendedInstalledCuratedModels(
+        installedModels: [InstalledSpeechModel],
+        curatedModels: [CuratedSpeechModel]
+    ) -> [CuratedSpeechModel] {
+        CuratedSpeechModelCatalog.recommendedModels(among: curatedModels).filter { curatedModel in
+            installedModels.contains { installedModel($0, matches: curatedModel) }
+        }
+    }
+
     public static func bestInstalledCuratedModel(
-        forPhysicalMemoryBytes physicalMemoryBytes: UInt64,
+        forPhysicalMemoryBytes _: UInt64,
         installedModels: [InstalledSpeechModel],
         curatedModels: [CuratedSpeechModel]
     ) -> CuratedSpeechModel? {
-        guard physicalMemoryBytes > 0 else { return nil }
-
-        var bestFit: CuratedSpeechModel?
-        for curatedModel in curatedModels where curatedModel.recommendedRAMBytes <= physicalMemoryBytes {
-            guard installedModels.contains(where: { installedModel($0, matches: curatedModel) }) else {
-                continue
-            }
-
-            if bestFit == nil || Self.curatedModel(curatedModel, isBetterRecommendationThan: bestFit!) {
-                bestFit = curatedModel
-            }
-        }
-        return bestFit
-    }
-
-    private static func curatedModel(
-        _ model: CuratedSpeechModel,
-        isBetterRecommendationThan other: CuratedSpeechModel
-    ) -> Bool {
-        model.isBetterRecommendation(than: other)
+        recommendedInstalledCuratedModels(
+            installedModels: installedModels,
+            curatedModels: curatedModels
+        ).first
     }
 
     public static func installedModel(

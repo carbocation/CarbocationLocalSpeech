@@ -18,7 +18,7 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
         XCTAssertEqual(label?.tone, .secondary)
     }
 
-    func testRecommendedAndBestInstalledLabelsApplyOnlyToCuratedModels() {
+    func testRecommendedInstalledLabelsApplyOnlyToCuratedModels() {
         let curatedSmall = CuratedSpeechModel(
             id: "small",
             displayName: "Small",
@@ -26,16 +26,18 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
             variant: "small.en",
             languageScope: .englishOnly,
             approxSizeBytes: 1,
-            recommendedRAMGB: 8
+            recommendedRAMGB: 8,
+            recommendation: .bestLiveEnglish
         )
-        let curatedMedium = CuratedSpeechModel(
-            id: "medium",
-            displayName: "Medium",
+        let curatedDistil = CuratedSpeechModel(
+            id: "distil-large-v3",
+            displayName: "Distil Large v3",
             subtitle: "",
-            variant: "medium.en",
+            variant: "distil-large-v3",
             languageScope: .englishOnly,
             approxSizeBytes: 2,
-            recommendedRAMGB: 16
+            recommendedRAMGB: 16,
+            recommendation: .bestFileEnglish
         )
         let installed = InstalledSpeechModel(
             displayName: "Small",
@@ -51,19 +53,25 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
             assets: [SpeechModelAsset(role: .primaryWeights, relativePath: "ggml-small.en.bin", sizeBytes: 1)],
             source: .imported
         )
+        let installedDistil = InstalledSpeechModel(
+            displayName: "Distil Large v3",
+            variant: "distil-large-v3",
+            languageScope: .englishOnly,
+            assets: [SpeechModelAsset(role: .primaryWeights, relativePath: "ggml-distil-large-v3.bin", sizeBytes: 1)],
+            source: .curated
+        )
 
         XCTAssertTrue(SpeechModelPickerLabelPolicy.installedModel(installed, matches: curatedSmall))
         XCTAssertFalse(SpeechModelPickerLabelPolicy.installedModel(imported, matches: curatedSmall))
 
-        let best = SpeechModelPickerLabelPolicy.bestInstalledCuratedModel(
-            forPhysicalMemoryBytes: 32 * 1_073_741_824,
-            installedModels: [installed],
-            curatedModels: [curatedSmall, curatedMedium]
+        let recommendedInstalled = SpeechModelPickerLabelPolicy.recommendedInstalledCuratedModels(
+            installedModels: [installed, installedDistil],
+            curatedModels: [curatedSmall, curatedDistil]
         )
-        XCTAssertEqual(best?.id, "small")
+        XCTAssertEqual(recommendedInstalled.map(\.id), ["small", "distil-large-v3"])
     }
 
-    func testRecommendedLabelAppliesToCuratedDownloadModel() {
+    func testManualRecommendationLabelsApplyToCuratedDownloadModels() {
         let curatedSmall = CuratedSpeechModel(
             id: "small",
             displayName: "Small",
@@ -73,39 +81,35 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
             approxSizeBytes: 1,
             recommendedRAMGB: 8
         )
-        let curatedMedium = CuratedSpeechModel(
-            id: "medium",
-            displayName: "Medium",
+        let curatedDistil = CuratedSpeechModel(
+            id: "distil-large-v3",
+            displayName: "Distil Large v3",
             subtitle: "",
-            variant: "medium.en",
+            variant: "distil-large-v3",
             languageScope: .englishOnly,
             approxSizeBytes: 2,
-            recommendedRAMGB: 16
+            recommendedRAMGB: 16,
+            recommendation: .bestFileEnglish
         )
 
-        let label = SpeechModelPickerLabelPolicy.default.curatedModelLabel(
-            for: curatedMedium,
-            recommendedCuratedModel: curatedMedium
-        )
-        let nonRecommendedLabel = SpeechModelPickerLabelPolicy.default.curatedModelLabel(
-            for: curatedSmall,
-            recommendedCuratedModel: curatedMedium
-        )
+        let label = SpeechModelPickerLabelPolicy.default.curatedModelLabel(for: curatedDistil)
+        let nonRecommendedLabel = SpeechModelPickerLabelPolicy.default.curatedModelLabel(for: curatedSmall)
 
-        XCTAssertEqual(label?.title, "Recommended")
+        XCTAssertEqual(label?.title, "Best File English")
         XCTAssertEqual(label?.tone, .accent)
         XCTAssertNil(nonRecommendedLabel)
     }
 
-    func testBestInstalledCuratedModelPrefersLargerModelWhenRAMTierTies() {
-        let medium = CuratedSpeechModel(
-            id: "medium",
-            displayName: "Medium",
+    func testRecommendedInstalledModelsFollowManualCatalogRecommendations() {
+        let largeV2 = CuratedSpeechModel(
+            id: "large-v2",
+            displayName: "Large v2",
             subtitle: "",
-            variant: "medium.en",
-            languageScope: .englishOnly,
-            approxSizeBytes: 1_530_000_000,
-            recommendedRAMGB: 16
+            variant: "large-v2",
+            languageScope: .multilingual,
+            approxSizeBytes: 3_090_000_000,
+            recommendedRAMGB: 16,
+            recommendation: .bestFileMultilingual
         )
         let largeTurbo = CuratedSpeechModel(
             id: "large-v3-turbo",
@@ -114,13 +118,14 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
             variant: "large-v3-turbo",
             languageScope: .multilingual,
             approxSizeBytes: 1_620_000_000,
-            recommendedRAMGB: 16
+            recommendedRAMGB: 16,
+            recommendation: .bestLiveMultilingual
         )
-        let installedMedium = InstalledSpeechModel(
-            displayName: "Medium",
-            variant: "medium.en",
-            languageScope: .englishOnly,
-            assets: [SpeechModelAsset(role: .primaryWeights, relativePath: "ggml-medium.en.bin", sizeBytes: 1)],
+        let installedLargeV2 = InstalledSpeechModel(
+            displayName: "Large v2",
+            variant: "large-v2",
+            languageScope: .multilingual,
+            assets: [SpeechModelAsset(role: .primaryWeights, relativePath: "ggml-large-v2.bin", sizeBytes: 1)],
             source: .curated
         )
         let installedLargeTurbo = InstalledSpeechModel(
@@ -133,8 +138,8 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
 
         let best = SpeechModelPickerLabelPolicy.bestInstalledCuratedModel(
             forPhysicalMemoryBytes: 48 * 1_073_741_824,
-            installedModels: [installedMedium, installedLargeTurbo],
-            curatedModels: [medium, largeTurbo]
+            installedModels: [installedLargeV2, installedLargeTurbo],
+            curatedModels: [largeV2, largeTurbo]
         )
 
         XCTAssertEqual(best?.id, "large-v3-turbo")

@@ -132,9 +132,10 @@ final class CarbocationLocalSpeechTests: XCTestCase {
     func testCuratedCatalogEntriesHaveDownloadURLs() throws {
         XCTAssertEqual(
             CuratedSpeechModelCatalog.all.map(\.id),
-            ["tiny.en", "small.en", "medium.en", "distil-large-v3", "large-v2", "large-v3-turbo"]
+            ["tiny.en", "small.en", "distil-large-v3", "large-v2", "large-v3-turbo"]
         )
         XCTAssertNil(CuratedSpeechModelCatalog.entry(id: "base.en"))
+        XCTAssertNil(CuratedSpeechModelCatalog.entry(id: "medium.en"))
 
         for model in CuratedSpeechModelCatalog.all {
             let url = try XCTUnwrap(model.downloadURL, "\(model.id) should have a download URL")
@@ -148,6 +149,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(small.displayName, "Whisper small.en (English-only)")
         XCTAssertEqual(small.hfFilename, "ggml-small.en.bin")
         XCTAssertEqual(small.languageScope, .englishOnly)
+        XCTAssertEqual(small.recommendation, .bestLiveEnglish)
         XCTAssertEqual(
             small.downloadURL?.absoluteString,
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
@@ -157,6 +159,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(distil.hfRepo, "distil-whisper/distil-large-v3-ggml")
         XCTAssertEqual(distil.hfFilename, "ggml-distil-large-v3.bin")
         XCTAssertEqual(distil.languageScope, .englishOnly)
+        XCTAssertEqual(distil.recommendation, .bestFileEnglish)
         XCTAssertEqual(
             distil.downloadURL?.absoluteString,
             "https://huggingface.co/distil-whisper/distil-large-v3-ggml/resolve/main/ggml-distil-large-v3.bin"
@@ -166,32 +169,12 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(largeV2.displayName, "Whisper large-v2 (multilingual)")
         XCTAssertEqual(largeV2.hfFilename, "ggml-large-v2.bin")
         XCTAssertEqual(largeV2.languageScope, .multilingual)
+        XCTAssertEqual(largeV2.recommendation, .bestFileMultilingual)
 
         let turbo = try XCTUnwrap(CuratedSpeechModelCatalog.entry(id: "large-v3-turbo"))
         XCTAssertEqual(turbo.displayName, "Whisper large-v3 turbo (multilingual)")
         XCTAssertEqual(turbo.languageScope, .multilingual)
-        XCTAssertTrue(turbo.isBetterRecommendation(than: largeV2))
-        XCTAssertTrue(turbo.isBetterRecommendation(than: distil))
-
-        let unrankedLarger = CuratedSpeechModel(
-            id: "larger",
-            displayName: "Larger",
-            subtitle: "",
-            variant: "larger",
-            languageScope: .unknown,
-            approxSizeBytes: 2,
-            recommendedRAMGB: 4
-        )
-        let unrankedSmaller = CuratedSpeechModel(
-            id: "smaller",
-            displayName: "Smaller",
-            subtitle: "",
-            variant: "smaller",
-            languageScope: .unknown,
-            approxSizeBytes: 1,
-            recommendedRAMGB: 4
-        )
-        XCTAssertTrue(unrankedLarger.isBetterRecommendation(than: unrankedSmaller))
+        XCTAssertEqual(turbo.recommendation, .bestLiveMultilingual)
 
         let vad = CuratedSpeechModelCatalog.recommendedVADModel
         XCTAssertEqual(vad.hfRepo, "ggml-org/whisper-vad")
@@ -202,12 +185,20 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         )
     }
 
-    func testRecommendedCuratedModelUsesCatalogPriority() throws {
-        let recommended = CuratedSpeechModelCatalog.recommendedModel(
-            forPhysicalMemoryBytes: 48 * 1_073_741_824
-        )
+    func testRecommendedCuratedModelsUseManualCatalogRoles() throws {
+        let recommended = CuratedSpeechModelCatalog.recommendedModels()
 
-        XCTAssertEqual(recommended?.id, "large-v3-turbo")
+        XCTAssertEqual(recommended.map(\.id), ["small.en", "large-v3-turbo", "distil-large-v3", "large-v2"])
+        XCTAssertEqual(CuratedSpeechModelCatalog.bestLiveEnglishModel()?.id, "small.en")
+        XCTAssertEqual(CuratedSpeechModelCatalog.bestLiveMultilingualModel()?.id, "large-v3-turbo")
+        XCTAssertEqual(CuratedSpeechModelCatalog.bestFileEnglishModel()?.id, "distil-large-v3")
+        XCTAssertEqual(CuratedSpeechModelCatalog.bestFileMultilingualModel()?.id, "large-v2")
+        XCTAssertEqual(CuratedSpeechModelCatalog.bestEnglishModel()?.id, "small.en")
+        XCTAssertEqual(CuratedSpeechModelCatalog.bestMultilingualModel()?.id, "large-v3-turbo")
+        XCTAssertEqual(
+            CuratedSpeechModelCatalog.recommendedModel(forPhysicalMemoryBytes: 1)?.id,
+            "small.en"
+        )
     }
 
     func testInstalledSpeechModelInfersDistilLargeV3AsEnglishOnly() {
