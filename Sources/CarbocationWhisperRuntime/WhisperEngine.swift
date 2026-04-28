@@ -226,9 +226,14 @@ struct WhisperStreamingOptionsResolver {
 
 private struct WhisperRunResult {
     var transcript: Transcript
+    var alignmentWords: [SpeechChunkStreamingPipeline.StreamingAlignmentWord]
 
-    init(transcript: Transcript) {
+    init(
+        transcript: Transcript,
+        alignmentWords: [SpeechChunkStreamingPipeline.StreamingAlignmentWord] = []
+    ) {
         self.transcript = transcript
+        self.alignmentWords = alignmentWords
     }
 }
 
@@ -384,7 +389,9 @@ public actor WhisperEngine: CarbocationLocalSpeech.SpeechTranscriber {
     private func transcribePreparedAudio(
         _ audio: PreparedAudio,
         options: TranscriptionOptions,
-        streamingContext: WhisperStreamingRunContext?
+        streamingContext: WhisperStreamingRunContext?,
+        publicTimestampMode: TimestampMode? = nil,
+        includeAlignmentWords: Bool = false
     ) throws -> WhisperRunResult {
         guard let loadedInfo else {
             throw WhisperEngineError.noModelLoaded
@@ -432,7 +439,9 @@ public actor WhisperEngine: CarbocationLocalSpeech.SpeechTranscriber {
             options: options,
             backend: loadedInfo.backend,
             vadModelPath: loadedInfo.vadModelPath,
-            streamingContext: streamingContext
+            streamingContext: streamingContext,
+            publicTimestampMode: publicTimestampMode,
+            includeAlignmentWords: includeAlignmentWords
         )
 #else
         _ = streamingContext
@@ -496,7 +505,7 @@ public actor WhisperEngine: CarbocationLocalSpeech.SpeechTranscriber {
                     audio: audio,
                     backend: loadedInfo.backend,
                     options: resolvedOptions,
-                    transcribeTimed: { emitted, transcriptionOptions in
+                    transcribeTimedResult: { emitted, transcriptionOptions in
                         let context = WhisperStreamingRunContext(
                             chunkStartTime: emitted.startTime,
                             chunkDuration: emitted.audio.duration,
@@ -508,10 +517,21 @@ public actor WhisperEngine: CarbocationLocalSpeech.SpeechTranscriber {
                                 continuation.yield(event)
                             }
                         )
-                        return try await engine.transcribeStreamingChunk(
+                        let publicTimestampMode = transcriptionOptions.timestampMode
+                        var chunkOptions = transcriptionOptions
+                        let needsAlignmentWords: Bool
+                        if case .contextualRollingBuffer = resolvedOptions.emulation.window {
+                            chunkOptions.timestampMode = .words
+                            needsAlignmentWords = true
+                        } else {
+                            needsAlignmentWords = false
+                        }
+                        return try await engine.transcribeStreamingChunkResult(
                             emitted.audio,
-                            options: transcriptionOptions,
-                            context: context
+                            options: chunkOptions,
+                            context: context,
+                            publicTimestampMode: publicTimestampMode,
+                            includeAlignmentWords: needsAlignmentWords
                         )
                     },
                     voiceActivityDetector: outerVAD.detector,
@@ -661,18 +681,30 @@ public actor WhisperEngine: CarbocationLocalSpeech.SpeechTranscriber {
         return diagnostics
     }
 
-    private func transcribeStreamingChunk(
+    private func transcribeStreamingChunkResult(
         _ audio: PreparedAudio,
         options: TranscriptionOptions,
-        context: WhisperStreamingRunContext
-    ) throws -> Transcript {
+        context: WhisperStreamingRunContext,
+        publicTimestampMode: TimestampMode,
+        includeAlignmentWords: Bool
+    ) throws -> SpeechChunkStreamingPipeline.StreamingChunkTranscriptionResult {
         try Task.checkCancellation()
         context.eventSink(.diagnostic(TranscriptionDiagnostic(
             source: "whisper.streaming",
             message: "chunk duration=\(audio.duration.formattedWhisperDebug)s audio_ctx=\(context.tuning.audioContext) max_tokens=\(context.tuning.maxTokens) single_segment=\(context.tuning.singleSegment) decoder_context=\(context.keepsDecoderContext)",
             time: context.chunkStartTime
         )))
-        return try transcribePreparedAudio(audio, options: options, streamingContext: context).transcript
+        let result = try transcribePreparedAudio(
+            audio,
+            options: options,
+            streamingContext: context,
+            publicTimestampMode: publicTimestampMode,
+            includeAlignmentWords: includeAlignmentWords
+        )
+        return SpeechChunkStreamingPipeline.StreamingChunkTranscriptionResult(
+            transcript: result.transcript,
+            alignmentWords: result.alignmentWords
+        )
     }
 }
 
@@ -862,6 +894,96 @@ private let whisperStreamingEncoderBeginCallback: whisper_encoder_begin_callback
     return !state.isCancelled
 }
 
+struct WhisperDecodedTokenPiece: Hashable, Sendable {
+    var text: String
+    var startTime: TimeInterval
+    var endTime: TimeInterval
+    var confidence: Double
+}
+
+enum WhisperTokenWordGrouping {
+    static func transcriptWords(from tokens: [WhisperDecodedTokenPiece]) -> [TranscriptWord] {
+        var grouped: [TranscriptWord] = []
+        var currentText = ""
+        var currentStartTime: TimeInterval?
+        var currentEndTime: TimeInterval?
+        var currentConfidenceTotal = 0.0
+        var currentConfidenceCount = 0
+
+        func flushCurrent() {
+            let text = collapsedWhitespace(currentText)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            defer {
+                currentText = ""
+                currentStartTime = nil
+                currentEndTime = nil
+                currentConfidenceTotal = 0
+                currentConfidenceCount = 0
+            }
+            guard !text.isEmpty,
+                  let startTime = currentStartTime,
+                  let endTime = currentEndTime else {
+                return
+            }
+
+            let confidence: Double? = currentConfidenceCount > 0
+                ? currentConfidenceTotal / Double(currentConfidenceCount)
+                : nil
+            grouped.append(TranscriptWord(
+                text: text,
+                startTime: startTime,
+                endTime: max(startTime, endTime),
+                confidence: confidence
+            ))
+        }
+
+        for token in tokens {
+            let tokenText = token.text
+            let visibleText = tokenText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !visibleText.isEmpty else { continue }
+
+            if startsWithWhitespace(tokenText), !currentText.isEmpty {
+                flushCurrent()
+            }
+
+            if currentText.isEmpty {
+                currentStartTime = token.startTime
+            }
+            currentText += visibleText
+            currentEndTime = token.endTime
+            currentConfidenceTotal += token.confidence
+            currentConfidenceCount += 1
+        }
+
+        flushCurrent()
+        return grouped
+    }
+
+    private static func startsWithWhitespace(_ text: String) -> Bool {
+        guard let first = text.unicodeScalars.first else { return false }
+        return CharacterSet.whitespacesAndNewlines.contains(first)
+    }
+
+    private static func collapsedWhitespace(_ text: String) -> String {
+        var result = ""
+        var lastWasWhitespace = false
+
+        for scalar in text.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                if !lastWasWhitespace {
+                    result.append(" ")
+                    lastWasWhitespace = true
+                }
+            } else {
+                result.unicodeScalars.append(scalar)
+                lastWasWhitespace = false
+            }
+        }
+
+        return result
+    }
+}
+
 private extension WhisperEngine {
     func ensureContext(for loadedInfo: WhisperLoadedModelInfo) throws -> OpaquePointer {
         if let context, contextModelPath == loadedInfo.modelPath {
@@ -926,7 +1048,9 @@ private extension WhisperEngine {
         options: TranscriptionOptions,
         backend: SpeechBackendDescriptor,
         vadModelPath: String?,
-        streamingContext: WhisperStreamingRunContext?
+        streamingContext: WhisperStreamingRunContext?,
+        publicTimestampMode: TimestampMode? = nil,
+        includeAlignmentWords: Bool = false
     ) throws -> WhisperRunResult {
         let language = normalizedLanguage(options.language ?? loadedConfiguration?.language)
         let prompt = normalizedPrompt(options)
@@ -1001,20 +1125,28 @@ private extension WhisperEngine {
                         throw WhisperEngineError.transcriptionFailed(result)
                     }
 
+                    let publicMode = publicTimestampMode ?? options.timestampMode
                     let decodedSegments = transcriptSegments(
                         context: context,
-                        includeWords: options.timestampMode == .words
+                        includeWords: publicMode == .words
+                    )
+                    let alignmentWords = includeAlignmentWords
+                        ? transcriptAlignmentWords(context: context)
+                        : []
+                    let normalizedSegments = normalizedSegmentTimestamps(
+                        decodedSegments,
+                        fallbackDuration: params.no_timestamps ? audio.duration : nil
                     )
                     let transcript = Transcript(
-                        segments: normalizedSegmentTimestamps(
-                            decodedSegments,
-                            fallbackDuration: params.no_timestamps ? audio.duration : nil
-                        ),
+                        segments: normalizedSegments,
                         language: detectedLanguage(context: context),
                         duration: audio.duration,
                         backend: backend
                     )
-                    return WhisperRunResult(transcript: transcript)
+                    return WhisperRunResult(
+                        transcript: transcript,
+                        alignmentWords: alignmentWords
+                    )
                 }
             }
         }
@@ -1080,7 +1212,7 @@ private extension WhisperEngine {
 
         for index in 0..<count {
             let textPointer = whisper_full_get_segment_text(context, Int32(index))
-            let text = textPointer.map { String(cString: $0) } ?? ""
+            let text = sanitizedWhisperSegmentText(textPointer.map { String(cString: $0) } ?? "")
             let startTime = whisperTimeToSeconds(whisper_full_get_segment_t0(context, Int32(index)))
             let endTime = whisperTimeToSeconds(whisper_full_get_segment_t1(context, Int32(index)))
             let words = includeWords ? transcriptWords(context: context, segmentIndex: index) : []
@@ -1101,25 +1233,43 @@ private extension WhisperEngine {
 
     func transcriptWords(context: OpaquePointer, segmentIndex: Int) -> [TranscriptWord] {
         let count = max(0, Int(whisper_full_n_tokens(context, Int32(segmentIndex))))
-        var words: [TranscriptWord] = []
-        words.reserveCapacity(count)
+        var tokens: [WhisperDecodedTokenPiece] = []
+        tokens.reserveCapacity(count)
 
         for tokenIndex in 0..<count {
             let data = whisper_full_get_token_data(context, Int32(segmentIndex), Int32(tokenIndex))
+            guard data.id < whisper_token_eot(context) else { continue }
             guard data.t0 >= 0, data.t1 >= data.t0 else { continue }
 
             let textPointer = whisper_full_get_token_text(context, Int32(segmentIndex), Int32(tokenIndex))
             let text = textPointer.map { String(cString: $0) } ?? ""
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            guard !isWhisperSpecialTokenText(text) else { continue }
 
-            words.append(
-                TranscriptWord(
-                    text: text,
-                    startTime: whisperTimeToSeconds(data.t0),
-                    endTime: whisperTimeToSeconds(data.t1),
-                    confidence: Double(data.p)
+            tokens.append(WhisperDecodedTokenPiece(
+                text: text,
+                startTime: whisperTimeToSeconds(data.t0),
+                endTime: whisperTimeToSeconds(data.t1),
+                confidence: Double(data.p)
+            ))
+        }
+
+        return WhisperTokenWordGrouping.transcriptWords(from: tokens)
+    }
+
+    func transcriptAlignmentWords(context: OpaquePointer) -> [SpeechChunkStreamingPipeline.StreamingAlignmentWord] {
+        let segmentCount = max(0, Int(whisper_full_n_segments(context)))
+        var words: [SpeechChunkStreamingPipeline.StreamingAlignmentWord] = []
+
+        for segmentIndex in 0..<segmentCount {
+            words.append(contentsOf: transcriptWords(context: context, segmentIndex: segmentIndex).map { word in
+                SpeechChunkStreamingPipeline.StreamingAlignmentWord(
+                    text: word.text,
+                    startTime: word.startTime,
+                    endTime: word.endTime,
+                    confidence: word.confidence
                 )
-            )
+            })
         }
 
         return words
@@ -1130,10 +1280,61 @@ private extension WhisperEngine {
         guard count > 0 else { return nil }
 
         var total: Float = 0
+        var includedCount = 0
         for tokenIndex in 0..<count {
+            let tokenID = whisper_full_get_token_id(context, Int32(segmentIndex), Int32(tokenIndex))
+            guard tokenID < whisper_token_eot(context) else { continue }
             total += whisper_full_get_token_p(context, Int32(segmentIndex), Int32(tokenIndex))
+            includedCount += 1
         }
-        return Double(total / Float(count))
+        guard includedCount > 0 else { return nil }
+        return Double(total / Float(includedCount))
+    }
+
+    func sanitizedWhisperSegmentText(_ text: String) -> String {
+        var result = ""
+        var index = text.startIndex
+        var removedMarker = false
+
+        while index < text.endIndex {
+            if text[index] == "[",
+               text[index...].hasPrefix("[_"),
+               let markerEnd = text[index...].firstIndex(of: "]") {
+                removedMarker = true
+                index = text.index(after: markerEnd)
+                continue
+            }
+
+            result.append(text[index])
+            index = text.index(after: index)
+        }
+
+        guard removedMarker else { return text }
+        return collapsedWhisperWhitespace(result).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func isWhisperSpecialTokenText(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("[_") && trimmed.hasSuffix("]")
+    }
+
+    func collapsedWhisperWhitespace(_ text: String) -> String {
+        var result = ""
+        var lastWasWhitespace = false
+
+        for scalar in text.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                if !lastWasWhitespace {
+                    result.append(" ")
+                    lastWasWhitespace = true
+                }
+            } else {
+                result.unicodeScalars.append(scalar)
+                lastWasWhitespace = false
+            }
+        }
+
+        return result
     }
 
     func detectedLanguage(context: OpaquePointer) -> SpeechLanguage? {

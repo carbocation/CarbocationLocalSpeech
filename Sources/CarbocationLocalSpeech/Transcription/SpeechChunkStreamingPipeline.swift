@@ -3,6 +3,39 @@ import Foundation
 @_spi(Internal) public enum SpeechChunkStreamingPipeline {
     public typealias ChunkTranscription = @Sendable (PreparedAudio, TranscriptionOptions) async throws -> Transcript
     @_spi(Internal) public typealias TimedChunkTranscription = @Sendable (SpeechAudioChunk, TranscriptionOptions) async throws -> Transcript
+    @_spi(Internal) public typealias TimedChunkTranscriptionResult = @Sendable (SpeechAudioChunk, TranscriptionOptions) async throws -> StreamingChunkTranscriptionResult
+
+    @_spi(Internal) public struct StreamingAlignmentWord: Hashable, Sendable {
+        public var text: String
+        public var startTime: TimeInterval
+        public var endTime: TimeInterval
+        public var confidence: Double?
+
+        public init(
+            text: String,
+            startTime: TimeInterval,
+            endTime: TimeInterval,
+            confidence: Double? = nil
+        ) {
+            self.text = text
+            self.startTime = startTime
+            self.endTime = endTime
+            self.confidence = confidence
+        }
+    }
+
+    @_spi(Internal) public struct StreamingChunkTranscriptionResult: Hashable, Sendable {
+        public var transcript: Transcript
+        public var alignmentWords: [StreamingAlignmentWord]
+
+        public init(
+            transcript: Transcript,
+            alignmentWords: [StreamingAlignmentWord] = []
+        ) {
+            self.transcript = transcript
+            self.alignmentWords = alignmentWords
+        }
+    }
 
     public static func stream(
         audio: AsyncThrowingStream<AudioChunk, Error>,
@@ -14,8 +47,10 @@ import Foundation
             audio: audio,
             backend: backend,
             options: options,
-            transcribeTimed: { chunk, options in
-                try await transcribe(chunk.audio, options)
+            transcribeTimedResult: { chunk, options in
+                StreamingChunkTranscriptionResult(
+                    transcript: try await transcribe(chunk.audio, options)
+                )
             },
             voiceActivityDetector: nil,
             startupDiagnostics: []
@@ -27,6 +62,28 @@ import Foundation
         backend: SpeechBackendDescriptor,
         options: StreamingTranscriptionOptions,
         transcribeTimed transcribe: @escaping TimedChunkTranscription,
+        voiceActivityDetector injectedVoiceActivityDetector: VoiceActivityDetecting? = nil,
+        startupDiagnostics: [TranscriptionDiagnostic] = []
+    ) -> AsyncThrowingStream<TranscriptEvent, Error> {
+        stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { chunk, options in
+                StreamingChunkTranscriptionResult(
+                    transcript: try await transcribe(chunk, options)
+                )
+            },
+            voiceActivityDetector: injectedVoiceActivityDetector,
+            startupDiagnostics: startupDiagnostics
+        )
+    }
+
+    @_spi(Internal) public static func stream(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
+        transcribeTimedResult transcribe: @escaping TimedChunkTranscriptionResult,
         voiceActivityDetector injectedVoiceActivityDetector: VoiceActivityDetecting? = nil,
         startupDiagnostics: [TranscriptionDiagnostic] = []
     ) -> AsyncThrowingStream<TranscriptEvent, Error> {
@@ -222,7 +279,7 @@ import Foundation
         audio: AsyncThrowingStream<AudioChunk, Error>,
         backend: SpeechBackendDescriptor,
         options: StreamingTranscriptionOptions,
-        transcribe: @escaping TimedChunkTranscription,
+        transcribe: @escaping TimedChunkTranscriptionResult,
         detector: VoiceActivityDetecting?,
         maximumBufferDuration: TimeInterval,
         updateInterval: TimeInterval,
@@ -230,12 +287,14 @@ import Foundation
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) async throws {
         let queue = CoalescingTranscriptionQueue()
+        let committedFrontier = ContextualCommittedFrontier()
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 try await produceContextualRollingChunks(
                     audio: audio,
                     queue: queue,
+                    committedFrontier: committedFrontier,
                     detector: detector,
                     usesNoVAD: options.transcription.voiceActivityDetection.mode == .disabled,
                     maximumBufferDuration: maximumBufferDuration,
@@ -251,6 +310,7 @@ import Foundation
                     backend: backend,
                     options: options,
                     transcribe: transcribe,
+                    committedFrontier: committedFrontier,
                     continuation: continuation
                 )
             }
@@ -268,6 +328,7 @@ import Foundation
     private static func produceContextualRollingChunks(
         audio: AsyncThrowingStream<AudioChunk, Error>,
         queue: CoalescingTranscriptionQueue,
+        committedFrontier: ContextualCommittedFrontier,
         detector: VoiceActivityDetecting?,
         usesNoVAD: Bool,
         maximumBufferDuration: TimeInterval,
@@ -321,6 +382,14 @@ import Foundation
                     )))
                     await queue.enqueueFlushPending(time: silenceFlushTime)
                 }
+                if let committedEndTime = await committedFrontier.endTime(),
+                   let trimmedDuration = window.trimCommittedAudio(before: committedEndTime) {
+                    continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                        source: "streaming.pipeline",
+                        message: "buffer_trim=\(trimmedDuration.formattedStreamingDebug)s",
+                        time: committedEndTime
+                    )))
+                }
             }
 
             for emitted in window.finish() {
@@ -343,62 +412,75 @@ import Foundation
         queue: CoalescingTranscriptionQueue,
         backend: SpeechBackendDescriptor,
         options: StreamingTranscriptionOptions,
-        transcribe: @escaping TimedChunkTranscription,
+        transcribe: @escaping TimedChunkTranscriptionResult,
+        committedFrontier: ContextualCommittedFrontier,
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) async throws {
         var committedSegments: [TranscriptSegment] = []
-        var agreementState = LocalAgreementState(
+        var textAgreementState = LocalAgreementState(
             policy: resolvedCommitmentPolicy(options),
             fallbackPolicy: localAgreementFallbackPolicy(for: options)
         )
+        var wordAlignmentState = ContextualWordAlignmentState(policy: resolvedCommitmentPolicy(options))
 
         while let work = try await queue.next() {
             try Task.checkCancellation()
             switch work {
             case .transcribe(let emitted):
-                try await process(
+                try await processContextual(
                     emitted,
                     backend: backend,
                     options: options,
                     transcribe: transcribe,
                     committedSegments: &committedSegments,
-                    agreementState: &agreementState,
+                    textAgreementState: &textAgreementState,
+                    wordAlignmentState: &wordAlignmentState,
                     continuation: continuation
                 )
             case .transcribeAndFlush(let emitted, _):
-                try await process(
+                try await processContextual(
                     emitted,
                     backend: backend,
                     options: options,
                     transcribe: transcribe,
                     committedSegments: &committedSegments,
-                    agreementState: &agreementState,
+                    textAgreementState: &textAgreementState,
+                    wordAlignmentState: &wordAlignmentState,
                     continuation: continuation
                 )
-                flushPendingLocalAgreementIfNeeded(
+                flushPendingContextualAgreementIfNeeded(
                     backend: backend,
                     options: options,
                     committedSegments: &committedSegments,
-                    agreementState: &agreementState,
+                    textAgreementState: &textAgreementState,
+                    wordAlignmentState: &wordAlignmentState,
                     continuation: continuation
                 )
             case .flushPending:
-                flushPendingLocalAgreementIfNeeded(
+                flushPendingContextualAgreementIfNeeded(
                     backend: backend,
                     options: options,
                     committedSegments: &committedSegments,
-                    agreementState: &agreementState,
+                    textAgreementState: &textAgreementState,
+                    wordAlignmentState: &wordAlignmentState,
                     continuation: continuation
                 )
             }
+            await committedFrontier.update(
+                wordAlignmentState.lastCommittedEndTime ?? committedSegments.last?.endTime
+            )
         }
 
-        flushPendingLocalAgreementIfNeeded(
+        flushPendingContextualAgreementIfNeeded(
             backend: backend,
             options: options,
             committedSegments: &committedSegments,
-            agreementState: &agreementState,
+            textAgreementState: &textAgreementState,
+            wordAlignmentState: &wordAlignmentState,
             continuation: continuation
+        )
+        await committedFrontier.update(
+            wordAlignmentState.lastCommittedEndTime ?? committedSegments.last?.endTime
         )
         continuation.yield(.completed(Transcript(
             segments: committedSegments,
@@ -439,7 +521,7 @@ import Foundation
         _ emitted: SpeechAudioChunk,
         backend: SpeechBackendDescriptor,
         options: StreamingTranscriptionOptions,
-        transcribe: TimedChunkTranscription,
+        transcribe: TimedChunkTranscriptionResult,
         committedSegments: inout [TranscriptSegment],
         agreementState: inout LocalAgreementState,
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
@@ -452,7 +534,8 @@ import Foundation
             streamingOptions: options,
             committedSegments: committedSegments
         )
-        let transcript = try await transcribe(emitted, transcriptionOptions)
+        let result = try await transcribe(emitted, transcriptionOptions)
+        let transcript = result.transcript
         let processingDuration = Date().timeIntervalSince(startedAt)
         let segments = transcript.segments
             .map { offset($0, by: emitted.startTime) }
@@ -558,6 +641,203 @@ import Foundation
                     continuation: continuation
                 )
             }
+        }
+    }
+
+    private static func processContextual(
+        _ emitted: SpeechAudioChunk,
+        backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
+        transcribe: TimedChunkTranscriptionResult,
+        committedSegments: inout [TranscriptSegment],
+        textAgreementState: inout LocalAgreementState,
+        wordAlignmentState: inout ContextualWordAlignmentState,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) async throws {
+        guard case .localAgreement = resolvedCommitmentPolicy(options) else {
+            try await process(
+                emitted,
+                backend: backend,
+                options: options,
+                transcribe: transcribe,
+                committedSegments: &committedSegments,
+                agreementState: &textAgreementState,
+                continuation: continuation
+            )
+            return
+        }
+
+        try Task.checkCancellation()
+
+        let startedAt = Date()
+        let transcriptionOptions = stableContextTranscriptionOptions(
+            from: options.transcription,
+            streamingOptions: options,
+            committedSegments: committedSegments
+        )
+        let result = try await transcribe(emitted, transcriptionOptions)
+        let transcript = result.transcript
+        let processingDuration = Date().timeIntervalSince(startedAt)
+        let segments = transcript.segments
+            .map { offset($0, by: emitted.startTime) }
+            .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let alignmentWords = result.alignmentWords
+            .map { offset($0, by: emitted.startTime) }
+
+        continuation.yield(.progress(TranscriptionProgress(
+            processedDuration: emitted.startTime + emitted.audio.duration
+        )))
+        continuation.yield(.stats(TranscriptionStats(
+            audioDuration: emitted.audio.duration,
+            processingDuration: processingDuration,
+            realTimeFactor: emitted.audio.duration > 0 ? processingDuration / emitted.audio.duration : nil,
+            segmentCount: segments.count
+        )))
+
+        guard !segments.isEmpty else {
+            return
+        }
+
+        let rawHypothesisText = segments.map(\.text).joined(separator: " ")
+        if let staleReplay = staleReplayRejection(
+            rawHypothesisText: rawHypothesisText,
+            emitted: emitted,
+            options: options,
+            committedSegments: committedSegments
+        ) {
+            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                source: "streaming.pipeline",
+                message: staleReplay,
+                time: emitted.startTime
+            )))
+            return
+        }
+
+        if rejectsPathologicalRepetition(for: options),
+           containsPathologicalRepetition(rawHypothesisText) {
+            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                source: "streaming.pipeline",
+                message: "hypothesis_rejected=repetition",
+                time: emitted.startTime
+            )))
+            return
+        }
+
+        let words = contextualAlignmentWords(from: alignmentWords)
+        guard !words.isEmpty else {
+            if wordAlignmentState.shouldEmitTextFallbackDiagnostic() {
+                continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                    source: "streaming.pipeline",
+                    message: "alignment=text-fallback",
+                    time: emitted.startTime
+                )))
+            }
+            processContextualTextAgreement(
+                segments,
+                emitted: emitted,
+                backend: backend,
+                options: options,
+                committedSegments: &committedSegments,
+                agreementState: &textAgreementState,
+                continuation: continuation
+            )
+            return
+        }
+
+        if wordAlignmentState.shouldEmitWordsDiagnostic() {
+            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                source: "streaming.pipeline",
+                message: "alignment=words",
+                time: emitted.startTime
+            )))
+        }
+
+        let update = wordAlignmentState.accept(words: words, isFinal: emitted.isFinal)
+        if !update.committedWords.isEmpty {
+            commitContextualWords(
+                update.committedWords,
+                backend: backend,
+                options: options,
+                committedSegments: &committedSegments,
+                continuation: continuation
+            )
+        }
+
+        emitContextualAlignmentDiagnostics(
+            update,
+            state: wordAlignmentState,
+            time: emitted.startTime,
+            continuation: continuation
+        )
+
+        if emitted.isFinal {
+            if update.committedWords.isEmpty {
+                continuation.yield(.snapshot(StreamingTranscriptSnapshot(
+                    stable: Transcript(segments: committedSegments, backend: backend)
+                )))
+            }
+            return
+        }
+
+        guard !update.volatileWords.isEmpty else {
+            if update.committedWords.isEmpty {
+                continuation.yield(.snapshot(StreamingTranscriptSnapshot(
+                    stable: Transcript(segments: committedSegments, backend: backend)
+                )))
+            }
+            return
+        }
+
+        publishContextualPartial(
+            update.volatileWords,
+            backend: backend,
+            options: options,
+            committedSegments: committedSegments,
+            continuation: continuation
+        )
+    }
+
+    private static func processContextualTextAgreement(
+        _ segments: [TranscriptSegment],
+        emitted: SpeechAudioChunk,
+        backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
+        committedSegments: inout [TranscriptSegment],
+        agreementState: inout LocalAgreementState,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) {
+        let candidateSegments = candidateSegments(
+            from: segments,
+            options: options,
+            committedSegments: committedSegments
+        )
+
+        guard !candidateSegments.isEmpty else {
+            return
+        }
+
+        if emitted.isFinal {
+            let didCommitFinal = commitFinalLocalAgreement(
+                candidateSegments,
+                backend: backend,
+                options: options,
+                committedSegments: &committedSegments,
+                agreementState: &agreementState,
+                allowsUnconfirmedFinalCommit: localAgreementAllowsUnconfirmedFinalCommit(for: options),
+                continuation: continuation
+            )
+            if didCommitFinal || localAgreementAllowsUnconfirmedFinalCommit(for: options) {
+                agreementState.reset()
+            }
+        } else {
+            processLocalAgreement(
+                candidateSegments,
+                backend: backend,
+                options: options,
+                committedSegments: &committedSegments,
+                agreementState: &agreementState,
+                continuation: continuation
+            )
         }
     }
 
@@ -788,6 +1068,151 @@ import Foundation
             volatile: volatile,
             volatileRange: TranscriptTimeRange(startTime: firstSegment.startTime, endTime: lastSegment.endTime)
         )))
+    }
+
+    private static func commitContextualWords(
+        _ words: [ContextualAlignedWord],
+        backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
+        committedSegments: inout [TranscriptSegment],
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) {
+        guard let segment = contextualSegment(
+            from: words,
+            includeWords: options.transcription.timestampMode == .words
+        ) else {
+            return
+        }
+
+        committedSegments.append(segment)
+        continuation.yield(.snapshot(StreamingTranscriptSnapshot(
+            stable: Transcript(segments: committedSegments, backend: backend)
+        )))
+    }
+
+    private static func publishContextualPartial(
+        _ words: [ContextualAlignedWord],
+        backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
+        committedSegments: [TranscriptSegment],
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) {
+        guard let segment = contextualSegment(
+            from: words,
+            includeWords: options.transcription.timestampMode == .words
+        ) else {
+            return
+        }
+
+        let volatile = Transcript(segments: [segment], backend: backend)
+        continuation.yield(.snapshot(StreamingTranscriptSnapshot(
+            stable: Transcript(segments: committedSegments, backend: backend),
+            volatile: volatile,
+            volatileRange: TranscriptTimeRange(startTime: segment.startTime, endTime: segment.endTime)
+        )))
+    }
+
+    private static func contextualSegment(
+        from words: [ContextualAlignedWord],
+        includeWords: Bool
+    ) -> TranscriptSegment? {
+        guard let firstWord = words.first,
+              let lastWord = words.last else {
+            return nil
+        }
+
+        let text = joinedWordText(words.map(\.text))
+        guard !text.isEmpty else { return nil }
+
+        return TranscriptSegment(
+            text: text,
+            startTime: firstWord.startTime,
+            endTime: max(firstWord.startTime, lastWord.endTime),
+            words: includeWords ? words.map { word in
+                TranscriptWord(
+                    text: word.text,
+                    startTime: word.startTime,
+                    endTime: word.endTime,
+                    confidence: word.word.confidence
+                )
+            } : []
+        )
+    }
+
+    private static func flushPendingContextualAgreementIfNeeded(
+        backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
+        committedSegments: inout [TranscriptSegment],
+        textAgreementState: inout LocalAgreementState,
+        wordAlignmentState: inout ContextualWordAlignmentState,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) {
+        guard case .localAgreement = resolvedCommitmentPolicy(options) else {
+            return
+        }
+
+        if wordAlignmentState.hasSeenWords {
+            let pendingWords = wordAlignmentState.flushPending()
+            guard !pendingWords.isEmpty else { return }
+            commitContextualWords(
+                pendingWords,
+                backend: backend,
+                options: options,
+                committedSegments: &committedSegments,
+                continuation: continuation
+            )
+            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                source: "streaming.pipeline",
+                message: contextualAlignmentDiagnostic(
+                    committedFrontier: wordAlignmentState.lastCommittedEndTime,
+                    wordsCommitted: pendingWords.count,
+                    volatileWords: 0,
+                    frontierDropped: 0
+                ),
+                time: pendingWords.first?.startTime
+            )))
+            return
+        }
+
+        flushPendingLocalAgreementIfNeeded(
+            backend: backend,
+            options: options,
+            committedSegments: &committedSegments,
+            agreementState: &textAgreementState,
+            continuation: continuation
+        )
+    }
+
+    private static func emitContextualAlignmentDiagnostics(
+        _ update: ContextualAlignmentUpdate,
+        state: ContextualWordAlignmentState,
+        time: TimeInterval,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) {
+        continuation.yield(.diagnostic(TranscriptionDiagnostic(
+            source: "streaming.pipeline",
+            message: contextualAlignmentDiagnostic(
+                committedFrontier: state.lastCommittedEndTime,
+                wordsCommitted: update.committedWords.count,
+                volatileWords: update.volatileWords.count,
+                frontierDropped: update.frontierDroppedWordCount
+            ),
+            time: time
+        )))
+    }
+
+    private static func contextualAlignmentDiagnostic(
+        committedFrontier: TimeInterval?,
+        wordsCommitted: Int,
+        volatileWords: Int,
+        frontierDropped: Int
+    ) -> String {
+        [
+            "committed_frontier=\((committedFrontier ?? 0).formattedStreamingDebug)s",
+            "words_committed=\(wordsCommitted)",
+            "volatile_words=\(volatileWords)",
+            "frontier_drop=\(frontierDropped)"
+        ].joined(separator: " ")
     }
 
     private static func removeCommittedPrefixForWindow(
@@ -1146,10 +1571,421 @@ import Foundation
         return false
     }
 
+    private static func contextualAlignmentWords(from words: [StreamingAlignmentWord]) -> [ContextualAlignedWord] {
+        guard !words.isEmpty else { return [] }
+        return words.compactMap { word in
+            let text = word.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !isWhisperSpecialTokenText(text) else { return nil }
+            let units = alignmentUnits(in: text)
+            guard !text.isEmpty, !units.isEmpty, word.endTime >= word.startTime else {
+                return nil
+            }
+            return ContextualAlignedWord(
+                word: StreamingAlignmentWord(
+                    text: text,
+                    startTime: word.startTime,
+                    endTime: word.endTime,
+                    confidence: word.confidence
+                ),
+                normalizedUnits: units
+            )
+        }
+    }
+
+    private static func joinedWordText(_ words: [String]) -> String {
+        var result = ""
+        for rawWord in words {
+            let word = rawWord.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !word.isEmpty else { continue }
+
+            if result.isEmpty {
+                result = word
+            } else if shouldAttachWithoutLeadingSpace(word) {
+                result += word
+            } else {
+                result += " \(word)"
+            }
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func shouldAttachWithoutLeadingSpace(_ word: String) -> Bool {
+        let lowercased = word.lowercased()
+        if ["'s", "'re", "'m", "'ll", "'ve", "'d", "'t", "n't"].contains(lowercased) {
+            return true
+        }
+
+        guard let first = word.unicodeScalars.first else { return false }
+        return CharacterSet.punctuationCharacters.contains(first)
+            && first != "'"
+            && first != "\""
+            && first != "("
+            && first != "["
+            && first != "{"
+    }
+
+    private static func isWhisperSpecialTokenText(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("[_") && trimmed.hasSuffix("]")
+    }
+
+    private static func alignmentUnits(in text: String) -> [String] {
+        tokens(in: text).flatMap { token in
+            compoundTokenUnits(for: token.normalized) ?? [token.normalized]
+        }
+    }
+
+    private static func compoundTokenUnits(for token: String) -> [String]? {
+        switch token {
+        case "backend":
+            return ["back", "end"]
+        case "frontend":
+            return ["front", "end"]
+        default:
+            return nil
+        }
+    }
+
     private enum LocalAgreementFallbackPolicy {
         case none
         case shiftedWindowPrefix
         case shiftedWindowOrPreviousHypothesis
+    }
+
+    private struct ContextualWordAlignmentState {
+        private let requiredIterations: Int
+        private var previousUnconfirmedWords: [ContextualAlignedWord] = []
+        private var hypotheses: [[ContextualAlignedWord]] = []
+        private(set) var committedWordsInBuffer: [ContextualAlignedWord] = []
+        private(set) var lastCommittedEndTime: TimeInterval?
+        private var emittedWordsDiagnostic = false
+        private var emittedTextFallbackDiagnostic = false
+
+        init(policy: TranscriptCommitmentPolicy) {
+            if case .localAgreement(let iterations) = policy {
+                self.requiredIterations = max(2, iterations)
+            } else {
+                self.requiredIterations = 2
+            }
+        }
+
+        var hasSeenWords: Bool {
+            emittedWordsDiagnostic || !previousUnconfirmedWords.isEmpty || !committedWordsInBuffer.isEmpty
+        }
+
+        mutating func shouldEmitWordsDiagnostic() -> Bool {
+            guard !emittedWordsDiagnostic else { return false }
+            emittedWordsDiagnostic = true
+            return true
+        }
+
+        mutating func shouldEmitTextFallbackDiagnostic() -> Bool {
+            guard !emittedTextFallbackDiagnostic else { return false }
+            emittedTextFallbackDiagnostic = true
+            return true
+        }
+
+        mutating func accept(
+            words: [ContextualAlignedWord],
+            isFinal: Bool
+        ) -> ContextualAlignmentUpdate {
+            let frontierFiltered = wordsAfterCommittedFrontier(words)
+            let candidateWords = frontierFiltered.words
+            guard !candidateWords.isEmpty else {
+                return ContextualAlignmentUpdate(
+                    committedWords: [],
+                    volatileWords: [],
+                    frontierDroppedWordCount: frontierFiltered.droppedCount
+                )
+            }
+
+            if isFinal {
+                return acceptFinal(
+                    candidateWords,
+                    frontierDroppedWordCount: frontierFiltered.droppedCount
+                )
+            }
+
+            hypotheses.append(candidateWords)
+            if hypotheses.count > requiredIterations {
+                hypotheses.removeFirst(hypotheses.count - requiredIterations)
+            }
+
+            guard hypotheses.count >= requiredIterations else {
+                previousUnconfirmedWords = candidateWords
+                return ContextualAlignmentUpdate(
+                    committedWords: [],
+                    volatileWords: candidateWords,
+                    frontierDroppedWordCount: frontierFiltered.droppedCount
+                )
+            }
+
+            let confirmedWordCount = Self.commonPrefixWordCount(in: hypotheses)
+            if confirmedWordCount == 0,
+               let previousHypothesis = hypotheses.dropLast().last {
+                let expiredWords = Self.expiredPrefixBeforeWindowShift(
+                    previous: previousHypothesis,
+                    current: candidateWords
+                )
+                if !expiredWords.isEmpty {
+                    recordCommittedWords(expiredWords)
+                    previousUnconfirmedWords = candidateWords
+                    hypotheses = [candidateWords]
+                    return ContextualAlignmentUpdate(
+                        committedWords: expiredWords,
+                        volatileWords: candidateWords,
+                        frontierDroppedWordCount: frontierFiltered.droppedCount
+                    )
+                }
+            }
+
+            let committedWords = Array(candidateWords.prefix(confirmedWordCount))
+            let volatileWords = Array(candidateWords.dropFirst(confirmedWordCount))
+            recordCommittedWords(committedWords)
+            previousUnconfirmedWords = volatileWords
+            hypotheses = volatileWords.isEmpty ? [] : [volatileWords]
+
+            return ContextualAlignmentUpdate(
+                committedWords: committedWords,
+                volatileWords: volatileWords,
+                frontierDroppedWordCount: frontierFiltered.droppedCount
+            )
+        }
+
+        mutating func flushPending() -> [ContextualAlignedWord] {
+            let pendingWords = previousUnconfirmedWords
+            previousUnconfirmedWords = []
+            hypotheses.removeAll(keepingCapacity: true)
+            recordCommittedWords(pendingWords)
+            return pendingWords
+        }
+
+        private mutating func acceptFinal(
+            _ candidateWords: [ContextualAlignedWord],
+            frontierDroppedWordCount: Int
+        ) -> ContextualAlignmentUpdate {
+            guard !previousUnconfirmedWords.isEmpty else {
+                hypotheses.removeAll(keepingCapacity: true)
+                return ContextualAlignmentUpdate(
+                    committedWords: [],
+                    volatileWords: [],
+                    frontierDroppedWordCount: frontierDroppedWordCount
+                )
+            }
+
+            let confirmedWordCount = Self.commonPrefixWordCount(in: [
+                previousUnconfirmedWords,
+                candidateWords
+            ])
+            let committedWords = Array(candidateWords.prefix(confirmedWordCount))
+            let remainingPreviousWords = Array(previousUnconfirmedWords.dropFirst(confirmedWordCount))
+            recordCommittedWords(committedWords)
+            previousUnconfirmedWords = remainingPreviousWords
+            hypotheses = remainingPreviousWords.isEmpty ? [] : [remainingPreviousWords]
+
+            return ContextualAlignmentUpdate(
+                committedWords: committedWords,
+                volatileWords: [],
+                frontierDroppedWordCount: frontierDroppedWordCount
+            )
+        }
+
+        private func wordsAfterCommittedFrontier(
+            _ words: [ContextualAlignedWord]
+        ) -> (words: [ContextualAlignedWord], droppedCount: Int) {
+            let timeFilteredWords: [ContextualAlignedWord]
+            let timeDroppedCount: Int
+            if let lastCommittedEndTime {
+                let threshold = lastCommittedEndTime - 0.10
+                timeFilteredWords = words.filter { $0.endTime > threshold }
+                timeDroppedCount = words.count - timeFilteredWords.count
+            } else {
+                timeFilteredWords = words
+                timeDroppedCount = 0
+            }
+
+            let committedPrefixWordCount = committedPrefixOverlapWordCount(in: timeFilteredWords)
+            guard committedPrefixWordCount > 0 else {
+                return (timeFilteredWords, timeDroppedCount)
+            }
+
+            return (
+                Array(timeFilteredWords.dropFirst(committedPrefixWordCount)),
+                timeDroppedCount + committedPrefixWordCount
+            )
+        }
+
+        private func committedPrefixOverlapWordCount(in candidateWords: [ContextualAlignedWord]) -> Int {
+            guard !committedWordsInBuffer.isEmpty, !candidateWords.isEmpty else {
+                return 0
+            }
+
+            let maximumSuffixWordCount = min(committedWordsInBuffer.count, 40)
+            for suffixWordCount in stride(from: maximumSuffixWordCount, through: 1, by: -1) {
+                let committedSuffix = Array(committedWordsInBuffer.suffix(suffixWordCount))
+                let matched = Self.matchingPrefixWordCounts(
+                    committedSuffix,
+                    candidateWords
+                )
+                if matched.left == committedSuffix.count {
+                    return matched.right
+                }
+            }
+
+            return 0
+        }
+
+        private mutating func recordCommittedWords(_ words: [ContextualAlignedWord]) {
+            guard !words.isEmpty else { return }
+            committedWordsInBuffer.append(contentsOf: words)
+            if committedWordsInBuffer.count > 240 {
+                committedWordsInBuffer.removeFirst(committedWordsInBuffer.count - 240)
+            }
+            lastCommittedEndTime = max(lastCommittedEndTime ?? 0, words.map(\.endTime).max() ?? 0)
+        }
+
+        private static func commonPrefixWordCount(in hypotheses: [[ContextualAlignedWord]]) -> Int {
+            let nonEmptyHypotheses = hypotheses.filter { !$0.isEmpty }
+            guard nonEmptyHypotheses.count == hypotheses.count,
+                  let latest = hypotheses.last,
+                  !latest.isEmpty else {
+                return 0
+            }
+
+            let flattened = hypotheses.map { flattenedUnits(from: $0) }
+            guard let latestFlattened = flattened.last else { return 0 }
+            let maximumUnitCount = flattened.map(\.count).min() ?? 0
+            guard maximumUnitCount > 0 else { return 0 }
+
+            var bestWordCount = 0
+            for unitIndex in 0..<maximumUnitCount {
+                let unit = latestFlattened[unitIndex].value
+                guard flattened.allSatisfy({ SpeechChunkStreamingPipeline.tokensAreEquivalent($0[unitIndex].value, unit) }) else {
+                    break
+                }
+                if flattened.allSatisfy({ $0[unitIndex].isWordEnd }) {
+                    bestWordCount = latestFlattened[unitIndex].wordIndex + 1
+                }
+            }
+            return bestWordCount
+        }
+
+        private static func matchingPrefixWordCounts(
+            _ lhs: [ContextualAlignedWord],
+            _ rhs: [ContextualAlignedWord]
+        ) -> (left: Int, right: Int) {
+            let leftUnits = flattenedUnits(from: lhs)
+            let rightUnits = flattenedUnits(from: rhs)
+            let maximumUnitCount = min(leftUnits.count, rightUnits.count)
+            guard maximumUnitCount > 0 else { return (0, 0) }
+
+            var best = (left: 0, right: 0)
+            for unitIndex in 0..<maximumUnitCount {
+                guard SpeechChunkStreamingPipeline.tokensAreEquivalent(
+                    leftUnits[unitIndex].value,
+                    rightUnits[unitIndex].value
+                ) else {
+                    break
+                }
+                if leftUnits[unitIndex].isWordEnd, rightUnits[unitIndex].isWordEnd {
+                    best = (
+                        left: leftUnits[unitIndex].wordIndex + 1,
+                        right: rightUnits[unitIndex].wordIndex + 1
+                    )
+                }
+            }
+            return best
+        }
+
+        private static func expiredPrefixBeforeWindowShift(
+            previous: [ContextualAlignedWord],
+            current: [ContextualAlignedWord]
+        ) -> [ContextualAlignedWord] {
+            let overlapWordCount = suffixPrefixOverlapWordCount(
+                previous: previous,
+                current: current
+            )
+            if overlapWordCount > 0, overlapWordCount < previous.count {
+                return Array(previous.prefix(previous.count - overlapWordCount))
+            }
+
+            if let overlapStart = internalPrefixOverlapStart(previous: previous, current: current),
+               overlapStart > 0 {
+                return Array(previous.prefix(overlapStart))
+            }
+
+            guard let currentStartTime = current.first?.startTime,
+                  let previousFirstStartTime = previous.first?.startTime,
+                  currentStartTime > previousFirstStartTime + 0.25 else {
+                return []
+            }
+
+            let threshold = currentStartTime - 0.10
+            let expiredCount = previous.prefix { $0.endTime <= threshold }.count
+            guard expiredCount > 0 else {
+                return []
+            }
+            return Array(previous.prefix(expiredCount))
+        }
+
+        private static func suffixPrefixOverlapWordCount(
+            previous: [ContextualAlignedWord],
+            current: [ContextualAlignedWord]
+        ) -> Int {
+            let maximumOverlap = min(previous.count, current.count)
+            guard maximumOverlap > 0 else { return 0 }
+
+            for count in stride(from: maximumOverlap, through: 1, by: -1) {
+                let previousSuffix = Array(previous.suffix(count))
+                let matched = matchingPrefixWordCounts(previousSuffix, current)
+                if matched.left == previousSuffix.count {
+                    return count
+                }
+            }
+
+            return 0
+        }
+
+        private static func internalPrefixOverlapStart(
+            previous: [ContextualAlignedWord],
+            current: [ContextualAlignedWord]
+        ) -> Int? {
+            let minimumOverlap = 2
+            let maximumOverlap = min(previous.count, current.count, 12)
+            guard maximumOverlap >= minimumOverlap, previous.count > minimumOverlap else {
+                return nil
+            }
+
+            for count in stride(from: maximumOverlap, through: minimumOverlap, by: -1) {
+                let currentPrefix = Array(current.prefix(count))
+                let lastStart = previous.count - count
+                guard lastStart >= 1 else { continue }
+
+                for start in 1...lastStart {
+                    let previousSlice = Array(previous[start..<(start + count)])
+                    let matched = matchingPrefixWordCounts(previousSlice, currentPrefix)
+                    if matched.left == previousSlice.count {
+                        return start
+                    }
+                }
+            }
+
+            return nil
+        }
+
+        private static func flattenedUnits(from words: [ContextualAlignedWord]) -> [ContextualWordUnit] {
+            var units: [ContextualWordUnit] = []
+            for (wordIndex, word) in words.enumerated() {
+                for (unitIndex, unit) in word.normalizedUnits.enumerated() {
+                    units.append(ContextualWordUnit(
+                        value: unit,
+                        wordIndex: wordIndex,
+                        isWordEnd: unitIndex == word.normalizedUnits.count - 1
+                    ))
+                }
+            }
+            return units
+        }
     }
 
     private struct LocalAgreementState {
@@ -1790,6 +2626,15 @@ import Foundation
             confidence: segment.confidence
         )
     }
+
+    private static func offset(_ word: StreamingAlignmentWord, by offset: TimeInterval) -> StreamingAlignmentWord {
+        StreamingAlignmentWord(
+            text: word.text,
+            startTime: word.startTime + offset,
+            endTime: word.endTime + offset,
+            confidence: word.confidence
+        )
+    }
 }
 
 private struct TranscriptTextToken {
@@ -1802,6 +2647,48 @@ private struct StaleReplayAnalysis {
     var matchedTokenCount: Int
     var candidateTokenCount: Int
     var trailingUnmatchedTokenCount: Int
+}
+
+private struct ContextualAlignedWord: Sendable {
+    var word: SpeechChunkStreamingPipeline.StreamingAlignmentWord
+    var normalizedUnits: [String]
+
+    var text: String {
+        word.text
+    }
+
+    var startTime: TimeInterval {
+        word.startTime
+    }
+
+    var endTime: TimeInterval {
+        word.endTime
+    }
+}
+
+private struct ContextualAlignmentUpdate: Sendable {
+    var committedWords: [ContextualAlignedWord]
+    var volatileWords: [ContextualAlignedWord]
+    var frontierDroppedWordCount: Int
+}
+
+private struct ContextualWordUnit {
+    var value: String
+    var wordIndex: Int
+    var isWordEnd: Bool
+}
+
+private actor ContextualCommittedFrontier {
+    private var value: TimeInterval?
+
+    func update(_ endTime: TimeInterval?) {
+        guard let endTime else { return }
+        value = max(value ?? endTime, endTime)
+    }
+
+    func endTime() -> TimeInterval? {
+        value
+    }
 }
 
 private enum QueuedTranscriptionWork: Sendable {

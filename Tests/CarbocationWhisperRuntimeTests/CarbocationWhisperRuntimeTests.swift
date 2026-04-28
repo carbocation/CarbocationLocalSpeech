@@ -87,6 +87,33 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         XCTAssertGreaterThan(high.samplesOverlap, low.samplesOverlap)
     }
 
+    func testWhisperTokenWordGroupingMergesSubwordPieces() {
+        let words = WhisperTokenWordGrouping.transcriptWords(from: [
+            WhisperDecodedTokenPiece(text: " What", startTime: 0.0, endTime: 0.1, confidence: 0.9),
+            WhisperDecodedTokenPiece(text: " if", startTime: 0.1, endTime: 0.2, confidence: 0.8),
+            WhisperDecodedTokenPiece(text: " there", startTime: 0.2, endTime: 0.3, confidence: 0.8),
+            WhisperDecodedTokenPiece(text: "'s", startTime: 0.3, endTime: 0.4, confidence: 0.8),
+            WhisperDecodedTokenPiece(text: " no", startTime: 0.4, endTime: 0.5, confidence: 0.8),
+            WhisperDecodedTokenPiece(text: " Door", startTime: 0.5, endTime: 0.6, confidence: 0.8),
+            WhisperDecodedTokenPiece(text: "D", startTime: 0.6, endTime: 0.7, confidence: 0.8),
+            WhisperDecodedTokenPiece(text: "ash", startTime: 0.7, endTime: 0.8, confidence: 0.8),
+            WhisperDecodedTokenPiece(text: " V", startTime: 0.8, endTime: 0.9, confidence: 0.8),
+            WhisperDecodedTokenPiece(text: "im", startTime: 0.9, endTime: 1.0, confidence: 0.8),
+            WhisperDecodedTokenPiece(text: "?", startTime: 1.0, endTime: 1.1, confidence: 0.8)
+        ])
+
+        XCTAssertEqual(words.map(\.text), [
+            "What",
+            "if",
+            "there's",
+            "no",
+            "DoorDash",
+            "Vim?"
+        ])
+        XCTAssertEqual(words.first?.startTime, 0.0)
+        XCTAssertEqual(words.last?.endTime, 1.1)
+    }
+
     func testWhisperOuterVADSelectionUsesModelWhenAvailable() {
         XCTAssertEqual(
             WhisperOuterVADSelection.resolve(mode: .automatic, vadModelPath: "/tmp/ggml-silero.bin"),

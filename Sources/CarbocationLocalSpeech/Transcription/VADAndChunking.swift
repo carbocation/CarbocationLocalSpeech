@@ -605,6 +605,38 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
         return [final]
     }
 
+    public mutating func trimCommittedAudio(
+        before committedEndTime: TimeInterval,
+        contextPadding: TimeInterval = 0.5,
+        minimumRetainedDuration: TimeInterval = 1.0,
+        activationDuration: TimeInterval = 15.0
+    ) -> TimeInterval? {
+        guard duration > activationDuration,
+              let sampleRate,
+              let startTime,
+              let bufferEndTime,
+              sampleRate > 0
+        else {
+            return nil
+        }
+
+        let targetStart = min(
+            committedEndTime - max(0, contextPadding),
+            bufferEndTime - max(0.05, minimumRetainedDuration)
+        )
+        guard targetStart > startTime else { return nil }
+
+        let droppedSamples = max(0, min(
+            samples.count,
+            Int(((targetStart - startTime) * sampleRate).rounded(.down))
+        ))
+        guard droppedSamples > 0 else { return nil }
+
+        samples.removeFirst(droppedSamples)
+        self.startTime = startTime + Double(droppedSamples) / sampleRate
+        return Double(droppedSamples) / sampleRate
+    }
+
     private var duration: TimeInterval {
         guard let sampleRate, sampleRate > 0 else { return 0 }
         return Double(samples.count) / sampleRate

@@ -644,6 +644,33 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(final.audio.duration, 2.0, accuracy: 0.000_1)
     }
 
+    func testSpeechContextualRollingWindowTrimsCommittedAudioAfterFrontier() throws {
+        var window = SpeechContextualRollingWindow(
+            maximumBufferDuration: 30.0,
+            updateInterval: 1.0,
+            finalSilenceDelay: 0.5,
+            voiceActivityMode: .leadingSilence
+        )
+
+        _ = window.append(
+            AudioChunk(
+                samples: Array(repeating: 0.05, count: 20 * 16_000),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 20
+            ),
+            activity: nil
+        )
+
+        let trimmed = try XCTUnwrap(window.trimCommittedAudio(before: 18.0))
+        XCTAssertEqual(trimmed, 17.5, accuracy: 0.001)
+
+        let final = try XCTUnwrap(window.finish().first)
+        XCTAssertEqual(final.startTime, 17.5, accuracy: 0.001)
+        XCTAssertEqual(final.audio.duration, 2.5, accuracy: 0.001)
+    }
+
     func testSpeechContextualRollingWindowFinalizesAfterSilence() throws {
         var window = SpeechContextualRollingWindow(
             maximumBufferDuration: 10.0,
@@ -1952,6 +1979,556 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertFalse(completedText.contains("hospital"))
     }
 
+    func testSpeechChunkStreamingPipelineContextualWordAlignmentDoesNotDuplicateCommittedReplay() async throws {
+        let audio = contextualTestAudio(chunkCount: 4)
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(timestampMode: .words, voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1:
+                    text = "alpha beta gamma"
+                case 2:
+                    text = "alpha beta gamma delta epsilon"
+                default:
+                    text = "alpha beta gamma delta epsilon zeta"
+                }
+                return timedWordResult(text, step: 0.20)
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        let completedText = completedTranscriptText(in: events)
+        XCTAssertFalse(hasRepeatedNormalizedNGram(completedText, size: 4))
+        XCTAssertEqual(completedText, "alpha beta gamma delta epsilon zeta")
+        XCTAssertTrue(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message == "alignment=words"
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineContextualWordAlignmentMatchesBackendCompoundSplit() async throws {
+        let audio = contextualTestAudio(chunkCount: 3)
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(timestampMode: .words, voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { _, _ in
+                let callIndex = await callCounter.next()
+                switch callIndex {
+                case 1:
+                    return timedWordResult("users call backend", step: 0.20)
+                default:
+                    return timedWordResult("users call back end API", step: 0.20)
+                }
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertEqual(completedTranscriptText(in: events), "users call back end API")
+    }
+
+    func testSpeechChunkStreamingPipelineContextualWordAlignmentDropsChangedTextBeforeFrontier() async throws {
+        let audio = contextualTestAudio(chunkCount: 4)
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(timestampMode: .words, voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { _, _ in
+                let callIndex = await callCounter.next()
+                switch callIndex {
+                case 1:
+                    return timedWordResult("alpha beta gamma delta", step: 0.20)
+                case 2:
+                    return timedWordResult("alpha beta gamma delta epsilon", step: 0.20)
+                default:
+                    return timedWordResult([
+                        ("wrong", 0.00, 0.10),
+                        ("old", 0.10, 0.20),
+                        ("words", 0.20, 0.30),
+                        ("epsilon", 0.80, 1.00),
+                        ("zeta", 1.00, 1.20)
+                    ])
+                }
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        let completedText = completedTranscriptText(in: events)
+        XCTAssertEqual(completedText, "alpha beta gamma delta epsilon zeta")
+        XCTAssertFalse(completedText.contains("wrong old words"))
+        XCTAssertTrue(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message.contains("frontier_drop=3")
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineContextualWordAlignmentFinalFlushCommitsOnlyPendingAfterFrontier() async throws {
+        let audio = contextualTestAudio(chunkCount: 3)
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(timestampMode: .words, voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { chunk, _ in
+                let callIndex = await callCounter.next()
+                switch callIndex {
+                case 1:
+                    return timedWordResult("drive a car", step: 0.20)
+                case 2:
+                    return timedWordResult("drive a car or operate machinery", step: 0.20)
+                default:
+                    let text = chunk.isFinal
+                        ? "drive a car or operate machinery hospital hallucination"
+                        : "drive a car or operate machinery"
+                    return timedWordResult(text, step: 0.20)
+                }
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        let completedText = completedTranscriptText(in: events)
+        XCTAssertEqual(completedText, "drive a car or operate machinery")
+        XCTAssertFalse(completedText.contains("hospital"))
+        XCTAssertFalse(completedText.contains("hallucination"))
+    }
+
+    func testSpeechChunkStreamingPipelineContextualWordAlignmentSilenceFlushClosesTailOnce() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<3 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: index == 2 ? 0 : 0.05, count: 8_000),
+                        sampleRate: 16_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.5,
+                        duration: 0.5
+                    ))
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(timestampMode: .words, voiceActivityDetection: .enabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 0.5)
+            )
+        )
+        let detector = SequenceVoiceActivityDetector(states: [.speech, .speech, .silence])
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { _, _ in
+                let callIndex = await callCounter.next()
+                switch callIndex {
+                case 1:
+                    return timedWordResult("alpha beta", step: 0.50)
+                case 2:
+                    return timedWordResult("alpha beta gamma", step: 0.50)
+                default:
+                    return timedWordResult([
+                        ("gamma", 1.00, 1.50),
+                        ("delta", 1.50, 2.00)
+                    ])
+                }
+            },
+            voiceActivityDetector: detector
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertEqual(completedTranscriptText(in: events), "alpha beta gamma delta")
+        XCTAssertFalse(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.transcript.text.contains("gamma gamma")
+                    || snapshot.transcript.text.contains("delta delta")
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineContextualInternalWordsDoNotLeakForSegmentTimestampMode() async throws {
+        let audio = contextualTestAudio(chunkCount: 3)
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(timestampMode: .segments, voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { _, _ in
+                let callIndex = await callCounter.next()
+                let text = callIndex == 1 ? "stable alpha" : "stable alpha beta"
+                return timedWordResult(text, step: 0.20)
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        for event in events {
+            switch event {
+            case .snapshot(let snapshot):
+                XCTAssertTrue(snapshot.stable.segments.allSatisfy { $0.words.isEmpty })
+                XCTAssertTrue(snapshot.volatile?.segments.allSatisfy { $0.words.isEmpty } ?? true)
+            case .completed(let transcript):
+                XCTAssertTrue(transcript.segments.allSatisfy { $0.words.isEmpty })
+            default:
+                continue
+            }
+        }
+    }
+
+    func testSpeechChunkStreamingPipelineContextualWordAlignmentDoesNotUsePublicWordsAsAlignmentMetadata() async throws {
+        let audio = contextualTestAudio(chunkCount: 3)
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(timestampMode: .words, voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { _, _ in
+                let callIndex = await callCounter.next()
+                let text = callIndex == 1 ? "stable alpha" : "stable alpha beta"
+                let transcript = Transcript(segments: [
+                    TranscriptSegment(
+                        text: text,
+                        startTime: 0,
+                        endTime: 0.4,
+                        words: [
+                            TranscriptWord(text: "stable", startTime: 0.0, endTime: 0.2),
+                            TranscriptWord(text: "alpha", startTime: 0.2, endTime: 0.4)
+                        ]
+                    )
+                ])
+                return SpeechChunkStreamingPipeline.StreamingChunkTranscriptionResult(
+                    transcript: transcript,
+                    alignmentWords: []
+                )
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message == "alignment=text-fallback"
+            }
+            return false
+        })
+        XCTAssertFalse(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message == "alignment=words"
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineContextualWordAlignmentFiltersWhisperSpecialMarkersFromText() async throws {
+        let audio = contextualTestAudio(chunkCount: 3)
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(timestampMode: .segments, voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { _, _ in
+                let callIndex = await callCounter.next()
+                let words: [(text: String, startTime: TimeInterval, endTime: TimeInterval)]
+                switch callIndex {
+                case 1:
+                    words = [
+                        ("[_BEG_]", 0.00, 0.00),
+                        ("What", 0.00, 0.10),
+                        ("if", 0.10, 0.20),
+                        ("there", 0.20, 0.30),
+                        ("'s", 0.30, 0.40),
+                        ("no", 0.40, 0.50),
+                        ("bubbles", 0.50, 0.60),
+                        ("[_TT_50]", 0.60, 0.60)
+                    ]
+                default:
+                    words = [
+                        ("[_BEG_]", 0.00, 0.00),
+                        ("What", 0.00, 0.10),
+                        ("if", 0.10, 0.20),
+                        ("there", 0.20, 0.30),
+                        ("'s", 0.30, 0.40),
+                        ("no", 0.40, 0.50),
+                        ("bubbles", 0.50, 0.60),
+                        ("in", 0.60, 0.70),
+                        ("water", 0.70, 0.80),
+                        ("you", 0.80, 0.90),
+                        ("'re", 0.90, 1.00),
+                        ("done", 1.00, 1.10),
+                        ("[_TT_110]", 1.10, 1.10)
+                    ]
+                }
+                return timedWordResult(words)
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        let completedText = completedTranscriptText(in: events)
+        XCTAssertEqual(completedText, "What if there's no bubbles in water you're done")
+        XCTAssertFalse(completedText.contains("[_"))
+        XCTAssertFalse(completedText.contains("_]"))
+
+        for event in events {
+            if case .snapshot(let snapshot) = event {
+                XCTAssertFalse(snapshot.transcript.text.contains("[_"))
+                XCTAssertFalse(snapshot.volatile?.text.contains("[_") ?? false)
+            }
+        }
+    }
+
+    func testSpeechChunkStreamingPipelineContextualWordAlignmentCommitsExpiredPrefixAfterWindowShift() async throws {
+        let audio = contextualTestAudio(chunkCount: 6)
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(timestampMode: .words, voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { _, _ in
+                let callIndex = await callCounter.next()
+                switch callIndex {
+                case 1:
+                    return timedWordResult("alpha beta", step: 0.20)
+                case 2:
+                    return timedWordResult("alpha beta one two three four", step: 0.20)
+                case 3:
+                    return timedWordResult("three four five six", step: 0.20)
+                default:
+                    return timedWordResult("five six seven eight", step: 0.20)
+                }
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertEqual(
+            completedTranscriptText(in: events),
+            "alpha beta one two three four five six"
+        )
+    }
+
+    func testSpeechChunkStreamingPipelineContextualSparklingWaterRegressionHasNoRepeatedStableNGrams() async throws {
+        let audio = contextualTestAudio(chunkCount: 5)
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(timestampMode: .words, voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 20.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimedResult: { _, _ in
+                let callIndex = await callCounter.next()
+                switch callIndex {
+                case 1:
+                    return timedWordResult("users will call the backend", step: 0.20)
+                case 2:
+                    return timedWordResult("users will call the back end to order food", step: 0.20)
+                case 3:
+                    return timedWordResult([
+                        ("users", 0.00, 0.20),
+                        ("will", 0.20, 0.40),
+                        ("call", 0.40, 0.60),
+                        ("the", 0.60, 0.80),
+                        ("API", 0.80, 1.00),
+                        ("to", 1.00, 1.20),
+                        ("order", 1.20, 1.40),
+                        ("food", 1.40, 1.60),
+                        ("okay", 1.60, 1.80),
+                        ("if", 1.80, 2.00),
+                        ("you", 2.00, 2.20),
+                        ("really", 2.20, 2.40),
+                        ("think", 2.40, 2.60)
+                    ])
+                default:
+                    return timedWordResult([
+                        ("users", 0.00, 0.20),
+                        ("will", 0.20, 0.40),
+                        ("call", 0.40, 0.60),
+                        ("the", 0.60, 0.80),
+                        ("API", 0.80, 1.00),
+                        ("to", 1.00, 1.20),
+                        ("order", 1.20, 1.40),
+                        ("food", 1.40, 1.60),
+                        ("okay", 1.60, 1.80),
+                        ("if", 1.80, 2.00),
+                        ("you", 2.00, 2.20),
+                        ("really", 2.20, 2.40),
+                        ("think", 2.40, 2.60),
+                        ("we", 2.60, 2.80),
+                        ("have", 2.80, 3.00),
+                        ("to", 3.00, 3.20),
+                        ("build", 3.20, 3.40),
+                        ("a", 3.40, 3.60),
+                        ("frontend", 3.60, 3.80)
+                    ])
+                }
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        let completedText = completedTranscriptText(in: events)
+        XCTAssertFalse(hasRepeatedNormalizedNGram(completedText, size: 4), completedText)
+        XCTAssertFalse(events.contains { event in
+            if case .snapshot(let snapshot) = event,
+               !snapshot.stable.text.isEmpty,
+               let volatileText = snapshot.volatile?.text {
+                return volatileText.hasPrefix(snapshot.stable.text)
+            }
+            return false
+        })
+    }
+
     func testSpeechChunkStreamingPipelineContextualFlushesPendingTailWhenFinalRegresses() async throws {
         let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
             Task {
@@ -3172,6 +3749,97 @@ private actor SpeechChunkStreamingPipelineStartRecorder {
     func recordedValue() -> TimeInterval? {
         value
     }
+}
+
+private func contextualTestAudio(chunkCount: Int) -> AsyncThrowingStream<AudioChunk, Error> {
+    AsyncThrowingStream { continuation in
+        Task {
+            for index in 0..<chunkCount {
+                continuation.yield(AudioChunk(
+                    samples: Array(repeating: 0.05, count: 8_000),
+                    sampleRate: 16_000,
+                    channelCount: 1,
+                    startTime: TimeInterval(index) * 0.5,
+                    duration: 0.5
+                ))
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            continuation.finish()
+        }
+    }
+}
+
+private func timedWordResult(
+    _ text: String,
+    startTime: TimeInterval = 0,
+    step: TimeInterval
+) -> SpeechChunkStreamingPipeline.StreamingChunkTranscriptionResult {
+    let parts = text.split(separator: " ").map(String.init)
+    let words = parts.enumerated().map { index, part in
+        (
+            text: part,
+            startTime: startTime + TimeInterval(index) * step,
+            endTime: startTime + TimeInterval(index + 1) * step
+        )
+    }
+    return timedWordResult(words)
+}
+
+private func timedWordResult(
+    _ words: [(text: String, startTime: TimeInterval, endTime: TimeInterval)]
+) -> SpeechChunkStreamingPipeline.StreamingChunkTranscriptionResult {
+    let alignmentWords = words.map { word in
+        SpeechChunkStreamingPipeline.StreamingAlignmentWord(
+            text: word.text,
+            startTime: word.startTime,
+            endTime: word.endTime
+        )
+    }
+    let publicWords = words.filter { !isWhisperSpecialMarker($0.text) }
+    let transcript = Transcript(segments: [
+        TranscriptSegment(
+            text: publicWords.map(\.text).joined(separator: " "),
+            startTime: alignmentWords.first?.startTime ?? 0,
+            endTime: alignmentWords.last?.endTime ?? 0,
+            words: []
+        )
+    ])
+    return SpeechChunkStreamingPipeline.StreamingChunkTranscriptionResult(
+        transcript: transcript,
+        alignmentWords: alignmentWords
+    )
+}
+
+private func isWhisperSpecialMarker(_ text: String) -> Bool {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.hasPrefix("[_") && trimmed.hasSuffix("]")
+}
+
+private func completedTranscriptText(in events: [TranscriptEvent]) -> String {
+    events.compactMap { event -> String? in
+        if case .completed(let transcript) = event {
+            return transcript.text
+        }
+        return nil
+    }.last ?? ""
+}
+
+private func hasRepeatedNormalizedNGram(_ text: String, size: Int) -> Bool {
+    let tokens = text
+        .lowercased()
+        .split { !$0.isLetter && !$0.isNumber && $0 != "'" }
+        .map(String.init)
+    guard tokens.count >= size * 2 else { return false }
+
+    var seen: Set<String> = []
+    for index in 0...(tokens.count - size) {
+        let ngram = tokens[index..<(index + size)].joined(separator: " ")
+        if seen.contains(ngram) {
+            return true
+        }
+        seen.insert(ngram)
+    }
+    return false
 }
 
 private actor TranscriptionPromptRecorder {
