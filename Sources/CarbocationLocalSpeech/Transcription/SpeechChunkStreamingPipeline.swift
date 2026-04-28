@@ -510,6 +510,7 @@ import Foundation
                 let didCommitFinal = commitFinalLocalAgreement(
                     candidateSegments,
                     backend: backend,
+                    options: options,
                     committedSegments: &committedSegments,
                     agreementState: &agreementState,
                     allowsUnconfirmedFinalCommit: localAgreementAllowsUnconfirmedFinalCommit(for: options),
@@ -522,6 +523,7 @@ import Foundation
                 processLocalAgreement(
                     candidateSegments,
                     backend: backend,
+                    options: options,
                     committedSegments: &committedSegments,
                     agreementState: &agreementState,
                     continuation: continuation
@@ -601,14 +603,16 @@ import Foundation
     private static func commitFinalLocalAgreement(
         _ segments: [TranscriptSegment],
         backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
         committedSegments: inout [TranscriptSegment],
         agreementState: inout LocalAgreementState,
         allowsUnconfirmedFinalCommit: Bool,
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) -> Bool {
-        let finalHypothesis = removeCommittedTextPrefix(
+        let finalHypothesis = removeCommittedPrefixForWindow(
             in: segments.map(\.text).joined(separator: " "),
-            after: committedSegments
+            after: committedSegments,
+            options: options
         )
         let mergedFinalText = allowsUnconfirmedFinalCommit
             ? agreementState.flush(currentHypothesis: finalHypothesis)
@@ -616,9 +620,10 @@ import Foundation
                 currentHypothesis: finalHypothesis,
                 clearWhenEmpty: false
             )
-        let finalText = removeCommittedTextPrefix(
+        let finalText = removeCommittedPrefixForWindow(
             in: mergedFinalText,
-            after: committedSegments
+            after: committedSegments,
+            options: options
         )
 
         guard !finalText.isEmpty,
@@ -667,9 +672,10 @@ import Foundation
         guard case .localAgreement = resolvedCommitmentPolicy(options) else {
             return
         }
-        let finalText = removeCommittedTextPrefix(
+        let finalText = removeCommittedPrefixForWindow(
             in: agreementState.flushPending(),
-            after: committedSegments
+            after: committedSegments,
+            options: options
         )
         guard !finalText.isEmpty else { return }
 
@@ -689,22 +695,25 @@ import Foundation
     private static func processLocalAgreement(
         _ segments: [TranscriptSegment],
         backend: SpeechBackendDescriptor,
+        options: StreamingTranscriptionOptions,
         committedSegments: inout [TranscriptSegment],
         agreementState: inout LocalAgreementState,
         continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
     ) {
-        let hypothesis = removeCommittedTextPrefix(
+        let hypothesis = removeCommittedPrefixForWindow(
             in: segments.map(\.text).joined(separator: " "),
-            after: committedSegments
+            after: committedSegments,
+            options: options
         )
         let agreement = agreementState.accept(hypothesis: hypothesis)
 
         if !agreement.confirmedPrefix.isEmpty,
            let firstSegment = segments.first,
            let lastSegment = segments.last {
-            let confirmedPrefix = removeCommittedTextPrefix(
+            let confirmedPrefix = removeCommittedPrefixForWindow(
                 in: agreement.confirmedPrefix,
-                after: committedSegments
+                after: committedSegments,
+                options: options
             )
             if !confirmedPrefix.isEmpty {
                 let segment = TranscriptSegment(
@@ -762,6 +771,25 @@ import Foundation
             volatile: volatile,
             volatileRange: TranscriptTimeRange(startTime: firstSegment.startTime, endTime: lastSegment.endTime)
         )))
+    }
+
+    private static func removeCommittedPrefixForWindow(
+        in text: String,
+        after committedSegments: [TranscriptSegment],
+        options: StreamingTranscriptionOptions
+    ) -> String {
+        switch options.emulation.window {
+        case .contextualRollingBuffer:
+            return removeCommittedContextPrefix(
+                in: text,
+                after: committedSegments
+            ).text
+        case .rollingBuffer, .vadUtterances:
+            return removeCommittedTextPrefix(
+                in: text,
+                after: committedSegments
+            )
+        }
     }
 
     private static func removeCommittedTextPrefix(

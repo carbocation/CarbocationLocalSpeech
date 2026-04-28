@@ -29,15 +29,15 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
             recommendedRAMGB: 8,
             recommendation: .bestLiveEnglish
         )
-        let curatedDistil = CuratedSpeechModel(
-            id: "distil-large-v3",
-            displayName: "Distil Large v3",
+        let curatedLargeV2 = CuratedSpeechModel(
+            id: "large-v2",
+            displayName: "Large v2",
             subtitle: "",
-            variant: "distil-large-v3",
-            languageScope: .englishOnly,
-            approxSizeBytes: 2,
+            variant: "large-v2",
+            languageScope: .multilingual,
+            approxSizeBytes: 3_090_000_000,
             recommendedRAMGB: 16,
-            recommendation: .bestFileEnglish
+            recommendation: .bestFile
         )
         let installed = InstalledSpeechModel(
             displayName: "Small",
@@ -53,11 +53,11 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
             assets: [SpeechModelAsset(role: .primaryWeights, relativePath: "ggml-small.en.bin", sizeBytes: 1)],
             source: .imported
         )
-        let installedDistil = InstalledSpeechModel(
-            displayName: "Distil Large v3",
-            variant: "distil-large-v3",
-            languageScope: .englishOnly,
-            assets: [SpeechModelAsset(role: .primaryWeights, relativePath: "ggml-distil-large-v3.bin", sizeBytes: 1)],
+        let installedLargeV2 = InstalledSpeechModel(
+            displayName: "Large v2",
+            variant: "large-v2",
+            languageScope: .multilingual,
+            assets: [SpeechModelAsset(role: .primaryWeights, relativePath: "ggml-large-v2.bin", sizeBytes: 1)],
             source: .curated
         )
 
@@ -65,10 +65,10 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
         XCTAssertFalse(SpeechModelPickerLabelPolicy.installedModel(imported, matches: curatedSmall))
 
         let recommendedInstalled = SpeechModelPickerLabelPolicy.recommendedInstalledCuratedModels(
-            installedModels: [installed, installedDistil],
-            curatedModels: [curatedSmall, curatedDistil]
+            installedModels: [installed, installedLargeV2],
+            curatedModels: [curatedSmall, curatedLargeV2]
         )
-        XCTAssertEqual(recommendedInstalled.map(\.id), ["small", "distil-large-v3"])
+        XCTAssertEqual(recommendedInstalled.map(\.id), ["small", "large-v2"])
     }
 
     func testManualRecommendationLabelsApplyToCuratedDownloadModels() {
@@ -81,21 +81,21 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
             approxSizeBytes: 1,
             recommendedRAMGB: 8
         )
-        let curatedDistil = CuratedSpeechModel(
-            id: "distil-large-v3",
-            displayName: "Distil Large v3",
+        let curatedLargeV2 = CuratedSpeechModel(
+            id: "large-v2",
+            displayName: "Large v2",
             subtitle: "",
-            variant: "distil-large-v3",
-            languageScope: .englishOnly,
-            approxSizeBytes: 2,
+            variant: "large-v2",
+            languageScope: .multilingual,
+            approxSizeBytes: 3_090_000_000,
             recommendedRAMGB: 16,
-            recommendation: .bestFileEnglish
+            recommendation: .bestFile
         )
 
-        let label = SpeechModelPickerLabelPolicy.default.curatedModelLabel(for: curatedDistil)
+        let label = SpeechModelPickerLabelPolicy.default.curatedModelLabel(for: curatedLargeV2)
         let nonRecommendedLabel = SpeechModelPickerLabelPolicy.default.curatedModelLabel(for: curatedSmall)
 
-        XCTAssertEqual(label?.title, "Best File English")
+        XCTAssertEqual(label?.title, "Best for Files")
         XCTAssertEqual(label?.tone, .accent)
         XCTAssertNil(nonRecommendedLabel)
     }
@@ -109,7 +109,7 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
             languageScope: .multilingual,
             approxSizeBytes: 3_090_000_000,
             recommendedRAMGB: 16,
-            recommendation: .bestFileMultilingual
+            recommendation: .bestFile
         )
         let largeTurbo = CuratedSpeechModel(
             id: "large-v3-turbo",

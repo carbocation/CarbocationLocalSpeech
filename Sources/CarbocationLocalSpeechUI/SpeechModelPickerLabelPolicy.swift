@@ -29,8 +29,7 @@ public struct SpeechModelPickerLabelPolicy: Equatable, Sendable {
     public static let recommendedLabel = SpeechModelPickerStatusLabel("Recommended", tone: .accent)
     public static let bestLiveEnglishLabel = SpeechModelPickerStatusLabel("Best Live English", tone: .accent)
     public static let bestLiveMultilingualLabel = SpeechModelPickerStatusLabel("Best Live Multilingual", tone: .accent)
-    public static let bestFileEnglishLabel = SpeechModelPickerStatusLabel("Best File English", tone: .accent)
-    public static let bestFileMultilingualLabel = SpeechModelPickerStatusLabel("Best File Multilingual", tone: .accent)
+    public static let bestFileLabel = SpeechModelPickerStatusLabel("Best for Files", tone: .accent)
     public static let bestInstalledLabel = SpeechModelPickerStatusLabel("Best Installed", tone: .positive)
 
     public static let defaultSystemProviderLabels: [SpeechModelSelection: SpeechModelPickerStatusLabel] = [
@@ -40,8 +39,7 @@ public struct SpeechModelPickerLabelPolicy: Equatable, Sendable {
     public static let defaultRecommendationLabels: [CuratedSpeechModelRecommendation: SpeechModelPickerStatusLabel] = [
         .bestLiveEnglish: bestLiveEnglishLabel,
         .bestLiveMultilingual: bestLiveMultilingualLabel,
-        .bestFileEnglish: bestFileEnglishLabel,
-        .bestFileMultilingual: bestFileMultilingualLabel
+        .bestFile: bestFileLabel
     ]
 
     public static let `default` = SpeechModelPickerLabelPolicy()

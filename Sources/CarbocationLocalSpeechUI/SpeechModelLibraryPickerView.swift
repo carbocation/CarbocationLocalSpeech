@@ -733,17 +733,16 @@ public struct SpeechModelLibraryPickerView: View {
     private func recommendationSummary() -> String {
         let liveEnglish = recommendedCuratedModels.first { $0.recommendation == .bestLiveEnglish }?.displayName
         let liveMultilingual = recommendedCuratedModels.first { $0.recommendation == .bestLiveMultilingual }?.displayName
-        let fileEnglish = recommendedCuratedModels.first { $0.recommendation == .bestFileEnglish }?.displayName
-        let fileMultilingual = recommendedCuratedModels.first { $0.recommendation == .bestFileMultilingual }?.displayName
+        let file = recommendedCuratedModels.first { $0.recommendation == .bestFile }?.displayName
 
-        if let liveEnglish, let liveMultilingual, let fileEnglish, let fileMultilingual {
-            return "Live: \(liveEnglish) for English, \(liveMultilingual) for multilingual. Files: \(fileEnglish) for English, \(fileMultilingual) for multilingual."
+        if let liveEnglish, let liveMultilingual, let file {
+            return "Live: \(liveEnglish) for English, \(liveMultilingual) for multilingual. Files: \(file)."
         }
         if let liveEnglish, let liveMultilingual {
             return "Live transcription: \(liveEnglish) for English, \(liveMultilingual) for multilingual."
         }
-        if let fileEnglish, let fileMultilingual {
-            return "File transcription: \(fileEnglish) for English, \(fileMultilingual) for multilingual."
+        if let file {
+            return "File transcription: \(file)."
         }
         return "Curated downloads include approximate size and RAM guidance."
     }

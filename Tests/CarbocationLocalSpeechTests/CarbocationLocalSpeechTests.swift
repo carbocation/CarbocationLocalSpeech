@@ -132,7 +132,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
     func testCuratedCatalogEntriesHaveDownloadURLs() throws {
         XCTAssertEqual(
             CuratedSpeechModelCatalog.all.map(\.id),
-            ["tiny.en", "small.en", "distil-large-v3", "large-v2", "large-v3-turbo"]
+            ["tiny.en", "small.en", "large-v2", "large-v3-turbo"]
         )
         XCTAssertNil(CuratedSpeechModelCatalog.entry(id: "base.en"))
         XCTAssertNil(CuratedSpeechModelCatalog.entry(id: "medium.en"))
@@ -155,21 +155,11 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
         )
 
-        let distil = try XCTUnwrap(CuratedSpeechModelCatalog.entry(id: "distil-large-v3"))
-        XCTAssertEqual(distil.hfRepo, "distil-whisper/distil-large-v3-ggml")
-        XCTAssertEqual(distil.hfFilename, "ggml-distil-large-v3.bin")
-        XCTAssertEqual(distil.languageScope, .englishOnly)
-        XCTAssertEqual(distil.recommendation, .bestFileEnglish)
-        XCTAssertEqual(
-            distil.downloadURL?.absoluteString,
-            "https://huggingface.co/distil-whisper/distil-large-v3-ggml/resolve/main/ggml-distil-large-v3.bin"
-        )
-
         let largeV2 = try XCTUnwrap(CuratedSpeechModelCatalog.entry(id: "large-v2"))
         XCTAssertEqual(largeV2.displayName, "Whisper large-v2 (multilingual)")
         XCTAssertEqual(largeV2.hfFilename, "ggml-large-v2.bin")
         XCTAssertEqual(largeV2.languageScope, .multilingual)
-        XCTAssertEqual(largeV2.recommendation, .bestFileMultilingual)
+        XCTAssertEqual(largeV2.recommendation, .bestFile)
 
         let turbo = try XCTUnwrap(CuratedSpeechModelCatalog.entry(id: "large-v3-turbo"))
         XCTAssertEqual(turbo.displayName, "Whisper large-v3 turbo (multilingual)")
@@ -188,11 +178,10 @@ final class CarbocationLocalSpeechTests: XCTestCase {
     func testRecommendedCuratedModelsUseManualCatalogRoles() throws {
         let recommended = CuratedSpeechModelCatalog.recommendedModels()
 
-        XCTAssertEqual(recommended.map(\.id), ["small.en", "large-v3-turbo", "distil-large-v3", "large-v2"])
+        XCTAssertEqual(recommended.map(\.id), ["small.en", "large-v3-turbo", "large-v2"])
         XCTAssertEqual(CuratedSpeechModelCatalog.bestLiveEnglishModel()?.id, "small.en")
         XCTAssertEqual(CuratedSpeechModelCatalog.bestLiveMultilingualModel()?.id, "large-v3-turbo")
-        XCTAssertEqual(CuratedSpeechModelCatalog.bestFileEnglishModel()?.id, "distil-large-v3")
-        XCTAssertEqual(CuratedSpeechModelCatalog.bestFileMultilingualModel()?.id, "large-v2")
+        XCTAssertEqual(CuratedSpeechModelCatalog.bestFileModel()?.id, "large-v2")
         XCTAssertEqual(CuratedSpeechModelCatalog.bestEnglishModel()?.id, "small.en")
         XCTAssertEqual(CuratedSpeechModelCatalog.bestMultilingualModel()?.id, "large-v3-turbo")
         XCTAssertEqual(
@@ -201,9 +190,9 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         )
     }
 
-    func testInstalledSpeechModelInfersDistilLargeV3AsEnglishOnly() {
+    func testInstalledSpeechModelInfersDistilLargeV2AsEnglishOnly() {
         XCTAssertEqual(
-            InstalledSpeechModel.inferLanguageScope(from: "ggml-distil-large-v3.bin"),
+            InstalledSpeechModel.inferLanguageScope(from: "ggml-distil-large-v2.bin"),
             .englishOnly
         )
     }
@@ -2022,6 +2011,149 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         })
     }
 
+    func testSpeechChunkStreamingPipelineContextualSilenceFlushTrimsCommittedReplayBeforeStableCommit() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<3 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: index == 2 ? 0 : 0.05, count: 8_000),
+                        sampleRate: 16_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.5,
+                        duration: 0.5
+                    ))
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .enabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 0.5)
+            )
+        )
+        let detector = SequenceVoiceActivityDetector(states: [.speech, .speech, .silence])
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+        let intro = "It comes as the world is grappling with its biggest energy crisis in decades"
+        let frontier = "triggered by the US-Israeli war against Iran and the Islamic Republic's closure of the Strait of Hormuz, through which about a"
+        let replayTail = "U.S.-Israeli war against Iran and the Islamic Republic's closure of the Strait of Hormuz, through which about a fifth of the world's oil normally passes."
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1:
+                    text = intro
+                case 2:
+                    text = "\(intro), \(frontier)"
+                default:
+                    text = "\(frontier) \(replayTail)"
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            },
+            voiceActivityDetector: detector
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        let completedText = events.compactMap { event -> String? in
+            if case .completed(let transcript) = event {
+                return transcript.text
+            }
+            return nil
+        }.last ?? ""
+
+        XCTAssertEqual(
+            completedText,
+            "\(intro), \(frontier) fifth of the world's oil normally passes."
+        )
+        XCTAssertFalse(completedText.contains("about a U.S.-Israeli war"))
+        XCTAssertTrue(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message.hasPrefix("contextual_silence_flush=")
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineContextualSilenceFlushPreservesNewRepeatedTail() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<3 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: index == 2 ? 0 : 0.05, count: 8_000),
+                        sampleRate: 16_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.5,
+                        duration: 0.5
+                    ))
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .enabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 0.5)
+            )
+        )
+        let detector = SequenceVoiceActivityDetector(states: [.speech, .speech, .silence])
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1:
+                    text = "alpha beta"
+                case 2:
+                    text = "alpha beta gamma"
+                default:
+                    text = "gamma delta delta tail"
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            },
+            voiceActivityDetector: detector
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == "alpha beta gamma delta delta tail"
+            }
+            return false
+        })
+    }
+
     func testSpeechChunkStreamingPipelineDoesNotFlushContextualWindowForBriefSmoothedSilence() async throws {
         let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
             Task {
@@ -2424,6 +2556,60 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             if case .snapshot(let snapshot) = event {
                 return snapshot.stable.text == "hello speech"
                     && snapshot.volatile?.text == "provider"
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineKeepsVADUtteranceLocalAgreementFlushBehavior() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            for index in 0..<2 {
+                continuation.yield(AudioChunk(
+                    samples: Array(repeating: 0.05, count: 8_000),
+                    sampleRate: 16_000,
+                    channelCount: 1,
+                    startTime: TimeInterval(index) * 0.5,
+                    duration: 0.5
+                ))
+            }
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .lowestLatency,
+            emulation: EmulatedStreamingOptions(
+                window: .vadUtterances(SpeechChunkingConfiguration(
+                    maximumChunkDuration: 0.5,
+                    overlapDuration: 0,
+                    silenceCommitDelay: 2.0,
+                    minimumSpeechDuration: 0.01
+                ))
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribe: { _, _ in
+                let callIndex = await callCounter.next()
+                let text = callIndex == 1 ? "alpha beta" : "alpha beta gamma"
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            })
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == "alpha beta gamma"
             }
             return false
         })

@@ -143,7 +143,7 @@ public struct InstalledSpeechModel: Identifiable, Codable, Hashable, Sendable {
         if lowercased.contains(".en.") || lowercased.contains("-en.") || lowercased.contains("_en.") {
             return .englishOnly
         }
-        if lowercased.contains("distil-large-v2") || lowercased.contains("distil-large-v3") {
+        if lowercased.contains("distil-large-v2") {
             return .englishOnly
         }
         if lowercased.contains("whisper") || lowercased.contains("large") || lowercased.contains("turbo") {

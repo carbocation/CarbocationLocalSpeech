@@ -3,8 +3,7 @@ import Foundation
 public enum CuratedSpeechModelRecommendation: Hashable, Sendable {
     case bestLiveEnglish
     case bestLiveMultilingual
-    case bestFileEnglish
-    case bestFileMultilingual
+    case bestFile
 }
 
 public struct CuratedSpeechModel: Identifiable, Hashable, Sendable {
@@ -103,7 +102,6 @@ public struct CuratedSpeechVADModel: Identifiable, Hashable, Sendable {
 
 public enum CuratedSpeechModelCatalog {
     private static let whisperCppRepo = "ggerganov/whisper.cpp"
-    private static let distilLargeV3GGMLRepo = "distil-whisper/distil-large-v3-ggml"
     private static let whisperVADRepo = "ggml-org/whisper-vad"
 
     public static let recommendedVADModel = CuratedSpeechVADModel(
@@ -139,28 +137,16 @@ public enum CuratedSpeechModelCatalog {
             recommendation: .bestLiveEnglish
         ),
         CuratedSpeechModel(
-            id: "distil-large-v3",
-            displayName: "Distil-Whisper large-v3 (English-only)",
-            subtitle: "Recommended English-only model for offline file transcription.",
-            variant: "distil-large-v3",
-            languageScope: .englishOnly,
-            approxSizeBytes: 1_520_000_000,
-            recommendedRAMGB: 16,
-            hfRepo: distilLargeV3GGMLRepo,
-            hfFilename: "ggml-distil-large-v3.bin",
-            recommendation: .bestFileEnglish
-        ),
-        CuratedSpeechModel(
             id: "large-v2",
             displayName: "Whisper large-v2 (multilingual)",
-            subtitle: "Recommended multilingual model for offline file and translation workflows.",
+            subtitle: "Recommended model for offline file and translation workflows.",
             variant: "large-v2",
             languageScope: .multilingual,
             approxSizeBytes: 3_090_000_000,
             recommendedRAMGB: 16,
             hfRepo: whisperCppRepo,
             hfFilename: "ggml-large-v2.bin",
-            recommendation: .bestFileMultilingual
+            recommendation: .bestFile
         ),
         CuratedSpeechModel(
             id: "large-v3-turbo",
@@ -186,8 +172,7 @@ public enum CuratedSpeechModelCatalog {
         [
             bestLiveEnglishModel(among: models),
             bestLiveMultilingualModel(among: models),
-            bestFileEnglishModel(among: models),
-            bestFileMultilingualModel(among: models)
+            bestFileModel(among: models)
         ].compactMap { $0 }
     }
 
@@ -203,16 +188,10 @@ public enum CuratedSpeechModelCatalog {
         models.first { $0.recommendation == .bestLiveMultilingual }
     }
 
-    public static func bestFileEnglishModel(
+    public static func bestFileModel(
         among models: [CuratedSpeechModel] = all
     ) -> CuratedSpeechModel? {
-        models.first { $0.recommendation == .bestFileEnglish }
-    }
-
-    public static func bestFileMultilingualModel(
-        among models: [CuratedSpeechModel] = all
-    ) -> CuratedSpeechModel? {
-        models.first { $0.recommendation == .bestFileMultilingual }
+        models.first { $0.recommendation == .bestFile }
     }
 
     public static func bestEnglishModel(
