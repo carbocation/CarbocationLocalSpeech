@@ -556,6 +556,10 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
 
         if shouldFlushForSilence {
             hasEmittedSilenceFlush = true
+            // Decode the retained buffer once more; the queued pending flush commits the endpoint tail.
+            if let endpoint = emitChunk(isFinal: false) {
+                emitted.append(endpoint)
+            }
             return AppendResult(
                 chunks: emitted,
                 audioGap: gap,
@@ -657,7 +661,6 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
     private mutating func apply(activity: VoiceActivityEvent?, duration: TimeInterval) {
         guard let activity else { return }
         usesVoiceActivity = true
-        let activityDuration = max(duration, activity.endTime - activity.startTime)
         if activity.state == .speech {
             hasObservedSpeech = true
             hasActiveSpeechTurn = true
@@ -665,7 +668,7 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
             hasEmittedSilenceFlush = false
             silenceDuration = 0
         } else {
-            silenceDuration += activityDuration
+            silenceDuration += duration
         }
     }
 

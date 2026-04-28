@@ -305,6 +305,7 @@ import Foundation
                         message: "contextual_silence_flush=\(silenceFlushTime.formattedStreamingDebug)s",
                         time: silenceFlushTime
                     )))
+                    await queue.enqueueFlushPending(time: silenceFlushTime)
                 }
             }
 

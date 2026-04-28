@@ -768,10 +768,81 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         )
 
         XCTAssertNil(silence.turnFinalTime)
-        XCTAssertTrue(silence.chunks.isEmpty)
+        XCTAssertEqual(silence.chunks.count, 1)
+        XCTAssertFalse(silence.chunks[0].isFinal)
+        XCTAssertEqual(silence.chunks[0].startTime, 0, accuracy: 0.000_1)
+        XCTAssertEqual(silence.chunks[0].audio.duration, 1.0, accuracy: 0.000_1)
         XCTAssertEqual(silence.silenceFlushTime, 1.0)
 
         XCTAssertTrue(window.finish().isEmpty)
+    }
+
+    func testSpeechContextualRollingWindowDoesNotBackCountSmoothedSilenceForFlush() throws {
+        var window = SpeechContextualRollingWindow(
+            maximumBufferDuration: 10.0,
+            updateInterval: 10.0,
+            finalSilenceDelay: 0.5,
+            voiceActivityMode: .leadingSilence
+        )
+
+        _ = window.append(
+            AudioChunk(
+                samples: Array(repeating: 0.05, count: 1_000),
+                sampleRate: 1_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 1.0
+            ),
+            activity: VoiceActivityEvent(state: .speech, startTime: 0, endTime: 1.0)
+        )
+
+        let smoothedTransition = window.append(
+            AudioChunk(
+                samples: Array(repeating: 0, count: 100),
+                sampleRate: 1_000,
+                channelCount: 1,
+                startTime: 1.0,
+                duration: 0.1
+            ),
+            activity: VoiceActivityEvent(state: .silence, startTime: 0.3, endTime: 1.1)
+        )
+
+        XCTAssertTrue(smoothedTransition.chunks.isEmpty)
+        XCTAssertNil(smoothedTransition.silenceFlushTime)
+
+        for index in 1..<4 {
+            let result = window.append(
+                AudioChunk(
+                    samples: Array(repeating: 0, count: 100),
+                    sampleRate: 1_000,
+                    channelCount: 1,
+                    startTime: 1.0 + TimeInterval(index) * 0.1,
+                    duration: 0.1
+                ),
+                activity: VoiceActivityEvent(
+                    state: .silence,
+                    startTime: 1.0 + TimeInterval(index) * 0.1,
+                    endTime: 1.1 + TimeInterval(index) * 0.1
+                )
+            )
+            XCTAssertNil(result.silenceFlushTime)
+        }
+
+        let sustainedSilence = window.append(
+            AudioChunk(
+                samples: Array(repeating: 0, count: 100),
+                sampleRate: 1_000,
+                channelCount: 1,
+                startTime: 1.4,
+                duration: 0.1
+            ),
+            activity: VoiceActivityEvent(state: .silence, startTime: 1.4, endTime: 1.5)
+        )
+
+        XCTAssertEqual(sustainedSilence.silenceFlushTime, 1.5)
+        XCTAssertEqual(sustainedSilence.chunks.count, 1)
+        XCTAssertFalse(sustainedSilence.chunks[0].isFinal)
+        XCTAssertEqual(sustainedSilence.chunks[0].audio.duration, 1.5, accuracy: 0.000_1)
     }
 
     func testSpeechContextualRollingWindowEmitsFinalBeforeInputGap() throws {
@@ -1764,6 +1835,92 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertTrue(events.contains { event in
             if case .diagnostic(let diagnostic) = event {
                 return diagnostic.message.contains("raw_vad=silence smoothed_vad=speech")
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineFlushesEndpointDecodeAfterSustainedSmoothedSilence() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<13 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: index < 6 ? 0.05 : 0, count: 100),
+                        sampleRate: 1_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.1,
+                        duration: 0.1
+                    ))
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .enabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 5.0, updateInterval: 0.3, finalSilenceDelay: 0.3)
+            )
+        )
+        let detector = SmoothedVoiceActivityDetector(
+            detector: SequenceVoiceActivityDetector(states: [
+                .speech,
+                .speech,
+                .speech,
+                .speech,
+                .speech,
+                .speech,
+                .silence,
+                .silence,
+                .silence,
+                .silence,
+                .silence,
+                .silence,
+                .silence
+            ]),
+            configuration: VoiceActivitySmoothingConfiguration(
+                enterSpeechDuration: 0.2,
+                exitSpeechDuration: 0.3
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { _, _ in
+                let callIndex = await callCounter.next()
+                let text = callIndex < 4 ? "alpha" : "alpha beta tail"
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            },
+            voiceActivityDetector: detector
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        let completedText = events.compactMap { event -> String? in
+            if case .completed(let transcript) = event {
+                return transcript.text
+            }
+            return nil
+        }.last ?? ""
+        let transcriptionCallCount = await callCounter.current()
+
+        XCTAssertEqual(transcriptionCallCount, 4)
+        XCTAssertEqual(completedText, "alpha beta tail")
+        XCTAssertTrue(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message.hasPrefix("contextual_silence_flush=")
             }
             return false
         })
