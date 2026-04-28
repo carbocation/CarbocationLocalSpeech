@@ -237,6 +237,7 @@ import Foundation
                     audio: audio,
                     queue: queue,
                     detector: detector,
+                    usesNoVAD: options.transcription.voiceActivityDetection.mode == .disabled,
                     maximumBufferDuration: maximumBufferDuration,
                     updateInterval: updateInterval,
                     finalSilenceDelay: finalSilenceDelay,
@@ -268,6 +269,7 @@ import Foundation
         audio: AsyncThrowingStream<AudioChunk, Error>,
         queue: CoalescingTranscriptionQueue,
         detector: VoiceActivityDetecting?,
+        usesNoVAD: Bool,
         maximumBufferDuration: TimeInterval,
         updateInterval: TimeInterval,
         finalSilenceDelay: TimeInterval,
@@ -279,12 +281,19 @@ import Foundation
             finalSilenceDelay: finalSilenceDelay,
             voiceActivityMode: .leadingSilence
         )
+        var frontierLowEnergyDuration: TimeInterval = 0
 
         do {
             for try await chunk in audio {
                 try Task.checkCancellation()
 
-                continuation.yield(.audioLevel(AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)))
+                let level = AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)
+                continuation.yield(.audioLevel(level))
+                if usesNoVAD, isLowEnergyFrontier(level) {
+                    frontierLowEnergyDuration += chunk.duration
+                } else {
+                    frontierLowEnergyDuration = 0
+                }
                 let activity = try optionalVoiceActivity(for: chunk, detector: detector, continuation: continuation)
                 let result = window.append(chunk, activity: activity)
                 if let audioGap = result.audioGap {
@@ -296,8 +305,13 @@ import Foundation
                 }
                 emitContextualWindowDiagnostics(result, continuation: continuation)
                 for emitted in result.chunks {
-                    await queue.enqueue(emitted)
-                    resetVoiceActivityStateIfNeeded(detector, after: emitted)
+                    let queued = chunkWithFrontierIdle(
+                        emitted,
+                        usesNoVAD: usesNoVAD,
+                        duration: frontierLowEnergyDuration
+                    )
+                    await queue.enqueue(queued)
+                    resetVoiceActivityStateIfNeeded(detector, after: queued)
                 }
                 if let silenceFlushTime = result.silenceFlushTime {
                     continuation.yield(.diagnostic(TranscriptionDiagnostic(
@@ -310,8 +324,13 @@ import Foundation
             }
 
             for emitted in window.finish() {
-                await queue.enqueue(emitted)
-                resetVoiceActivityStateIfNeeded(detector, after: emitted)
+                let queued = chunkWithFrontierIdle(
+                    emitted,
+                    usesNoVAD: usesNoVAD,
+                    duration: frontierLowEnergyDuration
+                )
+                await queue.enqueue(queued)
+                resetVoiceActivityStateIfNeeded(detector, after: queued)
             }
             await queue.finish()
         } catch {
@@ -433,6 +452,20 @@ import Foundation
         )))
 
         guard !segments.isEmpty else {
+            return
+        }
+
+        if let staleReplay = staleReplayRejection(
+            rawHypothesisText: segments.map(\.text).joined(separator: " "),
+            emitted: emitted,
+            options: options,
+            committedSegments: committedSegments
+        ) {
+            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                source: "streaming.pipeline",
+                message: staleReplay,
+                time: emitted.startTime
+            )))
             return
         }
 
@@ -835,6 +868,155 @@ import Foundation
         case .rollingBuffer, .vadUtterances:
             return false
         }
+    }
+
+    private static let noVADStaleReplayMinimumFrontierIdleDuration: TimeInterval = 1.0
+    private static let noVADStaleReplayRMSFloor: Float = 0.002
+    private static let noVADStaleReplayPeakFloor: Float = 0.008
+    private static let staleReplayMinimumCandidateTokenCount = 6
+    private static let staleReplayMinimumMatchedTokenCount = 6
+    private static let staleReplayMinimumOverlapRatio = 0.70
+    private static let staleReplayMaximumTrailingUnmatchedTokenCount = 2
+
+    private static func isLowEnergyFrontier(_ level: AudioLevel) -> Bool {
+        level.rms <= noVADStaleReplayRMSFloor && level.peak <= noVADStaleReplayPeakFloor
+    }
+
+    private static func chunkWithFrontierIdle(
+        _ chunk: SpeechAudioChunk,
+        usesNoVAD: Bool,
+        duration: TimeInterval
+    ) -> SpeechAudioChunk {
+        guard usesNoVAD else { return chunk }
+        var updated = chunk
+        updated.frontierLowEnergyDuration = duration
+        return updated
+    }
+
+    private static func staleReplayRejection(
+        rawHypothesisText: String,
+        emitted: SpeechAudioChunk,
+        options: StreamingTranscriptionOptions,
+        committedSegments: [TranscriptSegment]
+    ) -> String? {
+        guard options.transcription.voiceActivityDetection.mode == .disabled,
+              case .contextualRollingBuffer = options.emulation.window,
+              !emitted.isFinal,
+              !usesImmediateCommitment(options),
+              emitted.frontierLowEnergyDuration >= noVADStaleReplayMinimumFrontierIdleDuration,
+              let analysis = staleReplayAnalysis(
+                  candidateText: rawHypothesisText,
+                  committedSegments: committedSegments
+              )
+        else {
+            return nil
+        }
+
+        return [
+            "hypothesis_rejected=stale_replay",
+            "overlap=\(analysis.overlapRatio.formattedStreamingDebug)",
+            "matched=\(analysis.matchedTokenCount)/\(analysis.candidateTokenCount)",
+            "frontier_idle=\(emitted.frontierLowEnergyDuration.formattedStreamingDebug)s",
+            "trailing_unmatched=\(analysis.trailingUnmatchedTokenCount)"
+        ].joined(separator: " ")
+    }
+
+    private static func usesImmediateCommitment(_ options: StreamingTranscriptionOptions) -> Bool {
+        if case .immediate = resolvedCommitmentPolicy(options) {
+            return true
+        }
+        return false
+    }
+
+    private static func staleReplayAnalysis(
+        candidateText: String,
+        committedSegments: [TranscriptSegment]
+    ) -> StaleReplayAnalysis? {
+        let candidateTokens = tokens(in: candidateText).map(\.normalized)
+        guard candidateTokens.count >= staleReplayMinimumCandidateTokenCount else {
+            return nil
+        }
+
+        let committedText = committedSegments
+            .map(\.text)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let committedTokens = Array(tokens(in: committedText).suffix(200)).map(\.normalized)
+        guard committedTokens.count >= staleReplayMinimumMatchedTokenCount else {
+            return nil
+        }
+
+        let matchedCandidateIndices = longestCommonSubsequenceCandidateIndices(
+            candidateTokens: candidateTokens,
+            committedTokens: committedTokens
+        )
+        guard let lastMatchedCandidateIndex = matchedCandidateIndices.last else {
+            return nil
+        }
+
+        let matchedTokenCount = matchedCandidateIndices.count
+        let overlapRatio = Double(matchedTokenCount) / Double(candidateTokens.count)
+        let trailingUnmatchedTokenCount = candidateTokens.count - lastMatchedCandidateIndex - 1
+        guard matchedTokenCount >= staleReplayMinimumMatchedTokenCount,
+              overlapRatio >= staleReplayMinimumOverlapRatio,
+              trailingUnmatchedTokenCount <= staleReplayMaximumTrailingUnmatchedTokenCount else {
+            return nil
+        }
+
+        return StaleReplayAnalysis(
+            overlapRatio: overlapRatio,
+            matchedTokenCount: matchedTokenCount,
+            candidateTokenCount: candidateTokens.count,
+            trailingUnmatchedTokenCount: trailingUnmatchedTokenCount
+        )
+    }
+
+    private static func longestCommonSubsequenceCandidateIndices(
+        candidateTokens: [String],
+        committedTokens: [String]
+    ) -> [Int] {
+        guard !candidateTokens.isEmpty, !committedTokens.isEmpty else {
+            return []
+        }
+
+        var lengths = Array(
+            repeating: Array(repeating: 0, count: candidateTokens.count + 1),
+            count: committedTokens.count + 1
+        )
+
+        for committedIndex in 0..<committedTokens.count {
+            for candidateIndex in 0..<candidateTokens.count {
+                if tokensAreEquivalent(committedTokens[committedIndex], candidateTokens[candidateIndex]) {
+                    lengths[committedIndex + 1][candidateIndex + 1] = lengths[committedIndex][candidateIndex] + 1
+                } else {
+                    lengths[committedIndex + 1][candidateIndex + 1] = max(
+                        lengths[committedIndex][candidateIndex + 1],
+                        lengths[committedIndex + 1][candidateIndex]
+                    )
+                }
+            }
+        }
+
+        var committedIndex = committedTokens.count
+        var candidateIndex = candidateTokens.count
+        var matchedCandidateIndices: [Int] = []
+
+        while committedIndex > 0, candidateIndex > 0 {
+            let currentCommitted = committedTokens[committedIndex - 1]
+            let currentCandidate = candidateTokens[candidateIndex - 1]
+            if tokensAreEquivalent(currentCommitted, currentCandidate),
+               lengths[committedIndex][candidateIndex] == lengths[committedIndex - 1][candidateIndex - 1] + 1 {
+                matchedCandidateIndices.append(candidateIndex - 1)
+                committedIndex -= 1
+                candidateIndex -= 1
+            } else if lengths[committedIndex - 1][candidateIndex] >= lengths[committedIndex][candidateIndex - 1] {
+                committedIndex -= 1
+            } else {
+                candidateIndex -= 1
+            }
+        }
+
+        return matchedCandidateIndices.reversed()
     }
 
     private static func splitConfirmedPrefix(
@@ -1560,6 +1742,13 @@ import Foundation
 private struct TranscriptTextToken {
     var normalized: String
     var range: Range<String.Index>
+}
+
+private struct StaleReplayAnalysis {
+    var overlapRatio: Double
+    var matchedTokenCount: Int
+    var candidateTokenCount: Int
+    var trailingUnmatchedTokenCount: Int
 }
 
 private enum QueuedTranscriptionWork: Sendable {

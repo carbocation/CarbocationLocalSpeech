@@ -1563,6 +1563,214 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(completedText, "Speaking during a school visit in western Germany")
     }
 
+    func testSpeechChunkStreamingPipelineQuarantinesNoVADStaleReplayDuringIdleFrontier() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<6 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: index < 4 ? 0.05 : 0, count: 8_000),
+                        sampleRate: 16_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.5,
+                        duration: 0.5
+                    ))
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 1.0, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+        let stableText = "Merz said Washington quite obviously went into this war without any strategy"
+        let replayText = "Mersut said Washington quite obviously went into this war without any strategy"
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { chunk, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                if chunk.isFinal {
+                    text = ""
+                } else {
+                    text = callIndex <= 2 ? stableText : replayText
+                }
+                return Transcript(segments: text.isEmpty ? [] : [
+                    TranscriptSegment(text: text, startTime: 0, endTime: chunk.audio.duration)
+                ])
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message.contains("hypothesis_rejected=stale_replay")
+                    && diagnostic.message.contains("frontier_idle=")
+            }
+            return false
+        })
+        XCTAssertFalse(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.volatile?.text.contains("Mersut said Washington") ?? false
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains { event in
+            if case .completed(let transcript) = event {
+                return transcript.text == stableText
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineKeepsNoVADIdleCandidateWithNewSuffix() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<6 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: index < 4 ? 0.05 : 0, count: 8_000),
+                        sampleRate: 16_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.5,
+                        duration: 0.5
+                    ))
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 1.0, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+        let stableText = "Merz said Washington quite obviously went into this war"
+        let extendedText = "Merz said Washington quite obviously went into this war without any strategy and had new detail"
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { chunk, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                if chunk.isFinal {
+                    text = ""
+                } else {
+                    text = callIndex <= 2 ? stableText : extendedText
+                }
+                return Transcript(segments: text.isEmpty ? [] : [
+                    TranscriptSegment(text: text, startTime: 0, endTime: chunk.audio.duration)
+                ])
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertFalse(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message.contains("hypothesis_rejected=stale_replay")
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.volatile?.text.contains("without any strategy and had new detail") ?? false
+            }
+            return false
+        })
+    }
+
+    func testSpeechChunkStreamingPipelineDoesNotRejectNoVADLowEnergyUnrelatedCandidate() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<6 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: index < 4 ? 0.05 : 0, count: 8_000),
+                        sampleRate: 16_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.5,
+                        duration: 0.5
+                    ))
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 1.0, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+        let stableText = "alpha beta gamma delta epsilon zeta eta theta"
+        let unrelatedText = "completely different words arrive now with fresh material"
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { chunk, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                if chunk.isFinal {
+                    text = ""
+                } else {
+                    text = callIndex <= 2 ? stableText : unrelatedText
+                }
+                return Transcript(segments: text.isEmpty ? [] : [
+                    TranscriptSegment(text: text, startTime: 0, endTime: chunk.audio.duration)
+                ])
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertFalse(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message.contains("hypothesis_rejected=stale_replay")
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.volatile?.text.contains(unrelatedText) ?? false
+            }
+            return false
+        })
+    }
+
     func testSpeechChunkStreamingPipelineContextualFinalRequiresAgreementBeforeCommittingTail() async throws {
         let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
             Task {

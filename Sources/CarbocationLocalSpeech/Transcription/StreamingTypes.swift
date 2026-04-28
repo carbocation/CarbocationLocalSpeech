@@ -340,10 +340,17 @@ public protocol VoiceActivityDetecting: Sendable {
     public var audio: PreparedAudio
     public var startTime: TimeInterval
     public var isFinal: Bool
+    public var frontierLowEnergyDuration: TimeInterval
 
-    public init(audio: PreparedAudio, startTime: TimeInterval, isFinal: Bool) {
+    public init(
+        audio: PreparedAudio,
+        startTime: TimeInterval,
+        isFinal: Bool,
+        frontierLowEnergyDuration: TimeInterval = 0
+    ) {
         self.audio = audio
         self.startTime = startTime
         self.isFinal = isFinal
+        self.frontierLowEnergyDuration = frontierLowEnergyDuration
     }
 }
