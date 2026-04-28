@@ -124,6 +124,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry run: would sync Sources/whisper/include"
   echo "dry run: would verify header sync and C header parse"
   if [[ "$VALIDATE" -eq 1 ]]; then
+    echo "dry run: would rebuild the staged whisper library"
     echo "dry run: would build whisper.xcframework and run binary-artifact swift test"
   fi
   exit 0
@@ -135,6 +136,7 @@ git -C "$WHISPER_DIR" checkout --detach "$TAG"
 clang -fsyntax-only -x c -I "$ROOT/Sources/whisper/include" -include whisper.h /dev/null
 
 if [[ "$VALIDATE" -eq 1 ]]; then
+  "$ROOT/Scripts/build-whisper-macos.sh"
   "$ROOT/Scripts/build-whisper-xcframework.sh"
   (
     cd "$ROOT"
