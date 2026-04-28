@@ -64,7 +64,7 @@ public enum LocalSpeechEngineError: Error, LocalizedError, Sendable {
     }
 }
 
-public actor LocalSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscriber {
+public actor LocalSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
     public static let shared = LocalSpeechEngine()
 
     private let whisperEngine: WhisperEngine
@@ -226,7 +226,29 @@ public actor LocalSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTra
         }
     }
 
-    public func stream(
+    public nonisolated func stream(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        options: StreamingTranscriptionOptions
+    ) -> AsyncThrowingStream<TranscriptEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                let providerStream = await self.makeStream(audio: audio, options: options)
+                do {
+                    for try await event in providerStream {
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    private func makeStream(
         audio: AsyncThrowingStream<AudioChunk, Error>,
         options: StreamingTranscriptionOptions
     ) -> AsyncThrowingStream<TranscriptEvent, Error> {
@@ -240,7 +262,7 @@ public actor LocalSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTra
         case .installed:
             return AsyncThrowingStream { continuation in
                 let task = Task {
-                    let providerStream = await whisperEngine.stream(audio: audio, options: options)
+                    let providerStream = whisperEngine.stream(audio: audio, options: options)
                     do {
                         for try await event in providerStream {
                             continuation.yield(event)
@@ -257,7 +279,7 @@ public actor LocalSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTra
         case .system(.appleSpeech):
             return AsyncThrowingStream { continuation in
                 let task = Task {
-                    let providerStream = await appleSpeechEngine.stream(audio: audio, options: options)
+                    let providerStream = appleSpeechEngine.stream(audio: audio, options: options)
                     do {
                         for try await event in providerStream {
                             continuation.yield(event)

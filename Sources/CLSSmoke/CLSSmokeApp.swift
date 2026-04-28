@@ -631,7 +631,7 @@ private struct CLSSmokeRootView: View {
                 preferredChannelCount: 1,
                 frameDuration: 0.1
             ))
-            let stream = await LocalSpeechEngine.shared.stream(
+            let stream = LocalSpeechEngine.shared.stream(
                 audio: audio,
                 options: StreamingTranscriptionOptions(
                     transcription: TranscriptionOptions(

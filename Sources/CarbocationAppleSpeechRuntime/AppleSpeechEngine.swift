@@ -64,7 +64,7 @@ struct AppleAnalyzerInputClock {
     }
 }
 
-public actor AppleSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscriber {
+public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
     public static let shared = AppleSpeechEngine()
     public static let systemModelID = SpeechSystemModelID.appleSpeech
     public static let displayName = "Apple Speech"
@@ -175,7 +175,29 @@ public actor AppleSpeechEngine: @preconcurrency CarbocationLocalSpeech.SpeechTra
         return try await transcribe(file: url, options: options)
     }
 
-    public func stream(
+    public nonisolated func stream(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        options: StreamingTranscriptionOptions
+    ) -> AsyncThrowingStream<TranscriptEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                let providerStream = await self.makeStream(audio: audio, options: options)
+                do {
+                    for try await event in providerStream {
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    private func makeStream(
         audio: AsyncThrowingStream<AudioChunk, Error>,
         options: StreamingTranscriptionOptions
     ) -> AsyncThrowingStream<TranscriptEvent, Error> {

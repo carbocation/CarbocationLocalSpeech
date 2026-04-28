@@ -270,7 +270,7 @@ private final class WhisperStreamingSessionState: @unchecked Sendable {
     }
 }
 
-public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscriber {
+public actor WhisperEngine: CarbocationLocalSpeech.SpeechTranscriber {
     public static let shared = WhisperEngine()
 
     private let configuration: WhisperEngineConfiguration
@@ -440,7 +440,29 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
 #endif
     }
 
-    public func stream(
+    public nonisolated func stream(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        options: StreamingTranscriptionOptions
+    ) -> AsyncThrowingStream<TranscriptEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                let providerStream = await self.makeStream(audio: audio, options: options)
+                do {
+                    for try await event in providerStream {
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    private func makeStream(
         audio: AsyncThrowingStream<AudioChunk, Error>,
         options: StreamingTranscriptionOptions
     ) -> AsyncThrowingStream<TranscriptEvent, Error> {
