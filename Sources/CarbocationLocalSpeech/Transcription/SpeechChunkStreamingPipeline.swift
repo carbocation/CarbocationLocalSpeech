@@ -261,7 +261,8 @@ import Foundation
         var window = SpeechContextualRollingWindow(
             maximumBufferDuration: maximumBufferDuration,
             updateInterval: updateInterval,
-            finalSilenceDelay: finalSilenceDelay
+            finalSilenceDelay: finalSilenceDelay,
+            voiceActivityMode: .leadingSilence
         )
 
         do {
@@ -282,6 +283,14 @@ import Foundation
                 for emitted in result.chunks {
                     await queue.enqueue(emitted)
                     resetVoiceActivityStateIfNeeded(detector, after: emitted)
+                }
+                if let silenceFlushTime = result.silenceFlushTime {
+                    await queue.enqueueFlushPending(time: silenceFlushTime)
+                    continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                        source: "streaming.pipeline",
+                        message: "contextual_silence_flush=\(silenceFlushTime.formattedStreamingDebug)s",
+                        time: silenceFlushTime
+                    )))
                 }
             }
 
@@ -309,17 +318,28 @@ import Foundation
             allowsFallbackCommit: localAgreementAllowsFallbackCommit(for: options)
         )
 
-        while let emitted = try await queue.next() {
+        while let work = try await queue.next() {
             try Task.checkCancellation()
-            try await process(
-                emitted,
-                backend: backend,
-                options: options,
-                transcribe: transcribe,
-                committedSegments: &committedSegments,
-                agreementState: &agreementState,
-                continuation: continuation
-            )
+            switch work {
+            case .transcribe(let emitted):
+                try await process(
+                    emitted,
+                    backend: backend,
+                    options: options,
+                    transcribe: transcribe,
+                    committedSegments: &committedSegments,
+                    agreementState: &agreementState,
+                    continuation: continuation
+                )
+            case .flushPending:
+                flushPendingLocalAgreementIfNeeded(
+                    backend: backend,
+                    options: options,
+                    committedSegments: &committedSegments,
+                    agreementState: &agreementState,
+                    continuation: continuation
+                )
+            }
         }
 
         flushPendingLocalAgreementIfNeeded(
@@ -403,6 +423,16 @@ import Foundation
         )
 
         guard !candidateSegments.isEmpty else {
+            return
+        }
+
+        if rejectsPathologicalRepetition(for: options),
+           containsPathologicalRepetition(candidateSegments.map(\.text).joined(separator: " ")) {
+            continuation.yield(.diagnostic(TranscriptionDiagnostic(
+                source: "streaming.pipeline",
+                message: "hypothesis_rejected=repetition",
+                time: emitted.startTime
+            )))
             return
         }
 
@@ -729,6 +759,15 @@ import Foundation
         }
     }
 
+    private static func rejectsPathologicalRepetition(for options: StreamingTranscriptionOptions) -> Bool {
+        switch options.emulation.window {
+        case .contextualRollingBuffer:
+            return true
+        case .rollingBuffer, .vadUtterances:
+            return false
+        }
+    }
+
     private static func splitConfirmedPrefix(
         in text: String,
         tokenCount: Int
@@ -776,6 +815,39 @@ import Foundation
         }
 
         return count
+    }
+
+    private static func containsPathologicalRepetition(_ text: String) -> Bool {
+        let normalizedTokens = tokens(in: text).map(\.normalized)
+        guard normalizedTokens.count >= 12 else { return false }
+
+        let maximumPhraseLength = min(12, normalizedTokens.count / 3)
+        guard maximumPhraseLength >= 4 else { return false }
+
+        for phraseLength in stride(from: maximumPhraseLength, through: 4, by: -1) {
+            var index = 0
+            while index + phraseLength * 3 <= normalizedTokens.count {
+                let phrase = Array(normalizedTokens[index..<(index + phraseLength)])
+                var repetitionCount = 1
+                var nextIndex = index + phraseLength
+
+                while nextIndex + phraseLength <= normalizedTokens.count {
+                    let nextPhrase = Array(normalizedTokens[nextIndex..<(nextIndex + phraseLength)])
+                    guard tokenSequencesMatch(phrase, nextPhrase) else {
+                        break
+                    }
+                    repetitionCount += 1
+                    nextIndex += phraseLength
+                }
+
+                if repetitionCount >= 3 {
+                    return true
+                }
+                index += 1
+            }
+        }
+
+        return false
     }
 
     private struct LocalAgreementState {
@@ -1339,6 +1411,9 @@ import Foundation
 
     private static func normalizedTokenAlternates(_ token: String) -> Set<String> {
         var alternates: Set<String> = [token]
+        if let numberAlternate = numberTokenAlternate(for: token) {
+            alternates.insert(numberAlternate)
+        }
         if token.count > 4, token.hasSuffix("'s") {
             alternates.insert(String(token.dropLast(2)))
         }
@@ -1353,6 +1428,43 @@ import Foundation
             alternates.insert(String(token.dropLast()))
         }
         return alternates
+    }
+
+    private static func numberTokenAlternate(for token: String) -> String? {
+        let numberWords: [String: String] = [
+            "zero": "0",
+            "one": "1",
+            "two": "2",
+            "three": "3",
+            "four": "4",
+            "five": "5",
+            "six": "6",
+            "seven": "7",
+            "eight": "8",
+            "nine": "9",
+            "ten": "10",
+            "eleven": "11",
+            "twelve": "12",
+            "thirteen": "13",
+            "fourteen": "14",
+            "fifteen": "15",
+            "sixteen": "16",
+            "seventeen": "17",
+            "eighteen": "18",
+            "nineteen": "19",
+            "twenty": "20",
+            "thirty": "30",
+            "forty": "40",
+            "fifty": "50",
+            "sixty": "60",
+            "seventy": "70",
+            "eighty": "80",
+            "ninety": "90"
+        ]
+        if let digit = numberWords[token] {
+            return digit
+        }
+        return numberWords.first(where: { $0.value == token })?.key
     }
 
     private static func offset(_ segment: TranscriptSegment, by offset: TimeInterval) -> TranscriptSegment {
@@ -1381,9 +1493,15 @@ private struct TranscriptTextToken {
     var range: Range<String.Index>
 }
 
+private enum QueuedTranscriptionWork: Sendable {
+    case transcribe(SpeechAudioChunk)
+    case flushPending(time: TimeInterval)
+}
+
 private actor CoalescingTranscriptionQueue {
     private var pendingFinals: [SpeechAudioChunk] = []
     private var latestNonFinal: SpeechAudioChunk?
+    private var pendingFlushTime: TimeInterval?
     private var isFinished = false
     private var failure: Error?
     private var waiter: CheckedContinuation<Void, Never>?
@@ -1393,8 +1511,14 @@ private actor CoalescingTranscriptionQueue {
             latestNonFinal = nil
             pendingFinals.append(chunk)
         } else {
+            pendingFlushTime = nil
             latestNonFinal = chunk
         }
+        resumeWaiter()
+    }
+
+    func enqueueFlushPending(time: TimeInterval) {
+        pendingFlushTime = time
         resumeWaiter()
     }
 
@@ -1408,20 +1532,25 @@ private actor CoalescingTranscriptionQueue {
         isFinished = true
         pendingFinals.removeAll(keepingCapacity: true)
         latestNonFinal = nil
+        pendingFlushTime = nil
         resumeWaiter()
     }
 
-    func next() async throws -> SpeechAudioChunk? {
+    func next() async throws -> QueuedTranscriptionWork? {
         while true {
             if let failure {
                 throw failure
             }
             if !pendingFinals.isEmpty {
-                return pendingFinals.removeFirst()
+                return .transcribe(pendingFinals.removeFirst())
             }
             if let latestNonFinal {
                 self.latestNonFinal = nil
-                return latestNonFinal
+                return .transcribe(latestNonFinal)
+            }
+            if let pendingFlushTime {
+                self.pendingFlushTime = nil
+                return .flushPending(time: pendingFlushTime)
             }
             if isFinished {
                 return nil

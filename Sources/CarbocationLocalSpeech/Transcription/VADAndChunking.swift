@@ -316,25 +316,33 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
 }
 
 @_spi(Internal) public struct SpeechContextualRollingWindow: Sendable {
+    public enum VoiceActivityMode: Sendable {
+        case turnFinals
+        case leadingSilence
+    }
+
     public struct AppendResult: Sendable {
         public var chunks: [SpeechAudioChunk]
         public var audioGap: TimeInterval?
         public var speechStartTime: TimeInterval?
         public var leadingSilenceTrimmed: TimeInterval?
         public var turnFinalTime: TimeInterval?
+        public var silenceFlushTime: TimeInterval?
 
         public init(
             chunks: [SpeechAudioChunk],
             audioGap: TimeInterval? = nil,
             speechStartTime: TimeInterval? = nil,
             leadingSilenceTrimmed: TimeInterval? = nil,
-            turnFinalTime: TimeInterval? = nil
+            turnFinalTime: TimeInterval? = nil,
+            silenceFlushTime: TimeInterval? = nil
         ) {
             self.chunks = chunks
             self.audioGap = audioGap
             self.speechStartTime = speechStartTime
             self.leadingSilenceTrimmed = leadingSilenceTrimmed
             self.turnFinalTime = turnFinalTime
+            self.silenceFlushTime = silenceFlushTime
         }
     }
 
@@ -342,6 +350,7 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
     public var updateInterval: TimeInterval
     public var finalSilenceDelay: TimeInterval
     public var preSpeechPaddingDuration: TimeInterval
+    public var voiceActivityMode: VoiceActivityMode
 
     private var samples: [Float] = []
     private var sampleRate: Double?
@@ -352,17 +361,20 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
     private var hasObservedSpeech = false
     private var hasActiveSpeechTurn = false
     private var hasEmittedTurnFinal = false
+    private var hasEmittedSilenceFlush = false
 
     public init(
         maximumBufferDuration: TimeInterval,
         updateInterval: TimeInterval,
         finalSilenceDelay: TimeInterval,
-        preSpeechPaddingDuration: TimeInterval = 0.5
+        preSpeechPaddingDuration: TimeInterval = 0.5,
+        voiceActivityMode: VoiceActivityMode = .turnFinals
     ) {
         self.maximumBufferDuration = max(0.1, maximumBufferDuration)
         self.updateInterval = max(0.05, updateInterval)
         self.finalSilenceDelay = max(0.05, finalSilenceDelay)
         self.preSpeechPaddingDuration = max(0, preSpeechPaddingDuration)
+        self.voiceActivityMode = voiceActivityMode
     }
 
     public mutating func append(
@@ -403,6 +415,17 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
             )
         }
 
+        if shouldFlushForSilence {
+            hasEmittedSilenceFlush = true
+            return AppendResult(
+                chunks: emitted,
+                audioGap: gap,
+                speechStartTime: startsSpeechTurn ? activity?.startTime : nil,
+                leadingSilenceTrimmed: leadingSilenceTrimmed,
+                silenceFlushTime: bufferEndTime
+            )
+        }
+
         if shouldEmitUpdate, let update = emitChunk(isFinal: false) {
             emitted.append(update)
         }
@@ -417,7 +440,21 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
     }
 
     public mutating func finish() -> [SpeechAudioChunk] {
-        if usesVoiceActivity && (!hasObservedSpeech || (!hasActiveSpeechTurn && hasEmittedTurnFinal)) {
+        if usesVoiceActivity && !hasObservedSpeech {
+            reset()
+            return []
+        }
+        if voiceActivityMode == .turnFinals,
+           usesVoiceActivity,
+           !hasActiveSpeechTurn,
+           hasEmittedTurnFinal {
+            reset()
+            return []
+        }
+        if voiceActivityMode == .leadingSilence,
+           usesVoiceActivity,
+           hasObservedSpeech,
+           silenceDuration >= finalSilenceDelay {
             reset()
             return []
         }
@@ -436,7 +473,18 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
     }
 
     private var shouldEmitUpdate: Bool {
-        if usesVoiceActivity && !hasActiveSpeechTurn {
+        if usesVoiceActivity && !hasObservedSpeech {
+            return false
+        }
+        if voiceActivityMode == .leadingSilence,
+           usesVoiceActivity,
+           hasObservedSpeech,
+           silenceDuration >= finalSilenceDelay {
+            return false
+        }
+        if voiceActivityMode == .turnFinals,
+           usesVoiceActivity,
+           !hasActiveSpeechTurn {
             return false
         }
         guard let startTime, let bufferEndTime else { return false }
@@ -445,7 +493,18 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
     }
 
     private var shouldFinalizeForSilence: Bool {
-        hasActiveSpeechTurn && !hasEmittedTurnFinal && silenceDuration >= finalSilenceDelay
+        voiceActivityMode == .turnFinals
+            && hasActiveSpeechTurn
+            && !hasEmittedTurnFinal
+            && silenceDuration >= finalSilenceDelay
+    }
+
+    private var shouldFlushForSilence: Bool {
+        voiceActivityMode == .leadingSilence
+            && usesVoiceActivity
+            && hasObservedSpeech
+            && !hasEmittedSilenceFlush
+            && silenceDuration >= finalSilenceDelay
     }
 
     private mutating func appendSamples(from chunk: AudioChunk) {
@@ -463,6 +522,7 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
             hasObservedSpeech = true
             hasActiveSpeechTurn = true
             hasEmittedTurnFinal = false
+            hasEmittedSilenceFlush = false
             silenceDuration = 0
         } else {
             silenceDuration += duration
@@ -556,5 +616,6 @@ public struct EnergyVoiceActivityDetector: VoiceActivityDetecting {
         hasObservedSpeech = false
         hasActiveSpeechTurn = false
         hasEmittedTurnFinal = false
+        hasEmittedSilenceFlush = false
     }
 }

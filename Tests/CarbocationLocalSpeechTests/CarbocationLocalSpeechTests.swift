@@ -681,6 +681,43 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(nextSpeech.chunks[0].audio.duration, 2.0, accuracy: 0.000_1)
     }
 
+    func testSpeechContextualRollingWindowLeadingSilenceModeDoesNotFinalizeOnVADSilence() throws {
+        var window = SpeechContextualRollingWindow(
+            maximumBufferDuration: 10.0,
+            updateInterval: 0.5,
+            finalSilenceDelay: 0.5,
+            voiceActivityMode: .leadingSilence
+        )
+
+        _ = window.append(
+            AudioChunk(
+                samples: Array(repeating: 0.05, count: 500),
+                sampleRate: 1_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 0.5
+            ),
+            activity: VoiceActivityEvent(state: .speech, startTime: 0, endTime: 0.5)
+        )
+
+        let silence = window.append(
+            AudioChunk(
+                samples: Array(repeating: 0, count: 500),
+                sampleRate: 1_000,
+                channelCount: 1,
+                startTime: 0.5,
+                duration: 0.5
+            ),
+            activity: VoiceActivityEvent(state: .silence, startTime: 0.5, endTime: 1.0)
+        )
+
+        XCTAssertNil(silence.turnFinalTime)
+        XCTAssertTrue(silence.chunks.isEmpty)
+        XCTAssertEqual(silence.silenceFlushTime, 1.0)
+
+        XCTAssertTrue(window.finish().isEmpty)
+    }
+
     func testSpeechContextualRollingWindowEmitsFinalBeforeInputGap() throws {
         var window = SpeechContextualRollingWindow(
             maximumBufferDuration: 10.0,
@@ -1252,6 +1289,153 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         )
     }
 
+    func testSpeechChunkStreamingPipelineContextualWindowsSuppressCommittedReplayWithDigitWords() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<4 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: 0.05, count: 8_000),
+                        sampleRate: 16_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.5,
+                        duration: 0.5
+                    ))
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1, 2:
+                    text = "Dietary fiber, less than one gram. Total sugars, eighteen grams. Include seventeen grams added sugars."
+                default:
+                    text = "1 gram. Total sugars, 18 grams. Include 17 grams added sugars."
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertFalse(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.volatile?.text == "1 gram. Total sugars, 18 grams. Include 17 grams added sugars."
+            }
+            return false
+        })
+
+        let completedText = events.compactMap { event -> String? in
+            if case .completed(let transcript) = event {
+                return transcript.text
+            }
+            return nil
+        }.last ?? ""
+        XCTAssertEqual(
+            completedText,
+            "Dietary fiber, less than one gram. Total sugars, eighteen grams. Include seventeen grams added sugars."
+        )
+    }
+
+    func testSpeechChunkStreamingPipelineContextualRejectsRepeatedLoopHypothesis() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<4 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: 0.05, count: 8_000),
+                        sampleRate: 16_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.5,
+                        duration: 0.5
+                    ))
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .disabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 1.0)
+            )
+        )
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1:
+                    text = "Speaking during a school visit"
+                case 2:
+                    text = "Speaking during a school visit in western Germany"
+                default:
+                    text = "The U.S. is now being attacked by Iran. The U.S. is now being attacked by Iran. The U.S. is now being attacked by Iran. The U.S. is now being attacked by Iran."
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            }
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message == "hypothesis_rejected=repetition"
+            }
+            return false
+        })
+        XCTAssertFalse(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.transcript.text.contains("attacked by Iran")
+            }
+            return false
+        })
+
+        let completedText = events.compactMap { event -> String? in
+            if case .completed(let transcript) = event {
+                return transcript.text
+            }
+            return nil
+        }.last ?? ""
+        XCTAssertEqual(completedText, "Speaking during a school visit in western Germany")
+    }
+
     func testSpeechChunkStreamingPipelineContextualFinalRequiresAgreementBeforeCommittingTail() async throws {
         let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
             Task {
@@ -1385,6 +1569,75 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             completedText,
             "Consumption of alcoholic beverages impairs your ability to drive a car or to operate machinery and may cause"
         )
+    }
+
+    func testSpeechChunkStreamingPipelineContextualFlushesPendingTailOnSustainedVADSilence() async throws {
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            Task {
+                for index in 0..<3 {
+                    continuation.yield(AudioChunk(
+                        samples: Array(repeating: index == 2 ? 0 : 0.05, count: 8_000),
+                        sampleRate: 16_000,
+                        channelCount: 1,
+                        startTime: TimeInterval(index) * 0.5,
+                        duration: 0.5
+                    ))
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+                continuation.finish()
+            }
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(voiceActivityDetection: .enabled),
+            commitment: .localAgreement(iterations: 2),
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .contextualRollingBuffer(maxDuration: 10.0, updateInterval: 0.5, finalSilenceDelay: 0.5)
+            )
+        )
+        let detector = SequenceVoiceActivityDetector(states: [.speech, .speech, .silence])
+        let callCounter = SpeechChunkStreamingPipelineCallCounter()
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { _, _ in
+                let callIndex = await callCounter.next()
+                let text: String
+                switch callIndex {
+                case 1:
+                    text = "Friedrich Murs said the U.S."
+                default:
+                    text = "Friedrich Murs said the U.S.-Israel war on the regime in Iran hurts growth"
+                }
+                return Transcript(segments: [
+                    TranscriptSegment(text: text, startTime: 0, endTime: 1)
+                ])
+            },
+            voiceActivityDetector: detector
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            if case .diagnostic(let diagnostic) = event {
+                return diagnostic.message.hasPrefix("contextual_silence_flush=")
+            }
+            return false
+        })
+        XCTAssertTrue(events.contains { event in
+            if case .snapshot(let snapshot) = event {
+                return snapshot.stable.text.contains("Israel war on the regime in Iran hurts growth")
+                    && (snapshot.volatile?.text.isEmpty ?? true)
+            }
+            return false
+        })
     }
 
     func testSpeechChunkStreamingPipelineTrimsCommittedOverlap() async throws {

@@ -605,6 +605,12 @@ public actor WhisperEngine: @preconcurrency CarbocationLocalSpeech.SpeechTranscr
                 source: "whisper.streaming",
                 message: "commit_policy=strict-contextual"
             ))
+            if options.transcription.voiceActivityDetection.mode != .disabled {
+                diagnostics.append(TranscriptionDiagnostic(
+                    source: "whisper.streaming",
+                    message: "outer_vad_boundary=soft-contextual"
+                ))
+            }
         case .rollingBuffer(let maxDuration, let updateInterval, let overlap):
             diagnostics.append(TranscriptionDiagnostic(
                 source: "whisper.streaming",
