@@ -708,6 +708,96 @@ public actor WhisperEngine: CarbocationLocalSpeech.SpeechTranscriber {
     }
 }
 
+struct WhisperDecodedTokenPiece: Hashable, Sendable {
+    var text: String
+    var startTime: TimeInterval
+    var endTime: TimeInterval
+    var confidence: Double
+}
+
+enum WhisperTokenWordGrouping {
+    static func transcriptWords(from tokens: [WhisperDecodedTokenPiece]) -> [TranscriptWord] {
+        var grouped: [TranscriptWord] = []
+        var currentText = ""
+        var currentStartTime: TimeInterval?
+        var currentEndTime: TimeInterval?
+        var currentConfidenceTotal = 0.0
+        var currentConfidenceCount = 0
+
+        func flushCurrent() {
+            let text = collapsedWhitespace(currentText)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            defer {
+                currentText = ""
+                currentStartTime = nil
+                currentEndTime = nil
+                currentConfidenceTotal = 0
+                currentConfidenceCount = 0
+            }
+            guard !text.isEmpty,
+                  let startTime = currentStartTime,
+                  let endTime = currentEndTime else {
+                return
+            }
+
+            let confidence: Double? = currentConfidenceCount > 0
+                ? currentConfidenceTotal / Double(currentConfidenceCount)
+                : nil
+            grouped.append(TranscriptWord(
+                text: text,
+                startTime: startTime,
+                endTime: max(startTime, endTime),
+                confidence: confidence
+            ))
+        }
+
+        for token in tokens {
+            let tokenText = token.text
+            let visibleText = tokenText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !visibleText.isEmpty else { continue }
+
+            if startsWithWhitespace(tokenText), !currentText.isEmpty {
+                flushCurrent()
+            }
+
+            if currentText.isEmpty {
+                currentStartTime = token.startTime
+            }
+            currentText += visibleText
+            currentEndTime = token.endTime
+            currentConfidenceTotal += token.confidence
+            currentConfidenceCount += 1
+        }
+
+        flushCurrent()
+        return grouped
+    }
+
+    private static func startsWithWhitespace(_ text: String) -> Bool {
+        guard let first = text.unicodeScalars.first else { return false }
+        return CharacterSet.whitespacesAndNewlines.contains(first)
+    }
+
+    private static func collapsedWhitespace(_ text: String) -> String {
+        var result = ""
+        var lastWasWhitespace = false
+
+        for scalar in text.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                if !lastWasWhitespace {
+                    result.append(" ")
+                    lastWasWhitespace = true
+                }
+            } else {
+                result.unicodeScalars.append(scalar)
+                lastWasWhitespace = false
+            }
+        }
+
+        return result
+    }
+}
+
 #if CARBOCATION_HAS_WHISPER_C_API
 private final class WhisperStreamingCallbackBox: @unchecked Sendable {
     private let lock = NSLock()
@@ -892,96 +982,6 @@ private let whisperStreamingEncoderBeginCallback: whisper_encoder_begin_callback
     guard let userData else { return true }
     let state = Unmanaged<WhisperStreamingSessionState>.fromOpaque(userData).takeUnretainedValue()
     return !state.isCancelled
-}
-
-struct WhisperDecodedTokenPiece: Hashable, Sendable {
-    var text: String
-    var startTime: TimeInterval
-    var endTime: TimeInterval
-    var confidence: Double
-}
-
-enum WhisperTokenWordGrouping {
-    static func transcriptWords(from tokens: [WhisperDecodedTokenPiece]) -> [TranscriptWord] {
-        var grouped: [TranscriptWord] = []
-        var currentText = ""
-        var currentStartTime: TimeInterval?
-        var currentEndTime: TimeInterval?
-        var currentConfidenceTotal = 0.0
-        var currentConfidenceCount = 0
-
-        func flushCurrent() {
-            let text = collapsedWhitespace(currentText)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            defer {
-                currentText = ""
-                currentStartTime = nil
-                currentEndTime = nil
-                currentConfidenceTotal = 0
-                currentConfidenceCount = 0
-            }
-            guard !text.isEmpty,
-                  let startTime = currentStartTime,
-                  let endTime = currentEndTime else {
-                return
-            }
-
-            let confidence: Double? = currentConfidenceCount > 0
-                ? currentConfidenceTotal / Double(currentConfidenceCount)
-                : nil
-            grouped.append(TranscriptWord(
-                text: text,
-                startTime: startTime,
-                endTime: max(startTime, endTime),
-                confidence: confidence
-            ))
-        }
-
-        for token in tokens {
-            let tokenText = token.text
-            let visibleText = tokenText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !visibleText.isEmpty else { continue }
-
-            if startsWithWhitespace(tokenText), !currentText.isEmpty {
-                flushCurrent()
-            }
-
-            if currentText.isEmpty {
-                currentStartTime = token.startTime
-            }
-            currentText += visibleText
-            currentEndTime = token.endTime
-            currentConfidenceTotal += token.confidence
-            currentConfidenceCount += 1
-        }
-
-        flushCurrent()
-        return grouped
-    }
-
-    private static func startsWithWhitespace(_ text: String) -> Bool {
-        guard let first = text.unicodeScalars.first else { return false }
-        return CharacterSet.whitespacesAndNewlines.contains(first)
-    }
-
-    private static func collapsedWhitespace(_ text: String) -> String {
-        var result = ""
-        var lastWasWhitespace = false
-
-        for scalar in text.unicodeScalars {
-            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
-                if !lastWasWhitespace {
-                    result.append(" ")
-                    lastWasWhitespace = true
-                }
-            } else {
-                result.unicodeScalars.append(scalar)
-                lastWasWhitespace = false
-            }
-        }
-
-        return result
-    }
 }
 
 private extension WhisperEngine {
