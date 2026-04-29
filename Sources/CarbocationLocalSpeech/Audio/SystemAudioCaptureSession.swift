@@ -19,6 +19,7 @@ public struct SystemAudioCaptureOptions: Hashable, Sendable {
 
 @available(macOS 15.0, *)
 public enum SystemAudioCaptureError: Error, LocalizedError, Sendable {
+    case sdkUnavailable
     case processTapCreationFailed
     case aggregateDeviceCreationFailed
     case inputAudioUnitUnavailable
@@ -30,6 +31,8 @@ public enum SystemAudioCaptureError: Error, LocalizedError, Sendable {
 
     public var errorDescription: String? {
         switch self {
+        case .sdkUnavailable:
+            return "System audio capture requires a newer Core Audio SDK."
         case .processTapCreationFailed:
             return "Could not create a system audio tap."
         case .aggregateDeviceCreationFailed:
@@ -50,6 +53,7 @@ public enum SystemAudioCaptureError: Error, LocalizedError, Sendable {
     }
 }
 
+#if CARBOCATION_HAS_SYSTEM_AUDIO_TAPS
 @available(macOS 15.0, *)
 public final class SystemAudioCaptureSession: AudioCapturing, @unchecked Sendable {
     private let options: SystemAudioCaptureOptions
@@ -284,6 +288,26 @@ private final class SystemAudioCaptureState: @unchecked Sendable {
         try? AudioHardwareSystem.shared.destroyProcessTap(processTap)
     }
 }
+#else
+@available(macOS 15.0, *)
+public final class SystemAudioCaptureSession: AudioCapturing, @unchecked Sendable {
+    private let options: SystemAudioCaptureOptions
+
+    public init(options: SystemAudioCaptureOptions = SystemAudioCaptureOptions()) {
+        self.options = options
+    }
+
+    public func start(configuration: AudioCaptureConfiguration = AudioCaptureConfiguration()) -> AsyncThrowingStream<AudioChunk, Error> {
+        _ = options
+        _ = configuration
+        return AsyncThrowingStream { continuation in
+            continuation.finish(throwing: SystemAudioCaptureError.sdkUnavailable)
+        }
+    }
+
+    public func stop() {}
+}
+#endif
 
 private final class CaptureTiming: @unchecked Sendable {
     private let lock = NSLock()

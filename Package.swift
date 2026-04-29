@@ -10,11 +10,14 @@ let whisperBinaryArtifactChecksum = ""
 let whisperBinaryArtifactPath = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH"] ?? ""
 let forceSourceWhisper = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_SOURCE_WHISPER"] == "1"
 let forceDisableModernSpeechSDK = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_DISABLE_MODERN_SPEECH"] == "1"
+let forceDisableSystemAudioTaps = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_DISABLE_SYSTEM_AUDIO_TAPS"] == "1"
 let sourceWhisperLibraryExists = FileManager.default.fileExists(atPath: whisperCombinedLibrary)
 let whisperCAPIIsLinked = sourceWhisperLibraryExists || forceSourceWhisper || !whisperBinaryArtifactPath.isEmpty || (!whisperBinaryArtifactURL.isEmpty && !whisperBinaryArtifactChecksum.isEmpty)
 let whisperRuntimeSwiftSettings: [SwiftSetting] = whisperCAPIIsLinked ? [.define("CARBOCATION_HAS_WHISPER_C_API")] : []
 let modernSpeechSDKIsAvailable = !forceDisableModernSpeechSDK && macOSSDKContainsModernSpeechSymbols()
 let appleSpeechRuntimeSwiftSettings: [SwiftSetting] = modernSpeechSDKIsAvailable ? [.define("CARBOCATION_HAS_MODERN_SPEECH")] : []
+let systemAudioTapsAreAvailable = !forceDisableSystemAudioTaps && coreAudioSwiftOverlayContainsSystemAudioTapSymbols()
+let localSpeechSwiftSettings: [SwiftSetting] = systemAudioTapsAreAvailable ? [.define("CARBOCATION_HAS_SYSTEM_AUDIO_TAPS")] : []
 let clsSmokeInfoPlist = "\(packageRoot)/Sources/CLSSmoke/Info.plist"
 
 // canImport(Speech) is true on older SDKs that lack the macOS 26 analyzer API.
@@ -77,12 +80,21 @@ func installedXcodeDeveloperDirectories() -> [String] {
 }
 
 func xcrunMacOSSDKPath() -> String? {
+    guard let path = xcrunOutput(arguments: ["--sdk", "macosx", "--show-sdk-path"]),
+          !path.isEmpty,
+          FileManager.default.fileExists(atPath: path) else {
+        return nil
+    }
+    return path
+}
+
+func xcrunOutput(arguments: [String]) -> String? {
     guard FileManager.default.isExecutableFile(atPath: "/usr/bin/xcrun") else {
         return nil
     }
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-    process.arguments = ["--sdk", "macosx", "--show-sdk-path"]
+    process.arguments = arguments
 
     let output = Pipe()
     process.standardOutput = output
@@ -98,14 +110,40 @@ func xcrunMacOSSDKPath() -> String? {
     guard process.terminationStatus == 0 else { return nil }
 
     let data = output.fileHandleForReading.readDataToEndOfFile()
-    guard let path = String(data: data, encoding: .utf8)?
-        .trimmingCharacters(in: .whitespacesAndNewlines),
-        !path.isEmpty,
-        FileManager.default.fileExists(atPath: path) else {
+    return String(data: data, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func swiftCompilerPath() -> String? {
+    guard let path = xcrunOutput(arguments: ["--find", "swiftc"]),
+          !path.isEmpty,
+          FileManager.default.fileExists(atPath: path) else {
         return nil
     }
-
     return path
+}
+
+func swiftResourcePath() -> String? {
+    guard let swiftCompilerPath = swiftCompilerPath() else { return nil }
+    let path = URL(fileURLWithPath: swiftCompilerPath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("lib/swift")
+        .path
+    return FileManager.default.fileExists(atPath: path) ? path : nil
+}
+
+func coreAudioSwiftOverlayContainsSystemAudioTapSymbols() -> Bool {
+    guard let swiftResourcePath = swiftResourcePath() else { return false }
+    let prebuiltModules = URL(fileURLWithPath: swiftResourcePath)
+        .appendingPathComponent("macosx/prebuilt-modules", isDirectory: true)
+    return swiftModule(at: prebuiltModules, containsAll: [
+        "AudioHardwareSystem",
+        "AudioHardwareTap",
+        "AudioHardwareAggregateDevice",
+        "makeProcessTap",
+        "destroyProcessTap"
+    ])
 }
 
 func swiftModule(at directory: URL, containsAll symbols: [String]) -> Bool {
@@ -173,6 +211,7 @@ let package = Package(
     targets: [
         .target(
             name: "CarbocationLocalSpeech",
+            swiftSettings: localSpeechSwiftSettings,
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("AudioToolbox"),
