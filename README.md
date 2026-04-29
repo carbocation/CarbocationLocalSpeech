@@ -10,7 +10,7 @@ Host apps remain responsible for product behavior: hotkeys, paste/type behavior,
 
 ## Consuming Apps
 
-For normal app integration, use the `v0.1.0` release. Do not point shipping apps
+For normal app integration, use the `v0.2.0` release. Do not point shipping apps
 at `main`.
 
 The release tag's `Package.swift` points SwiftPM at the published
@@ -25,7 +25,7 @@ The release tag's `Package.swift` points SwiftPM at the published
 https://github.com/carbocation/CarbocationLocalSpeech.git
 ```
 
-2. Choose `Exact Version` `0.1.0` while integrating. The Git tag is `v0.1.0`.
+2. Choose `Exact Version` `0.2.0` while integrating. The Git tag is `v0.2.0`.
 
 For a Swift package host app, add the dependency directly:
 
@@ -33,7 +33,7 @@ For a Swift package host app, add the dependency directly:
 dependencies: [
     .package(
         url: "https://github.com/carbocation/CarbocationLocalSpeech.git",
-        exact: "0.1.0"
+        exact: "0.2.0"
     )
 ]
 ```
@@ -166,7 +166,7 @@ In `Package.swift`, target dependencies look like this:
 dependencies: [
     .package(
         url: "https://github.com/carbocation/CarbocationLocalSpeech.git",
-        exact: "0.1.0"
+        exact: "0.2.0"
     )
 ],
 targets: [
@@ -183,9 +183,9 @@ targets: [
 
 ### What Xcode Should Build
 
-For the `v0.1.0` release tag, Xcode should:
+For the `v0.2.0` release tag, Xcode should:
 
-1. Resolve `CarbocationLocalSpeech` from GitHub at version `0.1.0`.
+1. Resolve `CarbocationLocalSpeech` from GitHub at version `0.2.0`.
 2. Download `whisper.xcframework.zip` from the release asset URL recorded in that tag's `Package.swift`.
 3. Link the selected products into the host app target.
 4. Build the app normally.
@@ -552,7 +552,7 @@ To prepare a release manifest manually:
 
 ```sh
 Scripts/set-whisper-binary-artifact.sh \
-  "https://github.com/carbocation/CarbocationLocalSpeech/releases/download/v0.1.0/whisper.xcframework.zip" \
+  "https://github.com/carbocation/CarbocationLocalSpeech/releases/download/v0.2.0/whisper.xcframework.zip" \
   "$(cat Vendor/whisper-artifacts/release/whisper.xcframework.zip.checksum)"
 ```
 
@@ -562,7 +562,7 @@ The preferred release path is the `Publish Whisper Binary Artifact` GitHub workf
 
 First run it with:
 
-- `tag`: `v0.1.0` for the first public release; future releases use `vX.Y.Z`
+- `tag`: `v0.2.0` for the next public release; future releases use `vX.Y.Z`
 - `prerelease`: `true` for shakedown releases
 - `dry_run`: `true`
 
@@ -582,7 +582,7 @@ friendly while tagged consumers get the binary target.
 After publishing, verify the release from a clean temporary consumer package:
 
 ```sh
-Scripts/test-binary-release.sh v0.1.0
+Scripts/test-binary-release.sh v0.2.0
 ```
 
 The release workflow runs the same smoke test after uploading the GitHub release

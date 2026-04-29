@@ -8,7 +8,7 @@ KEEP_WORK_DIR="${CARBOCATION_LOCAL_SPEECH_KEEP_RELEASE_SMOKE_DIR:-0}"
 
 if [[ -z "$TAG" ]]; then
   echo "usage: $0 <release-tag>" >&2
-  echo "example: $0 v0.1.0" >&2
+  echo "example: $0 v0.2.0" >&2
   exit 2
 fi
 

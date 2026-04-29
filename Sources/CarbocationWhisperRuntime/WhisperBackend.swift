@@ -36,7 +36,11 @@ public enum WhisperBackend {
         if FileManager.default.fileExists(atPath: path) {
             return .linked
         }
+#if CARBOCATION_HAS_WHISPER_C_API
+        return .binaryArtifact
+#else
         return .missingSourceArtifact(expectedLibraryPath: path)
+#endif
     }
 
     public static func sourceArtifactLibraryPath() -> String {
