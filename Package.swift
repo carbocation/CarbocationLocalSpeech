@@ -5,8 +5,8 @@ import PackageDescription
 
 let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let whisperCombinedLibrary = "\(packageRoot)/Vendor/whisper-artifacts/current/lib/libwhisper-combined.a"
-let whisperBinaryArtifactURL = ""
-let whisperBinaryArtifactChecksum = ""
+let whisperBinaryArtifactURL = "https://github.com/carbocation/CarbocationLocalSpeech/releases/download/v0.1.0/whisper.xcframework.zip"
+let whisperBinaryArtifactChecksum = "9c19de440ab5a7e5749db8bd50334744edf9cd2e822e435fe2973b11a2b50972"
 let whisperBinaryArtifactPath = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH"] ?? ""
 let forceSourceWhisper = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_SOURCE_WHISPER"] == "1"
 let forceDisableModernSpeechSDK = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_DISABLE_MODERN_SPEECH"] == "1"
