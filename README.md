@@ -10,18 +10,120 @@ Host apps remain responsible for product behavior: hotkeys, paste/type behavior,
 
 ## Consuming Apps
 
-Use a tagged release for normal app integration. A release tag points SwiftPM at
-a published `whisper.xcframework.zip` asset, so the host app does not need a
-sibling checkout, a `whisper.cpp` submodule, or a build script for the Whisper
-runtime.
+For normal app integration, use the `v0.1.0` release. Do not point shipping apps
+at `main`.
 
-A GitHub release does not replace the Swift package dependency. The host app
-still adds `CarbocationLocalSpeech` by Git URL and selects a release version;
-Xcode/SwiftPM then reads that tag's `Package.swift` and downloads the binary
-artifact automatically.
+The release tag's `Package.swift` points SwiftPM at the published
+`whisper.xcframework.zip`, so your app does not need a sibling checkout,
+`Vendor/whisper.cpp`, or any Whisper build script.
 
-Current public release: none yet. Use the first published release tag once the
-`Publish Whisper Binary Artifact` workflow has created it.
+### Quick Start
+
+1. Add the package URL in Xcode with `File > Add Package Dependencies...`:
+
+```text
+https://github.com/carbocation/CarbocationLocalSpeech.git
+```
+
+2. Choose `Exact Version` `0.1.0` while integrating. The Git tag is `v0.1.0`.
+
+For a Swift package host app, add the dependency directly:
+
+```swift
+dependencies: [
+    .package(
+        url: "https://github.com/carbocation/CarbocationLocalSpeech.git",
+        exact: "0.1.0"
+    )
+]
+```
+
+3. Add the products your app uses:
+
+- `CarbocationLocalSpeechRuntime` for the unified Whisper/Apple Speech engine.
+- `CarbocationLocalSpeechUI` if you want the built-in settings and model picker.
+- `CarbocationLocalSpeech` when app code imports core model-library or transcript types directly.
+
+Most apps start with these imports:
+
+```swift
+import CarbocationLocalSpeech
+import CarbocationLocalSpeechRuntime
+import CarbocationLocalSpeechUI
+```
+
+### Basic Wiring
+
+Create one model library for your app. If the default shared App Group is not
+available, this falls back to your app's Application Support folder.
+
+```swift
+@MainActor
+func makeSpeechModelLibrary() -> SpeechModelLibrary {
+    SpeechModelLibrary(
+        root: SpeechModelStorage.modelsDirectory(appSupportFolderName: "YourApp")
+    )
+}
+```
+
+Drop the bundled settings view into your preferences window to let users import
+or download Whisper models and pick Apple Speech when it is available:
+
+```swift
+import CarbocationLocalSpeech
+import CarbocationLocalSpeechRuntime
+import CarbocationLocalSpeechUI
+import SwiftUI
+
+@MainActor
+struct SpeechSettingsPane: View {
+    let library: SpeechModelLibrary
+    @AppStorage("SpeechModelSelection") private var selectionStorageValue = ""
+    @State private var systemOptions: [SpeechSystemModelOption] = []
+
+    var body: some View {
+        SpeechSettingsView(
+            library: library,
+            selectionStorageValue: $selectionStorageValue,
+            systemOptions: systemOptions
+        )
+        .task {
+            systemOptions = await LocalSpeechEngine.systemModelOptions(locale: .current)
+        }
+    }
+}
+```
+
+When it is time to transcribe, restore the stored selection, load it, and send an
+audio file to the shared engine:
+
+```swift
+let selection = try LocalSpeechEngine.selection(from: selectionStorageValue)
+
+try await LocalSpeechEngine.shared.load(
+    selection: selection,
+    from: speechModelLibrary,
+    options: SpeechLoadOptions(installSystemAssetsIfNeeded: true)
+)
+
+let transcript = try await LocalSpeechEngine.shared.transcribe(
+    file: audioURL,
+    options: TranscriptionOptions(useCase: .dictation, language: "en")
+)
+
+print(transcript.text)
+```
+
+If you do not use the bundled UI, import an existing whisper.cpp `.bin` model and
+persist the resulting selection value:
+
+```swift
+let model = try speechModelLibrary.importFile(
+    at: modelURL,
+    displayName: "Whisper small.en"
+)
+let selectionStorageValue = SpeechModelSelection.installed(model.id).storageValue
+```
 
 ### Requirements
 
@@ -38,29 +140,7 @@ Apple Speech is exposed only when the current SDK, operating system, locale, per
 
 Whisper model weights are not bundled with the package. Apps can import local whisper.cpp `.bin` files, use the curated Hugging Face downloads, or provide their own download UI.
 
-### Add The Release In Xcode
-
-1. Open the host macOS app project in Xcode.
-2. Choose `File > Add Package Dependencies...`.
-3. Paste the package URL:
-
-```text
-https://github.com/carbocation/CarbocationLocalSpeech.git
-```
-
-4. Choose a release version/tag.
-   Prefer `Exact Version` while integrating, or `Up to Next Major Version` once the app has a tested upgrade policy.
-5. Add the package products to the app target that will use them.
-
-Do not choose a branch rule for `main` for a shipping app. `main` stays
-source-build friendly for library development, while release tags are the path
-that should resolve the Whisper runtime through the binary artifact.
-
-Do not download or drag `whisper.xcframework` into the app project manually. The
-release asset is referenced by the package manifest and is fetched by SwiftPM
-during package resolution.
-
-### Pick Products
+### Product Guide
 
 - `CarbocationLocalSpeech`: core model-library, provider-selection, audio, transcript, streaming, VAD, and diarization types.
 - `CarbocationLocalSpeechRuntime`: preferred facade for apps. It routes provider-aware selections to Whisper or Apple Speech.
@@ -77,24 +157,16 @@ directly. Apps that only need shared model storage or metadata can use
 `CarbocationAppleSpeechRuntime` directly only when the host app needs
 provider-specific control that is not exposed through the unified runtime.
 
-Host app source should import module names only:
-
-```swift
-import CarbocationLocalSpeech
-import CarbocationLocalSpeechRuntime
-import CarbocationLocalSpeechUI
-```
-
 Filesystem paths such as `../CarbocationLocalSpeech` should not appear in app
 source or Xcode package dependencies for the binary-release path.
 
-In `Package.swift`:
+In `Package.swift`, target dependencies look like this:
 
 ```swift
 dependencies: [
     .package(
         url: "https://github.com/carbocation/CarbocationLocalSpeech.git",
-        from: "<release-version>"
+        exact: "0.1.0"
     )
 ],
 targets: [
@@ -111,9 +183,9 @@ targets: [
 
 ### What Xcode Should Build
 
-For a release tag, Xcode should:
+For the `v0.1.0` release tag, Xcode should:
 
-1. Resolve `CarbocationLocalSpeech` from GitHub.
+1. Resolve `CarbocationLocalSpeech` from GitHub at version `0.1.0`.
 2. Download `whisper.xcframework.zip` from the release asset URL recorded in that tag's `Package.swift`.
 3. Link the selected products into the host app target.
 4. Build the app normally.
@@ -480,7 +552,7 @@ To prepare a release manifest manually:
 
 ```sh
 Scripts/set-whisper-binary-artifact.sh \
-  "https://github.com/carbocation/CarbocationLocalSpeech/releases/download/vX.Y.Z/whisper.xcframework.zip" \
+  "https://github.com/carbocation/CarbocationLocalSpeech/releases/download/v0.1.0/whisper.xcframework.zip" \
   "$(cat Vendor/whisper-artifacts/release/whisper.xcframework.zip.checksum)"
 ```
 
@@ -490,7 +562,7 @@ The preferred release path is the `Publish Whisper Binary Artifact` GitHub workf
 
 First run it with:
 
-- `tag`: the intended release tag, for example `vX.Y.Z`
+- `tag`: `v0.1.0` for the first public release; future releases use `vX.Y.Z`
 - `prerelease`: `true` for shakedown releases
 - `dry_run`: `true`
 
@@ -510,7 +582,7 @@ friendly while tagged consumers get the binary target.
 After publishing, verify the release from a clean temporary consumer package:
 
 ```sh
-Scripts/test-binary-release.sh vX.Y.Z
+Scripts/test-binary-release.sh v0.1.0
 ```
 
 The release workflow runs the same smoke test after uploading the GitHub release
