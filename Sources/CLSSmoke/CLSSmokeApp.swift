@@ -158,13 +158,13 @@ private final class CLSSmokeAppDelegate: NSObject, NSApplicationDelegate {
         hangSampler.start()
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
+            contentRect: NSRect(x: 0, y: 0, width: 1280, height: 800),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "CLSSmoke"
-        window.contentMinSize = NSSize(width: 980, height: 650)
+        window.contentMinSize = NSSize(width: 1240, height: 680)
         window.contentViewController = NSHostingController(rootView: CLSSmokeRootView())
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -294,27 +294,11 @@ private struct CLSSmokeRootView: View {
                     .padding(.horizontal, 20)
                     .padding(.vertical, 16)
                 Divider()
-                sessionStatus
-                Divider()
-                fileTranscriptionPanel
-                Divider()
-                werPanel
-                Divider()
-                LiveTranscriptDebugView(
-                    eventDescriptions: visibleEventDescriptions,
-                    snapshot: visibleTranscriptSnapshot,
-                    totalEventDescriptionCount: visibleEventDescriptionTotalCount,
-                    copyAllEventDescriptions: {
-                        copyEventDescriptions(liveDiagnostics.eventDescriptions)
-                    },
-                    copyTranscript: {
-                        copyTranscript(liveDiagnostics.transcriptSnapshot)
-                    }
-                )
+                diagnosticsContent
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 980, minHeight: 650)
+        .frame(minWidth: 1240, minHeight: 680)
         .task {
             refreshWERState()
             systemOptions = await LocalSpeechEngine.systemModelOptions(locale: .current)
@@ -411,6 +395,43 @@ private struct CLSSmokeRootView: View {
             return "Reference: \(CLSSmokeWERCalculator.maximumComparedWords)+ words"
         }
         return "Reference: \(werReferenceWordCount) words"
+    }
+
+    private var diagnosticsContent: some View {
+        HStack(spacing: 0) {
+            diagnosticsControlsColumn
+
+            Divider()
+
+            LiveTranscriptDebugView(
+                eventDescriptions: visibleEventDescriptions,
+                snapshot: visibleTranscriptSnapshot,
+                totalEventDescriptionCount: visibleEventDescriptionTotalCount,
+                copyAllEventDescriptions: {
+                    copyEventDescriptions(liveDiagnostics.eventDescriptions)
+                },
+                copyTranscript: {
+                    copyTranscript(liveDiagnostics.transcriptSnapshot)
+                }
+            )
+            .frame(minWidth: 430, maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var diagnosticsControlsColumn: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                sessionStatus
+                Divider()
+                fileTranscriptionPanel
+                Divider()
+                werPanel
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(minWidth: 360, idealWidth: 420, maxWidth: 500, maxHeight: .infinity)
     }
 
     private var sessionStatus: some View {

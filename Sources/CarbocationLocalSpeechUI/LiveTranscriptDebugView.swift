@@ -11,6 +11,7 @@ public struct LiveTranscriptDebugView: View {
     private var transcriptEvents: [TranscriptEvent]
     private var snapshot: LiveTranscriptDebugSnapshot?
     private let liveEventLineLimit = 50
+    private let transcriptPanelHeightRatio: CGFloat = 0.67
 
     public init(events: [TranscriptEvent], transcriptEvents: [TranscriptEvent]? = nil) {
         self.events = events
@@ -41,11 +42,23 @@ public struct LiveTranscriptDebugView: View {
     public var body: some View {
         let snapshot = snapshot ?? LiveTranscriptDebugSnapshot(events: transcriptEvents)
 
-        VStack(spacing: 0) {
-            transcriptPanel(snapshot)
-            Divider()
-            eventStream
+        GeometryReader { geometry in
+            let availableHeight = max(geometry.size.height - 1, 0)
+            let transcriptHeight = availableHeight * transcriptPanelHeightRatio
+            let eventStreamHeight = availableHeight - transcriptHeight
+
+            VStack(spacing: 0) {
+                transcriptPanel(snapshot)
+                    .frame(height: transcriptHeight)
+                    .frame(maxWidth: .infinity)
+                Divider()
+                eventStream
+                    .frame(height: eventStreamHeight)
+                    .frame(maxWidth: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func transcriptPanel(_ snapshot: LiveTranscriptDebugSnapshot) -> some View {
@@ -87,7 +100,7 @@ public struct LiveTranscriptDebugView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.trailing, 8)
             }
-            .frame(minHeight: 88, maxHeight: 150)
+            .frame(minHeight: 0, maxHeight: .infinity)
 
             if let latestText = snapshot.latestDisplayText {
                 Divider()
@@ -114,6 +127,7 @@ public struct LiveTranscriptDebugView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .textBackgroundColor))
     }
 
@@ -170,12 +184,14 @@ public struct LiveTranscriptDebugView: View {
             } description: {
                 Text("Provider activity will appear here.")
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
         } else {
             let liveLines = Array(lines.suffix(liveEventLineLimit))
             let totalLineCount = totalEventDescriptionCount ?? lines.count
             VStack(spacing: 0) {
                 HStack(spacing: 10) {
-                    Label("Events", systemImage: "list.bullet.rectangle")
+                    Label("Live Log", systemImage: "list.bullet.rectangle")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Text("\(liveLines.count)/\(totalLineCount)")
@@ -197,7 +213,10 @@ public struct LiveTranscriptDebugView: View {
                 .padding(.vertical, 8)
                 Divider()
                 LiveEventLogTailView(lines: liveLines)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
         }
     }
 
