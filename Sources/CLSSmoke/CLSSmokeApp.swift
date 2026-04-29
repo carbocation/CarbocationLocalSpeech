@@ -512,6 +512,15 @@ private struct CLSSmokeRootView: View {
                 Toggle("Record live audio", isOn: $recordLiveAudio)
                     .toggleStyle(.checkbox)
                     .disabled(isStarting || isListening || isFileTranscribing)
+
+                Spacer(minLength: 8)
+
+                Button {
+                    openLiveRecordingsFolder()
+                } label: {
+                    Label("Open Folder", systemImage: "folder")
+                }
+                .controlSize(.small)
             }
         }
     }
@@ -983,6 +992,21 @@ private struct CLSSmokeRootView: View {
         )
     }
 
+    private func openLiveRecordingsFolder() {
+        let directory = Self.liveRecordingsDirectory()
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            guard NSWorkspace.shared.open(directory) else {
+                statusMessage = "Could not open recordings folder."
+                statusTone = .error
+                return
+            }
+        } catch {
+            statusMessage = "Could not open recordings folder: \(error.localizedDescription)"
+            statusTone = .error
+        }
+    }
+
     private func logLiveRecordingStarted(_ context: CLSSmokeLiveRecordingContext) {
         let message = "started file=\(context.fileURL.lastPathComponent) path=\(context.fileURL.path)"
         appendEvent(.diagnostic(TranscriptionDiagnostic(
@@ -1041,9 +1065,12 @@ private struct CLSSmokeRootView: View {
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         let timestamp = formatter.string(from: date)
         let filename = "cls-live-\(timestamp)-\(input.recordingFilenameComponent).caf"
+        return liveRecordingsDirectory().appendingPathComponent(filename)
+    }
+
+    private static func liveRecordingsDirectory() -> URL {
         return SpeechModelStorage.appSupportDirectory(appSupportFolderName: "CLSSmoke")
             .appendingPathComponent("Recordings", isDirectory: true)
-            .appendingPathComponent(filename)
     }
 
     private func chooseAudioFile() {
