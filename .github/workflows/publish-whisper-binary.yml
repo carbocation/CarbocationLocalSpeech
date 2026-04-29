@@ -63,6 +63,30 @@ jobs:
         run: |
           CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH="Vendor/whisper-artifacts/release/whisper.xcframework" swift test
 
+      - name: Validate iOS simulator build against local binary artifact
+        env:
+          CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH: Vendor/whisper-artifacts/release/whisper.xcframework
+        run: |
+          IOS_SIMULATOR_SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          env CLANG_MODULE_CACHE_PATH=.build/module-cache SWIFTPM_CACHE_PATH=.build/swiftpm-cache \
+            swift build \
+              --triple arm64-apple-ios17.0-simulator \
+              --sdk "$IOS_SIMULATOR_SDK" \
+              --target CarbocationLocalSpeechRuntime
+          env CLANG_MODULE_CACHE_PATH=.build/module-cache SWIFTPM_CACHE_PATH=.build/swiftpm-cache \
+            swift build \
+              --triple arm64-apple-ios17.0-simulator \
+              --sdk "$IOS_SIMULATOR_SDK" \
+              --target CarbocationLocalSpeechUI
+          env CLANG_MODULE_CACHE_PATH=.build/module-cache SWIFTPM_CACHE_PATH=.build/swiftpm-cache \
+            swift build \
+              --triple arm64-apple-ios17.0-simulator \
+              --sdk "$IOS_SIMULATOR_SDK" \
+              --product CLSSmoke
+
+      - name: Validate clean iOS consumer against local binary artifact
+        run: Scripts/test-local-binary-artifact.sh
+
       - name: Summarize dry run
         if: ${{ inputs.dry_run }}
         run: |

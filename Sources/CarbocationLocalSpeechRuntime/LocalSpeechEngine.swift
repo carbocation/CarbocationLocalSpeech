@@ -123,7 +123,6 @@ public actor LocalSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
                 from: root,
                 configuration: WhisperLoadConfiguration(
                     language: options.locale.language.languageCode?.identifier,
-                    useMetal: true,
                     useCoreML: model.assets.contains { $0.role == .coreMLEncoder }
                 )
             )

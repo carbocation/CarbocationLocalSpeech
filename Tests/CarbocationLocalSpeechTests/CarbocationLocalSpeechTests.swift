@@ -21,6 +21,30 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertTrue(SpeechProviderAvailability.unavailable(.assetNotReady).shouldOfferModelOption)
         XCTAssertFalse(SpeechProviderAvailability.unavailable(.sdkUnavailable).shouldOfferModelOption)
         XCTAssertFalse(SpeechProviderAvailability.unavailable(.operatingSystemUnavailable).shouldOfferModelOption)
+        XCTAssertFalse(SpeechProviderAvailability.unavailable(.deviceNotEligible).shouldOfferModelOption)
+    }
+
+    func testProviderAvailabilityDisplayPolicy() {
+        XCTAssertTrue(SpeechProviderAvailability.available.shouldDisplayModelOption)
+        XCTAssertTrue(SpeechProviderAvailability.unavailable(.assetDownloadRequired).shouldDisplayModelOption)
+        XCTAssertTrue(SpeechProviderAvailability.unavailable(.assetNotReady).shouldDisplayModelOption)
+        XCTAssertTrue(SpeechProviderAvailability.unavailable(.deviceNotEligible).shouldDisplayModelOption)
+        XCTAssertTrue(SpeechProviderAvailability.unavailable(.speechRecognitionDenied).shouldDisplayModelOption)
+        XCTAssertTrue(SpeechProviderAvailability.unavailable(.localeUnsupported).shouldDisplayModelOption)
+        XCTAssertFalse(SpeechProviderAvailability.unavailable(.sdkUnavailable).shouldDisplayModelOption)
+        XCTAssertFalse(SpeechProviderAvailability.unavailable(.operatingSystemUnavailable).shouldDisplayModelOption)
+    }
+
+    func testOperatingSystemUnavailableMessageMentionsMacOSAndIOS() {
+        XCTAssertEqual(
+            SpeechProviderUnavailableReason.operatingSystemUnavailable.displayMessage,
+            "Apple Speech requires macOS 26 or iOS 26 or newer."
+        )
+    }
+
+    func testAudioCaptureConfigurationDefaultsToManagingApplicationAudioSession() {
+        XCTAssertTrue(AudioCaptureConfiguration().configuresApplicationAudioSession)
+        XCTAssertFalse(AudioCaptureConfiguration(configuresApplicationAudioSession: false).configuresApplicationAudioSession)
     }
 
     func testSpeechModelStorageUsesSharedGroupWhenAvailable() throws {

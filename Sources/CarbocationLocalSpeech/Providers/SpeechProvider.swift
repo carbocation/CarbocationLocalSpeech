@@ -68,7 +68,7 @@ public enum SpeechProviderUnavailableReason: String, Codable, Hashable, Sendable
         case .sdkUnavailable:
             return "This app was built without the required Speech SDK."
         case .operatingSystemUnavailable:
-            return "Apple Speech requires macOS 26 or newer."
+            return "Apple Speech requires macOS 26 or iOS 26 or newer."
         case .speechRecognitionDenied:
             return "Speech recognition permission is denied."
         case .localeUnsupported:
@@ -107,6 +107,17 @@ public enum SpeechProviderAvailability: Hashable, Sendable {
             return true
         case .unavailable:
             return false
+        }
+    }
+
+    public var shouldDisplayModelOption: Bool {
+        switch self {
+        case .available:
+            return true
+        case .unavailable(.sdkUnavailable), .unavailable(.operatingSystemUnavailable):
+            return false
+        case .unavailable:
+            return true
         }
     }
 

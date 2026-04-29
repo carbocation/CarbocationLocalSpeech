@@ -26,15 +26,35 @@ public struct AudioCaptureConfiguration: Hashable, Sendable {
     public var preferredSampleRate: Double
     public var preferredChannelCount: Int
     public var frameDuration: TimeInterval
+    public var configuresApplicationAudioSession: Bool
 
     public init(
         preferredSampleRate: Double = 16_000,
         preferredChannelCount: Int = 1,
-        frameDuration: TimeInterval = 0.1
+        frameDuration: TimeInterval = 0.1,
+        configuresApplicationAudioSession: Bool = true
     ) {
         self.preferredSampleRate = preferredSampleRate
         self.preferredChannelCount = preferredChannelCount
         self.frameDuration = frameDuration
+        self.configuresApplicationAudioSession = configuresApplicationAudioSession
+    }
+}
+
+public enum AudioCaptureError: Error, LocalizedError, Sendable {
+    case microphonePermissionDenied
+    case microphonePermissionRestricted
+    case audioSessionConfigurationFailed(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .microphonePermissionDenied:
+            return "Microphone permission is denied."
+        case .microphonePermissionRestricted:
+            return "Microphone permission is restricted."
+        case .audioSessionConfigurationFailed(let detail):
+            return "Could not configure the audio session: \(detail)"
+        }
     }
 }
 

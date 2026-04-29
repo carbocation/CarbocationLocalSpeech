@@ -29,7 +29,7 @@ else
   mkdir -p "$WORK_DIR"
 fi
 
-mkdir -p "$WORK_DIR/Sources/ReleaseSmoke"
+mkdir -p "$WORK_DIR/Sources/ReleaseSmoke" "$WORK_DIR/Sources/ReleaseSmokeIOS"
 
 cat > "$WORK_DIR/Package.swift" <<EOF
 // swift-tools-version: 5.9
@@ -39,10 +39,12 @@ import PackageDescription
 let package = Package(
     name: "CarbocationLocalSpeechReleaseSmoke",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v14),
+        .iOS(.v17)
     ],
     products: [
-        .executable(name: "ReleaseSmoke", targets: ["ReleaseSmoke"])
+        .executable(name: "ReleaseSmoke", targets: ["ReleaseSmoke"]),
+        .library(name: "ReleaseSmokeIOS", targets: ["ReleaseSmokeIOS"])
     ],
     dependencies: [
         .package(url: "$REPO_URL", exact: "$VERSION")
@@ -50,6 +52,15 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "ReleaseSmoke",
+            dependencies: [
+                .product(name: "CarbocationLocalSpeech", package: "CarbocationLocalSpeech"),
+                .product(name: "CarbocationLocalSpeechRuntime", package: "CarbocationLocalSpeech"),
+                .product(name: "CarbocationLocalSpeechUI", package: "CarbocationLocalSpeech"),
+                .product(name: "CarbocationWhisperRuntime", package: "CarbocationLocalSpeech")
+            ]
+        ),
+        .target(
+            name: "ReleaseSmokeIOS",
             dependencies: [
                 .product(name: "CarbocationLocalSpeech", package: "CarbocationLocalSpeech"),
                 .product(name: "CarbocationLocalSpeechRuntime", package: "CarbocationLocalSpeech"),
@@ -94,5 +105,48 @@ print("vadModel=\(vadModel.id)")
 print("whisperStatus=\(status.displayDescription)")
 EOF
 
+cat > "$WORK_DIR/Sources/ReleaseSmokeIOS/ReleaseSmokeIOS.swift" <<'EOF'
+import CarbocationLocalSpeech
+import CarbocationLocalSpeechRuntime
+import CarbocationLocalSpeechUI
+import CarbocationWhisperRuntime
+import Foundation
+import SwiftUI
+
+public enum ReleaseSmokeIOS {
+    public static func validate() async throws -> Int {
+        let curatedCount = CuratedSpeechModelCatalog.all.count
+        let _ = try LocalSpeechEngine.selection(from: SpeechSystemModelID.appleSpeech.rawValue)
+        let status = WhisperRuntimeSmoke.linkStatus()
+        guard status.isUsable else {
+            throw ReleaseSmokeIOSError.whisperRuntimeUnavailable(status.displayDescription)
+        }
+        return curatedCount
+    }
+
+    @MainActor
+    public static func makeSettingsView(
+        library: SpeechModelLibrary,
+        selectionStorageValue: Binding<String>
+    ) -> some View {
+        SpeechSettingsView(
+            library: library,
+            selectionStorageValue: selectionStorageValue
+        )
+    }
+}
+
+public enum ReleaseSmokeIOSError: Error {
+    case whisperRuntimeUnavailable(String)
+}
+EOF
+
 echo "Testing $REPO_URL at $TAG from $WORK_DIR"
 swift run --package-path "$WORK_DIR" ReleaseSmoke
+IOS_SIMULATOR_SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+env CLANG_MODULE_CACHE_PATH="$WORK_DIR/module-cache" SWIFTPM_CACHE_PATH="$WORK_DIR/swiftpm-cache" \
+  swift build \
+    --package-path "$WORK_DIR" \
+    --triple arm64-apple-ios17.0-simulator \
+    --sdk "$IOS_SIMULATOR_SDK" \
+    --target ReleaseSmokeIOS

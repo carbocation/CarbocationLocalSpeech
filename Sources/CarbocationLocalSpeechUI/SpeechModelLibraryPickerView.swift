@@ -1,16 +1,24 @@
-import AppKit
 import CarbocationLocalSpeech
 import Observation
 import SwiftUI
 import UniformTypeIdentifiers
 
+#if os(macOS)
+import AppKit
+#endif
+
 @MainActor
 public struct SpeechModelLibraryPickerView: View {
+    private static var whisperModelContentType: UTType {
+        UTType(filenameExtension: "bin") ?? .data
+    }
+
     private let library: SpeechModelLibrary
     @Binding private var selectionStorageValue: String
     private let title: String
     private let confirmTitle: String
     private let confirmDisabled: Bool
+    private let showsConfirmationFooter: Bool
     private let systemOptions: [SpeechSystemModelOption]
     private let curatedCatalog: [CuratedSpeechModel]
     private let labelPolicy: SpeechModelPickerLabelPolicy
@@ -24,6 +32,7 @@ public struct SpeechModelLibraryPickerView: View {
     @State private var activeDownload: SpeechModelLibraryDownload?
     @State private var notice: PickerNotice?
     @State private var showCustomSheet = false
+    @State private var showImportModelImporter = false
     @State private var showDeleteConfirm: InstalledSpeechModel?
     @State private var showDeletePartialConfirm: PartialSpeechModelDownload?
     @State private var refreshToken = UUID()
@@ -34,6 +43,7 @@ public struct SpeechModelLibraryPickerView: View {
         title: String = "Choose a Speech Provider",
         confirmTitle: String = "Use Selected Provider",
         confirmDisabled: Bool = false,
+        showsConfirmationFooter: Bool = true,
         systemOptions: [SpeechSystemModelOption] = [],
         curatedCatalog: [CuratedSpeechModel] = CuratedSpeechModelCatalog.all,
         labelPolicy: SpeechModelPickerLabelPolicy = .default,
@@ -49,6 +59,7 @@ public struct SpeechModelLibraryPickerView: View {
         self.title = title
         self.confirmTitle = confirmTitle
         self.confirmDisabled = confirmDisabled
+        self.showsConfirmationFooter = showsConfirmationFooter
         self.systemOptions = systemOptions
         self.curatedCatalog = curatedCatalog
         self.labelPolicy = labelPolicy
@@ -108,11 +119,19 @@ public struct SpeechModelLibraryPickerView: View {
                 .padding(20)
                 .id(refreshToken)
             }
-            Divider()
-            footer
+            if showsConfirmationFooter {
+                Divider()
+                footer
+            }
         }
         .task {
             refresh()
+        }
+        .fileImporter(
+            isPresented: $showImportModelImporter,
+            allowedContentTypes: [Self.whisperModelContentType]
+        ) { result in
+            handleImportResult(result)
         }
         .sheet(isPresented: $showCustomSheet) {
             CustomSpeechDownloadSheet { request in
@@ -271,11 +290,13 @@ public struct SpeechModelLibraryPickerView: View {
                     Label("Import .bin", systemImage: "square.and.arrow.down")
                 }
 
+#if os(macOS)
                 Button {
                     revealModelsFolder()
                 } label: {
                     Label("Reveal Folder", systemImage: "folder")
                 }
+#endif
 
                 Spacer()
 
@@ -350,11 +371,13 @@ public struct SpeechModelLibraryPickerView: View {
         }
         .buttonStyle(.plain)
         .contextMenu {
+#if os(macOS)
             Button {
                 NSWorkspace.shared.activateFileViewerSelecting([model.directory(in: library.root)])
             } label: {
                 Label("Reveal", systemImage: "folder")
             }
+#endif
             Button(role: .destructive) {
                 showDeleteConfirm = model
             } label: {
@@ -654,18 +677,24 @@ public struct SpeechModelLibraryPickerView: View {
             return
         }
 
-        let panel = NSOpenPanel()
-        panel.title = "Import Whisper Model"
-        panel.message = "Choose a whisper.cpp .bin model file."
-        panel.allowedContentTypes = [UTType(filenameExtension: "bin") ?? .data]
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.directoryURL = library.root
+        showImportModelImporter = true
+    }
 
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+    private func handleImportResult(_ result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            importModel(at: url)
+        case .failure(let error):
+            notice = PickerNotice(
+                message: "Failed to import model: \(error.localizedDescription)",
+                tone: .warning
+            )
+        }
+    }
+
+    private func importModel(at url: URL) {
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
-
         do {
             let model = try library.importFile(at: url)
             if selectionStorageValue.isEmpty {
@@ -704,9 +733,11 @@ public struct SpeechModelLibraryPickerView: View {
         }
     }
 
+#if os(macOS)
     private func revealModelsFolder() {
         NSWorkspace.shared.activateFileViewerSelecting([library.root])
     }
+#endif
 
     private func refresh() {
         library.refresh()

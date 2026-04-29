@@ -25,3 +25,40 @@ jobs:
 
       - name: Run tests
         run: swift test
+
+  ios-build:
+    name: iOS Simulator Build
+    runs-on: macos-14
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build runtime for iOS simulator
+        run: |
+          IOS_SIMULATOR_SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          env CLANG_MODULE_CACHE_PATH=.build/module-cache SWIFTPM_CACHE_PATH=.build/swiftpm-cache \
+            swift build \
+              --triple arm64-apple-ios17.0-simulator \
+              --sdk "$IOS_SIMULATOR_SDK" \
+              --target CarbocationLocalSpeechRuntime
+
+      - name: Build SwiftUI surfaces for iOS simulator
+        run: |
+          IOS_SIMULATOR_SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          env CLANG_MODULE_CACHE_PATH=.build/module-cache SWIFTPM_CACHE_PATH=.build/swiftpm-cache \
+            swift build \
+              --triple arm64-apple-ios17.0-simulator \
+              --sdk "$IOS_SIMULATOR_SDK" \
+              --target CarbocationLocalSpeechUI
+
+      - name: Build CLSSmoke for iOS simulator
+        run: |
+          IOS_SIMULATOR_SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          env CLANG_MODULE_CACHE_PATH=.build/module-cache SWIFTPM_CACHE_PATH=.build/swiftpm-cache \
+            swift build \
+              --triple arm64-apple-ios17.0-simulator \
+              --sdk "$IOS_SIMULATOR_SDK" \
+              --product CLSSmoke

@@ -4,6 +4,16 @@ import Foundation
 import whisper
 #endif
 
+public enum WhisperRuntimeDefaults {
+    public static var useMetal: Bool {
+#if os(iOS) && targetEnvironment(simulator)
+        false
+#else
+        true
+#endif
+    }
+}
+
 public struct WhisperEngineConfiguration: Hashable, Sendable {
     public var useMetal: Bool
     public var useCoreML: Bool
@@ -12,7 +22,7 @@ public struct WhisperEngineConfiguration: Hashable, Sendable {
     public var suppressNativeLogs: Bool
 
     public init(
-        useMetal: Bool = true,
+        useMetal: Bool = WhisperRuntimeDefaults.useMetal,
         useCoreML: Bool = true,
         threadCount: Int32? = nil,
         heartbeatInterval: TimeInterval = 2,
@@ -31,7 +41,11 @@ public struct WhisperLoadConfiguration: Hashable, Sendable {
     public var useMetal: Bool
     public var useCoreML: Bool
 
-    public init(language: String? = nil, useMetal: Bool = true, useCoreML: Bool = true) {
+    public init(
+        language: String? = nil,
+        useMetal: Bool = WhisperRuntimeDefaults.useMetal,
+        useCoreML: Bool = true
+    ) {
         self.language = language
         self.useMetal = useMetal
         self.useCoreML = useCoreML

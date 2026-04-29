@@ -292,6 +292,9 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
     )
     private var engine: AVAudioEngine?
     private var continuation: AsyncThrowingStream<AudioChunk, Error>.Continuation?
+#if os(iOS)
+    private var didConfigureApplicationAudioSession = false
+#endif
 
     public init() {}
 
@@ -299,66 +302,101 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
         AsyncThrowingStream(bufferingPolicy: .bufferingNewest(8)) { continuation in
             stop()
 
-            lock.lock()
-            let audioEngine = AVAudioEngine()
-            engine = audioEngine
-            self.continuation = continuation
-            lock.unlock()
-
-            let inputNode = audioEngine.inputNode
-            let format = inputNode.outputFormat(forBus: 0)
-            let frames = max(256, AVAudioFrameCount(configuration.frameDuration * format.sampleRate))
-            let targetChannelCount = max(1, configuration.preferredChannelCount)
-            let timing = CaptureTiming()
-
-            inputNode.installTap(onBus: 0, bufferSize: frames, format: format) { buffer, _ in
-                guard let channels = buffer.floatChannelData else { return }
-                let channelCount = Int(buffer.format.channelCount)
-                let frameLength = Int(buffer.frameLength)
-                var samples: [Float] = []
-                let emittedChannelCount: Int
-                if targetChannelCount == 1 {
-                    emittedChannelCount = 1
-                    samples.reserveCapacity(frameLength)
-                    for frame in 0..<frameLength {
-                        var sample: Float = 0
-                        for channel in 0..<channelCount {
-                            sample += channels[channel][frame]
-                        }
-                        samples.append(sample / Float(max(1, channelCount)))
-                    }
-                } else {
-                    emittedChannelCount = channelCount
-                    samples.reserveCapacity(frameLength * channelCount)
-                    for frame in 0..<frameLength {
-                        for channel in 0..<channelCount {
-                            samples.append(channels[channel][frame])
-                        }
-                    }
+            let startTask = Task {
+                do {
+                    try await prepareToStart(configuration: configuration)
+                    try Task.checkCancellation()
+                    try startEngine(configuration: configuration, continuation: continuation)
+                } catch {
+                    continuation.finish(throwing: error)
                 }
-                let duration = Double(frameLength) / buffer.format.sampleRate
-                continuation.yield(AudioChunk(
-                    samples: samples,
-                    sampleRate: buffer.format.sampleRate,
-                    channelCount: emittedChannelCount,
-                    startTime: timing.claim(duration: duration),
-                    duration: duration
-                ))
-            }
-
-            do {
-                audioEngine.prepare()
-                try audioEngine.start()
-            } catch {
-                inputNode.removeTap(onBus: 0)
-                clear(audioEngine: audioEngine)
-                continuation.finish(throwing: error)
             }
 
             continuation.onTermination = { [weak self] _ in
+                startTask.cancel()
                 self?.stop()
             }
         }
+    }
+
+    private func startEngine(
+        configuration: AudioCaptureConfiguration,
+        continuation: AsyncThrowingStream<AudioChunk, Error>.Continuation
+    ) throws {
+        lock.lock()
+        let audioEngine = AVAudioEngine()
+        engine = audioEngine
+        self.continuation = continuation
+        lock.unlock()
+
+        let inputNode = audioEngine.inputNode
+        let format = inputNode.outputFormat(forBus: 0)
+        let frames = max(256, AVAudioFrameCount(configuration.frameDuration * format.sampleRate))
+        let targetChannelCount = max(1, configuration.preferredChannelCount)
+        let timing = CaptureTiming()
+
+        inputNode.installTap(onBus: 0, bufferSize: frames, format: format) { buffer, _ in
+            guard let channels = buffer.floatChannelData else { return }
+            let channelCount = Int(buffer.format.channelCount)
+            let frameLength = Int(buffer.frameLength)
+            var samples: [Float] = []
+            let emittedChannelCount: Int
+            if targetChannelCount == 1 {
+                emittedChannelCount = 1
+                samples.reserveCapacity(frameLength)
+                for frame in 0..<frameLength {
+                    var sample: Float = 0
+                    for channel in 0..<channelCount {
+                        sample += channels[channel][frame]
+                    }
+                    samples.append(sample / Float(max(1, channelCount)))
+                }
+            } else {
+                emittedChannelCount = channelCount
+                samples.reserveCapacity(frameLength * channelCount)
+                for frame in 0..<frameLength {
+                    for channel in 0..<channelCount {
+                        samples.append(channels[channel][frame])
+                    }
+                }
+            }
+            let duration = Double(frameLength) / buffer.format.sampleRate
+            continuation.yield(AudioChunk(
+                samples: samples,
+                sampleRate: buffer.format.sampleRate,
+                channelCount: emittedChannelCount,
+                startTime: timing.claim(duration: duration),
+                duration: duration
+            ))
+        }
+
+        do {
+            audioEngine.prepare()
+            try audioEngine.start()
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            clear(audioEngine: audioEngine)
+            throw error
+        }
+    }
+
+    private func prepareToStart(configuration: AudioCaptureConfiguration) async throws {
+#if os(iOS)
+        try await requestMicrophoneAccessIfNeeded()
+        guard configuration.configuresApplicationAudioSession else { return }
+
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.record, mode: .measurement)
+            try audioSession.setPreferredSampleRate(configuration.preferredSampleRate)
+            try audioSession.setActive(true)
+            markApplicationAudioSessionConfigured()
+        } catch {
+            throw AudioCaptureError.audioSessionConfigurationFailed(error.localizedDescription)
+        }
+#else
+        _ = configuration
+#endif
     }
 
     public func stop() {
@@ -367,6 +405,10 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
         engine = nil
         let continuation = continuation
         self.continuation = nil
+#if os(iOS)
+        let shouldDeactivateAudioSession = didConfigureApplicationAudioSession
+        didConfigureApplicationAudioSession = false
+#endif
         lock.unlock()
 
         continuation?.finish()
@@ -377,6 +419,12 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
                 audioEngine.inputNode.removeTap(onBus: 0)
             }
         }
+
+#if os(iOS)
+        if shouldDeactivateAudioSession {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
+#endif
     }
 
     private func clear(audioEngine expectedEngine: AVAudioEngine) {
@@ -387,6 +435,32 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
         }
         lock.unlock()
     }
+
+#if os(iOS)
+    private func markApplicationAudioSessionConfigured() {
+        lock.lock()
+        didConfigureApplicationAudioSession = true
+        lock.unlock()
+    }
+
+    private func requestMicrophoneAccessIfNeeded() async throws {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return
+        case .notDetermined:
+            let granted = await MicrophonePermissionHelper.requestAccess()
+            guard granted else {
+                throw AudioCaptureError.microphonePermissionDenied
+            }
+        case .denied:
+            throw AudioCaptureError.microphonePermissionDenied
+        case .restricted:
+            throw AudioCaptureError.microphonePermissionRestricted
+        @unknown default:
+            throw AudioCaptureError.microphonePermissionDenied
+        }
+    }
+#endif
 }
 
 public enum MicrophonePermissionHelper {

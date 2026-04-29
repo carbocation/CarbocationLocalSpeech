@@ -21,25 +21,30 @@ public enum WhisperBackendStatus: Hashable, Sendable {
         case .binaryArtifact:
             return "whisper.cpp binary artifact is configured."
         case .missingSourceArtifact(let path):
+#if os(iOS)
+            _ = path
+            return "whisper.cpp on iOS requires the package to be built with a whisper.xcframework binary artifact."
+#else
             return "whisper.cpp source artifact is missing at \(path)."
+#endif
         }
     }
 }
 
 public enum WhisperBackend {
     public static func ensureInitialized() -> WhisperBackendStatus {
-        if ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH"]?.isEmpty == false {
-            return .binaryArtifact
-        }
-
+#if CARBOCATION_HAS_WHISPER_BINARY_ARTIFACT
+        return .binaryArtifact
+#else
         let path = sourceArtifactLibraryPath()
+#if CARBOCATION_HAS_WHISPER_C_API
         if FileManager.default.fileExists(atPath: path) {
             return .linked
         }
-#if CARBOCATION_HAS_WHISPER_C_API
         return .binaryArtifact
 #else
         return .missingSourceArtifact(expectedLibraryPath: path)
+#endif
 #endif
     }
 

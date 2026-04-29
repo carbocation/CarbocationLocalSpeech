@@ -4,15 +4,26 @@ import CarbocationLocalSpeech
 import XCTest
 
 final class CarbocationAppleSpeechRuntimeTests: XCTestCase {
-    func testAvailabilityAndSystemOptionUseSameOfferPolicy() async {
+    func testAvailabilityAndSystemOptionUseSameDisplayPolicy() async {
         let locale = Locale(identifier: "en_US")
         let availability = await AppleSpeechEngine.availability(locale: locale)
         let option = await AppleSpeechEngine.systemModelOption(locale: locale)
 
-        XCTAssertEqual(option != nil, availability.shouldOfferModelOption)
+        XCTAssertEqual(option != nil, availability.shouldDisplayModelOption)
         if let option {
             XCTAssertEqual(option.selection, .system(.appleSpeech))
         }
+    }
+
+    func testIOS26AvailabilityHonorsGlobalDeviceEligibilityGate() async {
+#if os(iOS)
+        guard #available(iOS 26.0, *) else { return }
+        guard AppleSpeechEngine.isBuiltWithModernSpeechSDK else { return }
+        guard !AppleSpeechEngine.modernSpeechTranscriberIsAvailable else { return }
+
+        let availability = await AppleSpeechEngine.availability(locale: Locale(identifier: "en_US"))
+        XCTAssertEqual(availability, .unavailable(.deviceNotEligible))
+#endif
     }
 
     func testUnsupportedFeatureMapping() {

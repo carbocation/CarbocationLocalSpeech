@@ -21,7 +21,7 @@ Options:
   --latest              Use the latest stable upstream tag (default).
   --include-prerelease  Allow prerelease tags when resolving --latest.
   --no-fetch            Use locally available tags without fetching from origin.
-  --validate            Build the XCFramework and run binary-artifact swift test.
+  --validate            Build the XCFramework and run binary-artifact validation.
   --dry-run             Print the selected tag and planned actions without changes.
   --force               Allow overwriting local changes in synced whisper headers.
   -h, --help            Show this help.
@@ -125,7 +125,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "dry run: would verify header sync and C header parse"
   if [[ "$VALIDATE" -eq 1 ]]; then
     echo "dry run: would rebuild the staged whisper library"
-    echo "dry run: would build whisper.xcframework and run binary-artifact swift test"
+    echo "dry run: would build whisper.xcframework and run binary-artifact validation"
   fi
   exit 0
 fi
@@ -142,6 +142,7 @@ if [[ "$VALIDATE" -eq 1 ]]; then
     cd "$ROOT"
     CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH="Vendor/whisper-artifacts/release/whisper.xcframework" swift test
   )
+  "$ROOT/Scripts/test-local-binary-artifact.sh"
 fi
 
 echo "Updated whisper.cpp to $TAG."

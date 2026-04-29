@@ -1,7 +1,9 @@
+import Foundation
+
+#if os(macOS)
 import AudioToolbox
 import CoreAudio
 import Darwin
-import Foundation
 
 @available(macOS 15.0, *)
 public struct SystemAudioCaptureOptions: Hashable, Sendable {
@@ -52,7 +54,6 @@ public enum SystemAudioCaptureError: Error, LocalizedError, Sendable {
         }
     }
 }
-
 #if CARBOCATION_HAS_SYSTEM_AUDIO_TAPS
 @available(macOS 15.0, *)
 public final class SystemAudioCaptureSession: AudioCapturing, @unchecked Sendable {
@@ -435,3 +436,43 @@ private extension AudioChunk {
         return 0
     }
 }
+#else
+@available(iOS, unavailable, message: "System audio capture uses macOS Core Audio process taps and is unavailable on iOS.")
+public struct SystemAudioCaptureOptions: Hashable, Sendable {
+    public var excludesCurrentProcessAudio: Bool
+    public var tapName: String
+
+    public init(
+        excludesCurrentProcessAudio: Bool = true,
+        tapName: String = "Carbocation Local Speech System Audio"
+    ) {
+        self.excludesCurrentProcessAudio = excludesCurrentProcessAudio
+        self.tapName = tapName
+    }
+}
+
+@available(iOS, unavailable, message: "System audio capture uses macOS Core Audio process taps and is unavailable on iOS.")
+public enum SystemAudioCaptureError: Error, LocalizedError, Sendable {
+    case sdkUnavailable
+
+    public var errorDescription: String? {
+        "System audio capture uses macOS Core Audio process taps and is unavailable on iOS."
+    }
+}
+
+@available(iOS, unavailable, message: "System audio capture uses macOS Core Audio process taps and is unavailable on iOS.")
+public final class SystemAudioCaptureSession: AudioCapturing, @unchecked Sendable {
+    public init(options: SystemAudioCaptureOptions = SystemAudioCaptureOptions()) {
+        _ = options
+    }
+
+    public func start(configuration: AudioCaptureConfiguration = AudioCaptureConfiguration()) -> AsyncThrowingStream<AudioChunk, Error> {
+        _ = configuration
+        return AsyncThrowingStream { continuation in
+            continuation.finish(throwing: SystemAudioCaptureError.sdkUnavailable)
+        }
+    }
+
+    public func stop() {}
+}
+#endif

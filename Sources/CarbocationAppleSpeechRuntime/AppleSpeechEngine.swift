@@ -84,9 +84,18 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
         #endif
     }
 
+    nonisolated static var modernSpeechTranscriberIsAvailable: Bool {
+        #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
+        if #available(macOS 26.0, iOS 26.0, *) {
+            return Speech.SpeechTranscriber.isAvailable
+        }
+        #endif
+        return false
+    }
+
     public nonisolated static func availability(locale: Locale) async -> SpeechProviderAvailability {
         #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
-        guard #available(macOS 26.0, *) else {
+        guard #available(macOS 26.0, iOS 26.0, *) else {
             return .unavailable(.operatingSystemUnavailable)
         }
         return await modernAvailability(locale: locale)
@@ -98,7 +107,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
 
     public nonisolated static func systemModelOption(locale: Locale) async -> SpeechSystemModelOption? {
         let availability = await availability(locale: locale)
-        guard availability.shouldOfferModelOption else { return nil }
+        guard availability.shouldDisplayModelOption else { return nil }
         let subtitle: String
         if availability.isAvailable {
             subtitle = "Built-in on-device speech recognition"
@@ -117,7 +126,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
 
     public func prepare(locale: Locale, installAssetsIfNeeded: Bool) async throws {
         #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, iOS 26.0, *) {
             try await Self.requestSpeechRecognitionAuthorizationIfNeeded()
         }
         #endif
@@ -130,7 +139,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
 
         if availability == .unavailable(.assetDownloadRequired), installAssetsIfNeeded {
             #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
-            guard #available(macOS 26.0, *) else {
+            guard #available(macOS 26.0, iOS 26.0, *) else {
                 throw AppleSpeechEngineError.unavailable(.unavailable(.operatingSystemUnavailable))
             }
             try await Self.installAssets(locale: locale)
@@ -160,7 +169,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
         }
 
         #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
-        guard #available(macOS 26.0, *) else {
+        guard #available(macOS 26.0, iOS 26.0, *) else {
             throw AppleSpeechEngineError.unavailable(.unavailable(.operatingSystemUnavailable))
         }
         return try await Self.transcribeWithModernSpeech(file: url, locale: locale, options: options)
@@ -210,7 +219,7 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
         if options.implementation != .emulated {
             let locale = preparedLocale ?? Locale(identifier: options.transcription.language ?? Locale.current.identifier)
             #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
-            if #available(macOS 26.0, *) {
+            if #available(macOS 26.0, iOS 26.0, *) {
                 return Self.streamWithModernSpeech(
                     audio: audio,
                     locale: locale,
@@ -325,9 +334,9 @@ public actor AppleSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
 
 #if canImport(Speech) && CARBOCATION_HAS_MODERN_SPEECH
 extension AppleSpeechEngine {
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func modernAvailability(locale: Locale) async -> SpeechProviderAvailability {
-        guard Speech.SpeechTranscriber.isAvailable else {
+        guard modernSpeechTranscriberIsAvailable else {
             return .unavailable(.deviceNotEligible)
         }
 
@@ -347,7 +356,7 @@ extension AppleSpeechEngine {
         return await availabilityForAssets(supporting: assetModules(for: supportedLocale))
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func installAssets(locale: Locale) async throws {
         guard let supportedLocale = await Speech.SpeechTranscriber.supportedLocale(equivalentTo: locale) else {
             throw AppleSpeechEngineError.unavailable(.unavailable(.localeUnsupported))
@@ -358,7 +367,7 @@ extension AppleSpeechEngine {
         }
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func requestSpeechRecognitionAuthorizationIfNeeded() async throws {
         let currentStatus = SFSpeechRecognizer.authorizationStatus()
         if currentStatus == .notDetermined {
@@ -373,7 +382,7 @@ extension AppleSpeechEngine {
         }
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func throwIfSpeechRecognitionUnauthorized(_ status: SFSpeechRecognizerAuthorizationStatus) throws {
         switch status {
         case .authorized, .notDetermined:
@@ -385,7 +394,7 @@ extension AppleSpeechEngine {
         }
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func assetModules(for supportedLocale: Locale) -> [any Speech.SpeechModule] {
         [
             Speech.SpeechTranscriber(locale: supportedLocale, preset: .transcription),
@@ -393,7 +402,7 @@ extension AppleSpeechEngine {
         ]
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func liveDictationPreset(
         strategy: StreamingTranscriptionStrategy
     ) -> Speech.DictationTranscriber.Preset {
@@ -421,12 +430,12 @@ extension AppleSpeechEngine {
         }
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func liveAnalyzerOptions() -> Speech.SpeechAnalyzer.Options {
         Speech.SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .whileInUse)
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func speechDetectionOptions(for options: VoiceActivityDetectionOptions) -> Speech.SpeechDetector.DetectionOptions {
         let sensitivity: Speech.SpeechDetector.SensitivityLevel
         switch options.sensitivity {
@@ -451,7 +460,7 @@ extension AppleSpeechEngine {
         }
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func availabilityForAssets(supporting modules: [any Speech.SpeechModule]) async -> SpeechProviderAvailability {
         let status = await Speech.AssetInventory.status(forModules: modules)
         switch status {
@@ -468,7 +477,7 @@ extension AppleSpeechEngine {
         }
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func ensureAssetsInstalled(supporting modules: [any Speech.SpeechModule]) async throws {
         let availability = await availabilityForAssets(supporting: modules)
         guard availability.isAvailable else {
@@ -476,7 +485,7 @@ extension AppleSpeechEngine {
         }
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func transcribeWithModernSpeech(
         file url: URL,
         locale: Locale,
@@ -546,7 +555,7 @@ extension AppleSpeechEngine {
         )
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func streamWithModernSpeech(
         audio: AsyncThrowingStream<AudioChunk, Error>,
         locale: Locale,
@@ -808,21 +817,21 @@ extension AppleSpeechEngine {
         }
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func segment(
         from result: Speech.SpeechTranscriber.Result
     ) -> TranscriptSegment {
         segment(text: result.text, range: result.range)
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func segment(
         from result: Speech.DictationTranscriber.Result
     ) -> TranscriptSegment {
         segment(text: result.text, range: result.range)
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     private nonisolated static func segment(
         text: AttributedString,
         range: CMTimeRange
@@ -1069,7 +1078,7 @@ private struct AppleLiveResultUpdate: Sendable {
     var events: [TranscriptEvent] = []
 }
 
-@available(macOS 26.0, *)
+@available(macOS 26.0, iOS 26.0, *)
 private actor AppleLiveResultCoordinator {
     private let language: SpeechLanguage
     private let backend: SpeechBackendDescriptor

@@ -7,22 +7,68 @@ let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().pa
 let whisperCombinedLibrary = "\(packageRoot)/Vendor/whisper-artifacts/current/lib/libwhisper-combined.a"
 let whisperBinaryArtifactURL = ""
 let whisperBinaryArtifactChecksum = ""
-let whisperBinaryArtifactPath = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH"] ?? ""
+let defaultWhisperBinaryArtifactPath = "Vendor/whisper-artifacts/release/whisper.xcframework"
+let configuredWhisperBinaryArtifactPath = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_BINARY_ARTIFACT_PATH"] ?? ""
+let localWhisperBinaryArtifactPath = FileManager.default.fileExists(atPath: "\(packageRoot)/\(defaultWhisperBinaryArtifactPath)")
+    ? defaultWhisperBinaryArtifactPath
+    : ""
+let whisperBinaryArtifactPath = configuredWhisperBinaryArtifactPath.isEmpty
+    ? localWhisperBinaryArtifactPath
+    : configuredWhisperBinaryArtifactPath
 let forceSourceWhisper = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_SOURCE_WHISPER"] == "1"
 let forceDisableModernSpeechSDK = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_DISABLE_MODERN_SPEECH"] == "1"
 let forceDisableSystemAudioTaps = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_FORCE_DISABLE_SYSTEM_AUDIO_TAPS"] == "1"
 let sourceWhisperLibraryExists = FileManager.default.fileExists(atPath: whisperCombinedLibrary)
-let whisperCAPIIsLinked = sourceWhisperLibraryExists || forceSourceWhisper || !whisperBinaryArtifactPath.isEmpty || (!whisperBinaryArtifactURL.isEmpty && !whisperBinaryArtifactChecksum.isEmpty)
-let whisperRuntimeSwiftSettings: [SwiftSetting] = whisperCAPIIsLinked ? [.define("CARBOCATION_HAS_WHISPER_C_API")] : []
-let modernSpeechSDKIsAvailable = !forceDisableModernSpeechSDK && macOSSDKContainsModernSpeechSymbols()
-let appleSpeechRuntimeSwiftSettings: [SwiftSetting] = modernSpeechSDKIsAvailable ? [.define("CARBOCATION_HAS_MODERN_SPEECH")] : []
-let systemAudioTapsAreAvailable = !forceDisableSystemAudioTaps && coreAudioSwiftOverlayContainsSystemAudioTapSymbols()
-let localSpeechSwiftSettings: [SwiftSetting] = systemAudioTapsAreAvailable ? [.define("CARBOCATION_HAS_SYSTEM_AUDIO_TAPS")] : []
-let clsSmokeInfoPlist = "\(packageRoot)/Sources/CLSSmoke/Info.plist"
+let whisperBinaryArtifactIsConfigured = !whisperBinaryArtifactPath.isEmpty || (!whisperBinaryArtifactURL.isEmpty && !whisperBinaryArtifactChecksum.isEmpty)
+let whisperSourceArtifactIsConfigured = sourceWhisperLibraryExists || forceSourceWhisper
+let whisperRuntimeSwiftSettings: [SwiftSetting] = {
+    if whisperBinaryArtifactIsConfigured {
+        return [
+            .define("CARBOCATION_HAS_WHISPER_C_API"),
+            .define("CARBOCATION_HAS_WHISPER_BINARY_ARTIFACT")
+        ]
+    }
+    if whisperSourceArtifactIsConfigured {
+        return [.define("CARBOCATION_HAS_WHISPER_C_API", .when(platforms: [.macOS]))]
+    }
+    return []
+}()
+let appleSpeechRuntimeSwiftSettings: [SwiftSetting] = {
+    guard !forceDisableModernSpeechSDK else { return [] }
 
-// canImport(Speech) is true on older SDKs that lack the macOS 26 analyzer API.
+    var settings: [SwiftSetting] = []
+    if macOSSDKContainsModernSpeechSymbols() {
+        settings.append(.define("CARBOCATION_HAS_MODERN_SPEECH", .when(platforms: [.macOS])))
+    }
+    if iOSSDKContainsModernSpeechSymbols() {
+        settings.append(.define("CARBOCATION_HAS_MODERN_SPEECH", .when(platforms: [.iOS])))
+    }
+    return settings
+}()
+let systemAudioTapsAreAvailable = !forceDisableSystemAudioTaps && coreAudioSwiftOverlayContainsSystemAudioTapSymbols()
+let localSpeechSwiftSettings: [SwiftSetting] = systemAudioTapsAreAvailable
+    ? [.define("CARBOCATION_HAS_SYSTEM_AUDIO_TAPS", .when(platforms: [.macOS]))]
+    : []
+let clsSmokeMacOSInfoPlist = "\(packageRoot)/Sources/CLSSmoke/Info.plist"
+let clsSmokeIOSInfoPlist = "\(packageRoot)/Sources/CLSSmoke/Info-iOS.plist"
+
+// canImport(Speech) is true on older SDKs that lack the platform 26 analyzer API.
 func macOSSDKContainsModernSpeechSymbols() -> Bool {
-    guard let sdkPath = activeMacOSSDKPath() else { return false }
+    sdkContainsModernSpeechSymbols(sdkName: "macosx")
+}
+
+func iOSSDKContainsModernSpeechSymbols() -> Bool {
+    let paths = ["iphoneos", "iphonesimulator"].compactMap { activeSDKPath(sdkName: $0) }
+    guard !paths.isEmpty else { return false }
+    return paths.allSatisfy { sdkContainsModernSpeechSymbols(sdkPath: $0) }
+}
+
+func sdkContainsModernSpeechSymbols(sdkName: String) -> Bool {
+    guard let sdkPath = activeSDKPath(sdkName: sdkName) else { return false }
+    return sdkContainsModernSpeechSymbols(sdkPath: sdkPath)
+}
+
+func sdkContainsModernSpeechSymbols(sdkPath: String) -> Bool {
     let speechModuleURL = URL(fileURLWithPath: sdkPath)
         .appendingPathComponent("System/Library/Frameworks/Speech.framework/Modules/Speech.swiftmodule")
     return swiftModule(at: speechModuleURL, containsAll: [
@@ -36,34 +82,66 @@ func macOSSDKContainsModernSpeechSymbols() -> Bool {
     ])
 }
 
-func activeMacOSSDKPath() -> String? {
+func activeSDKPath(sdkName: String) -> String? {
     let environment = ProcessInfo.processInfo.environment
     if let sdkRoot = environment["SDKROOT"],
        !sdkRoot.isEmpty,
+       sdkRootMatches(sdkRoot, sdkName: sdkName),
        FileManager.default.fileExists(atPath: sdkRoot) {
         return sdkRoot
     }
+    if let sdkPath = xcrunSDKPath(sdkName: sdkName) {
+        return sdkPath
+    }
     if let developerDir = environment["DEVELOPER_DIR"],
-       let sdkPath = macOSSDKPath(developerDir: developerDir) {
+       let sdkPath = developerSDKPath(developerDir: developerDir, sdkName: sdkName) {
         return sdkPath
     }
-    if let sdkPath = xcrunMacOSSDKPath() {
-        return sdkPath
-    }
-    if let sdkPath = macOSSDKPath(developerDir: "/Applications/Xcode.app/Contents/Developer") {
+    if let sdkPath = developerSDKPath(developerDir: "/Applications/Xcode.app/Contents/Developer", sdkName: sdkName) {
         return sdkPath
     }
     for developerDir in installedXcodeDeveloperDirectories() {
-        if let sdkPath = macOSSDKPath(developerDir: developerDir) {
+        if let sdkPath = developerSDKPath(developerDir: developerDir, sdkName: sdkName) {
             return sdkPath
         }
     }
     return nil
 }
 
-func macOSSDKPath(developerDir: String) -> String? {
+func sdkRootMatches(_ sdkRoot: String, sdkName: String) -> Bool {
+    let lowercased = sdkRoot.lowercased()
+    switch sdkName {
+    case "macosx":
+        return lowercased.contains("/macosx.platform/")
+    case "iphoneos":
+        return lowercased.contains("/iphoneos.platform/")
+    case "iphonesimulator":
+        return lowercased.contains("/iphonesimulator.platform/")
+    default:
+        return false
+    }
+}
+
+func developerSDKPath(developerDir: String, sdkName: String) -> String? {
+    let platformPath: String
+    let sdkDirectoryName: String
+    switch sdkName {
+    case "macosx":
+        platformPath = "Platforms/MacOSX.platform/Developer/SDKs"
+        sdkDirectoryName = "MacOSX.sdk"
+    case "iphoneos":
+        platformPath = "Platforms/iPhoneOS.platform/Developer/SDKs"
+        sdkDirectoryName = "iPhoneOS.sdk"
+    case "iphonesimulator":
+        platformPath = "Platforms/iPhoneSimulator.platform/Developer/SDKs"
+        sdkDirectoryName = "iPhoneSimulator.sdk"
+    default:
+        return nil
+    }
+
     let sdkPath = URL(fileURLWithPath: developerDir)
-        .appendingPathComponent("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+        .appendingPathComponent(platformPath)
+        .appendingPathComponent(sdkDirectoryName)
         .path
     return FileManager.default.fileExists(atPath: sdkPath) ? sdkPath : nil
 }
@@ -79,8 +157,8 @@ func installedXcodeDeveloperDirectories() -> [String] {
         .map { "/Applications/\($0)/Contents/Developer" }
 }
 
-func xcrunMacOSSDKPath() -> String? {
-    guard let path = xcrunOutput(arguments: ["--sdk", "macosx", "--show-sdk-path"]),
+func xcrunSDKPath(sdkName: String) -> String? {
+    guard let path = xcrunOutput(arguments: ["--sdk", sdkName, "--show-sdk-path"]),
           !path.isEmpty,
           FileManager.default.fileExists(atPath: path) else {
         return nil
@@ -179,7 +257,7 @@ let whisperUnsafeLinkerSettings: [LinkerSetting]
 
 if forceSourceWhisper {
     whisperTarget = .systemLibrary(name: "whisper", path: "Sources/whisper")
-    whisperUnsafeLinkerSettings = [.unsafeFlags([whisperCombinedLibrary])]
+    whisperUnsafeLinkerSettings = [.unsafeFlags([whisperCombinedLibrary], .when(platforms: [.macOS]))]
 } else if !whisperBinaryArtifactPath.isEmpty {
     whisperTarget = .binaryTarget(name: "whisper", path: whisperBinaryArtifactPath)
     whisperUnsafeLinkerSettings = []
@@ -192,13 +270,16 @@ if forceSourceWhisper {
     whisperUnsafeLinkerSettings = []
 } else {
     whisperTarget = .systemLibrary(name: "whisper", path: "Sources/whisper")
-    whisperUnsafeLinkerSettings = sourceWhisperLibraryExists ? [.unsafeFlags([whisperCombinedLibrary])] : []
+    whisperUnsafeLinkerSettings = sourceWhisperLibraryExists
+        ? [.unsafeFlags([whisperCombinedLibrary], .when(platforms: [.macOS]))]
+        : []
 }
 
 let package = Package(
     name: "CarbocationLocalSpeech",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v14),
+        .iOS(.v17)
     ],
     products: [
         .library(name: "CarbocationLocalSpeech", targets: ["CarbocationLocalSpeech"]),
@@ -215,7 +296,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("AudioToolbox"),
-                .linkedFramework("CoreAudio"),
+                .linkedFramework("CoreAudio", .when(platforms: [.macOS])),
                 .linkedFramework("Accelerate")
             ]
         ),
@@ -258,7 +339,7 @@ let package = Package(
             name: "CarbocationLocalSpeechUI",
             dependencies: ["CarbocationLocalSpeech"],
             linkerSettings: [
-                .linkedFramework("AppKit"),
+                .linkedFramework("AppKit", .when(platforms: [.macOS])),
                 .linkedFramework("SwiftUI")
             ]
         ),
@@ -266,16 +347,23 @@ let package = Package(
             name: "CLSSmoke",
             dependencies: [
                 "CarbocationLocalSpeechUI",
-                "CarbocationLocalSpeechRuntime"
+                "CarbocationLocalSpeechRuntime",
+                "CarbocationWhisperRuntime"
             ],
-            exclude: ["Info.plist"],
+            exclude: ["Info.plist", "Info-iOS.plist"],
             linkerSettings: [
                 .unsafeFlags([
                     "-Xlinker", "-sectcreate",
                     "-Xlinker", "__TEXT",
                     "-Xlinker", "__info_plist",
-                    "-Xlinker", clsSmokeInfoPlist
-                ])
+                    "-Xlinker", clsSmokeMacOSInfoPlist
+                ], .when(platforms: [.macOS])),
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", clsSmokeIOSInfoPlist
+                ], .when(platforms: [.iOS]))
             ]
         ),
         .testTarget(

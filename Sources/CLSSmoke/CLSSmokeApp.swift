@@ -1,9 +1,15 @@
-import AppKit
 import CarbocationLocalSpeech
 import CarbocationLocalSpeechRuntime
 import CarbocationLocalSpeechUI
+import CarbocationWhisperRuntime
 import SwiftUI
 import UniformTypeIdentifiers
+
+#if os(macOS)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 private enum CLSSmokeConsoleDiagnostics {
     static func log(_ message: String) {
@@ -33,6 +39,7 @@ private final class CLSSmokeLiveDiagnosticsState {
     }
 }
 
+#if os(macOS)
 private final class CLSSmokeHangSampler {
     private let monitorQueue = DispatchQueue(label: "CLSSmoke.HangSampler", qos: .utility)
     private var heartbeatTimer: DispatchSourceTimer?
@@ -132,7 +139,9 @@ private final class CLSSmokeHangSampler {
         String(format: "%.1f", value)
     }
 }
+#endif
 
+#if os(macOS)
 @main
 private enum CLSSmokeApp {
     @MainActor
@@ -196,6 +205,58 @@ private final class CLSSmokeAppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.mainMenu = mainMenu
     }
 }
+#else
+@main
+private struct CLSSmokeApp: App {
+    var body: some Scene {
+        WindowGroup {
+            CLSSmokeRootView()
+        }
+    }
+}
+#endif
+
+private enum CLSSmokePlatformColor {
+    static var windowBackground: Color {
+#if os(macOS)
+        Color(nsColor: .windowBackgroundColor)
+#elseif canImport(UIKit)
+        Color(uiColor: .systemBackground)
+#else
+        Color.clear
+#endif
+    }
+
+    static var controlBackground: Color {
+#if os(macOS)
+        Color(nsColor: .controlBackgroundColor)
+#elseif canImport(UIKit)
+        Color(uiColor: .secondarySystemBackground)
+#else
+        Color.clear
+#endif
+    }
+
+    static var textBackground: Color {
+#if os(macOS)
+        Color(nsColor: .textBackgroundColor)
+#elseif canImport(UIKit)
+        Color(uiColor: .secondarySystemBackground)
+#else
+        Color.clear
+#endif
+    }
+}
+
+private struct CLSSmokePlatformCheckboxToggleStyle: ViewModifier {
+    func body(content: Content) -> some View {
+#if os(macOS)
+        content.toggleStyle(.checkbox)
+#else
+        content
+#endif
+    }
+}
 
 @MainActor
 private struct CLSSmokeRootView: View {
@@ -225,11 +286,13 @@ private struct CLSSmokeRootView: View {
     @State private var lastLoggedProgressDuration: TimeInterval?
     @State private var lastTranscriptProgressDuration: TimeInterval?
     @State private var selectedFileURL: URL?
+    @State private var scopedFileAccessURL: URL?
     @State private var fileTranscript: Transcript?
     @State private var fileProcessingDuration: TimeInterval?
     @State private var fileStatusMessage = "Pick or drop an audio or movie file."
     @State private var fileStatusTone = CLSSmokeStatusTone.secondary
     @State private var isFileDropTargeted = false
+    @State private var showAudioFileImporter = false
     @State private var isFileTranscribing = false
     @State private var fileTranscriptionTask: Task<Void, Never>?
     @State private var activeFileTranscriptionID: UUID?
@@ -263,53 +326,89 @@ private struct CLSSmokeRootView: View {
     )
 
     var body: some View {
-        HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 0) {
-                Text("Speech Providers")
-                    .font(.title2.weight(.semibold))
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 16)
-                Divider()
-                SpeechModelLibraryPickerView(
-                    library: library,
-                    selectionStorageValue: $selectionStorageValue,
-                    confirmTitle: confirmTitle,
-                    confirmDisabled: isConfirmDisabled,
-                    systemOptions: systemOptions,
-                    onSelectionConfirmed: { selection in
-                        startListening(with: selection)
-                    },
-                    onDeleteModel: { model in
-                        try? library.delete(id: model.id)
-                    }
-                )
+        rootContent
+            .task {
+                refreshWERState()
+                systemOptions = await LocalSpeechEngine.systemModelOptions(locale: .current)
             }
-            .frame(width: 430)
+            .onDisappear {
+                cancelFileTranscription(updateStatus: false)
+                stopListening()
+                releaseSelectedFileSecurityScope()
+            }
+            .onChange(of: werReferenceText) {
+                refreshWERState()
+            }
+            .fileImporter(
+                isPresented: $showAudioFileImporter,
+                allowedContentTypes: Self.supportedAudioFileTypes
+            ) { result in
+                handleFileImportResult(result)
+            }
+    }
+
+    @ViewBuilder
+    private var rootContent: some View {
+#if os(macOS)
+        HStack(spacing: 0) {
+            speechProvidersColumn
+                .frame(width: 430)
 
             Divider()
 
-            VStack(alignment: .leading, spacing: 0) {
-                Text("Diagnostics")
-                    .font(.title2.weight(.semibold))
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 16)
-                Divider()
-                diagnosticsContent
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            diagnosticsColumn
         }
         .frame(minWidth: 1240, minHeight: 680)
-        .task {
-            refreshWERState()
-            systemOptions = await LocalSpeechEngine.systemModelOptions(locale: .current)
+#else
+        TabView {
+            speechProvidersColumn
+                .tabItem {
+                    Label("Models", systemImage: "shippingbox")
+                }
+
+            diagnosticsColumn
+                .tabItem {
+                    Label("Diagnostics", systemImage: "waveform.path.ecg")
+                }
         }
-        .onDisappear {
-            cancelFileTranscription(updateStatus: false)
-            stopListening()
+#endif
+    }
+
+    private var speechProvidersColumn: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Speech Providers")
+                .font(.title2.weight(.semibold))
+                .padding(.horizontal, 20)
+                .padding(.vertical, 16)
+            Divider()
+            SpeechModelLibraryPickerView(
+                library: library,
+                selectionStorageValue: $selectionStorageValue,
+                confirmTitle: confirmTitle,
+                confirmDisabled: isConfirmDisabled,
+                showsConfirmationFooter: false,
+                systemOptions: systemOptions,
+                onSelectionConfirmed: { selection in
+                    startListening(with: selection)
+                },
+                onDeleteModel: { model in
+                    try? library.delete(id: model.id)
+                }
+            )
         }
-        .onChange(of: werReferenceText) {
-            refreshWERState()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var diagnosticsColumn: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Diagnostics")
+                .font(.title2.weight(.semibold))
+                .padding(.horizontal, 20)
+                .padding(.vertical, 16)
+            Divider()
+            diagnosticsContent
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var confirmTitle: String {
@@ -339,7 +438,12 @@ private struct CLSSmokeRootView: View {
     }
 
     private var selectedLiveInput: CLSSmokeLiveInput {
-        CLSSmokeLiveInput(rawValue: liveInputStorageValue) ?? .microphone
+        let input = CLSSmokeLiveInput(rawValue: liveInputStorageValue) ?? .microphone
+#if os(macOS)
+        return input
+#else
+        return input == .systemAudio ? .microphone : input
+#endif
     }
 
     private var vadModeBinding: Binding<CLSSmokeVADMode> {
@@ -383,9 +487,11 @@ private struct CLSSmokeRootView: View {
     }
 
     private var systemAudioInputIsAvailable: Bool {
+#if os(macOS)
         if #available(macOS 15.0, *) {
             return true
         }
+#endif
         return false
     }
 
@@ -397,26 +503,41 @@ private struct CLSSmokeRootView: View {
         return "Reference: \(werReferenceWordCount) words"
     }
 
+    @ViewBuilder
     private var diagnosticsContent: some View {
+#if os(macOS)
         HStack(spacing: 0) {
             diagnosticsControlsColumn
 
             Divider()
 
-            LiveTranscriptDebugView(
-                eventDescriptions: visibleEventDescriptions,
-                snapshot: visibleTranscriptSnapshot,
-                totalEventDescriptionCount: visibleEventDescriptionTotalCount,
-                copyAllEventDescriptions: {
-                    copyEventDescriptions(liveDiagnostics.eventDescriptions)
-                },
-                copyTranscript: {
-                    copyTranscript(liveDiagnostics.transcriptSnapshot)
-                }
-            )
-            .frame(minWidth: 430, maxWidth: .infinity, maxHeight: .infinity)
+            liveTranscriptDebugPane
+                .frame(minWidth: 430, maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+#else
+        VStack(spacing: 0) {
+            diagnosticsControlsColumn
+            Divider()
+            liveTranscriptDebugPane
+                .frame(height: 360)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+#endif
+    }
+
+    private var liveTranscriptDebugPane: some View {
+        LiveTranscriptDebugView(
+            eventDescriptions: visibleEventDescriptions,
+            snapshot: visibleTranscriptSnapshot,
+            totalEventDescriptionCount: visibleEventDescriptionTotalCount,
+            copyAllEventDescriptions: {
+                copyEventDescriptions(liveDiagnostics.eventDescriptions)
+            },
+            copyTranscript: {
+                copyTranscript(liveDiagnostics.transcriptSnapshot)
+            }
+        )
     }
 
     private var diagnosticsControlsColumn: some View {
@@ -430,8 +551,12 @@ private struct CLSSmokeRootView: View {
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(CLSSmokePlatformColor.windowBackground)
+#if os(macOS)
         .frame(minWidth: 360, idealWidth: 420, maxWidth: 500, maxHeight: .infinity)
+#else
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+#endif
     }
 
     private var sessionStatus: some View {
@@ -439,7 +564,7 @@ private struct CLSSmokeRootView: View {
             HStack(spacing: 10) {
                 Label(statusMessage, systemImage: statusTone.systemImageName)
                     .foregroundStyle(statusTone.color)
-                    .lineLimit(2)
+                    .lineLimit(3)
 
                 if isStarting {
                     ProgressView()
@@ -454,6 +579,18 @@ private struct CLSSmokeRootView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    if let selectedSelection {
+                        startListening(with: selectedSelection)
+                    }
+                } label: {
+                    Label(confirmTitle, systemImage: isListening ? "arrow.clockwise" : "play.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(selectedSelection == nil || isConfirmDisabled)
 
                 Button {
                     stopListening()
@@ -461,6 +598,8 @@ private struct CLSSmokeRootView: View {
                     Label("Stop", systemImage: "stop.fill")
                 }
                 .disabled(!isStarting && !isListening)
+
+                Spacer()
             }
 
             liveInputSettings
@@ -510,7 +649,7 @@ private struct CLSSmokeRootView: View {
                     .frame(width: 80, alignment: .leading)
 
                 Toggle("Record live audio", isOn: $recordLiveAudio)
-                    .toggleStyle(.checkbox)
+                    .modifier(CLSSmokePlatformCheckboxToggleStyle())
                     .disabled(isStarting || isListening || isFileTranscribing)
 
                 Spacer(minLength: 8)
@@ -626,7 +765,7 @@ private struct CLSSmokeRootView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(CLSSmokePlatformColor.windowBackground)
     }
 
     private var werPanel: some View {
@@ -652,7 +791,7 @@ private struct CLSSmokeRootView: View {
                 .font(.system(.caption, design: .monospaced))
                 .frame(height: 74)
                 .scrollContentBackground(.hidden)
-                .background(Color(nsColor: .textBackgroundColor))
+                .background(CLSSmokePlatformColor.textBackground)
                 .clipShape(RoundedRectangle(cornerRadius: 6))
 
             HStack(spacing: 12) {
@@ -696,7 +835,7 @@ private struct CLSSmokeRootView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(CLSSmokePlatformColor.windowBackground)
     }
 
     private var fileDropTarget: some View {
@@ -724,7 +863,7 @@ private struct CLSSmokeRootView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .frame(maxWidth: .infinity, minHeight: 62, alignment: .leading)
-        .background(isFileDropTargeted ? Color.accentColor.opacity(0.12) : Color(nsColor: .controlBackgroundColor))
+        .background(isFileDropTargeted ? Color.accentColor.opacity(0.12) : CLSSmokePlatformColor.controlBackground)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8)
@@ -772,7 +911,7 @@ private struct CLSSmokeRootView: View {
                     .padding(10)
             }
             .frame(minHeight: 72, maxHeight: 130)
-            .background(Color(nsColor: .textBackgroundColor))
+            .background(CLSSmokePlatformColor.textBackground)
             .clipShape(RoundedRectangle(cornerRadius: 6))
         }
     }
@@ -796,6 +935,11 @@ private struct CLSSmokeRootView: View {
         guard liveInput != .systemAudio || systemAudioInputIsAvailable else {
             statusTone = .error
             statusMessage = "System audio input requires macOS 15 or newer."
+            return
+        }
+        guard whisperRuntimeIsAvailableIfNeeded(for: selection) else {
+            statusTone = .error
+            statusMessage = WhisperRuntimeSmoke.linkStatus().displayDescription
             return
         }
         guard vadMode != .enabled || vadAvailability.isAvailable else {
@@ -970,12 +1114,16 @@ private struct CLSSmokeRootView: View {
         case .microphone:
             return AVAudioEngineCaptureSession()
         case .systemAudio:
+#if os(macOS)
             guard #available(macOS 15.0, *) else {
                 throw CLSSmokeLiveInputError.systemAudioRequiresMacOS15
             }
             return SystemAudioCaptureSession(options: SystemAudioCaptureOptions(
                 excludesCurrentProcessAudio: true
             ))
+#else
+            throw CLSSmokeLiveInputError.systemAudioRequiresMacOS15
+#endif
         }
     }
 
@@ -996,11 +1144,16 @@ private struct CLSSmokeRootView: View {
         let directory = Self.liveRecordingsDirectory()
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+#if os(macOS)
             guard NSWorkspace.shared.open(directory) else {
                 statusMessage = "Could not open recordings folder."
                 statusTone = .error
                 return
             }
+#else
+            statusMessage = "Recordings are saved in the app container."
+            statusTone = .secondary
+#endif
         } catch {
             statusMessage = "Could not open recordings folder: \(error.localizedDescription)"
             statusTone = .error
@@ -1074,6 +1227,7 @@ private struct CLSSmokeRootView: View {
     }
 
     private func chooseAudioFile() {
+#if os(macOS)
         let panel = NSOpenPanel()
         panel.title = "Choose Audio or Movie File"
         panel.allowsMultipleSelection = false
@@ -1085,6 +1239,20 @@ private struct CLSSmokeRootView: View {
             return
         }
         selectFile(url, startImmediately: true)
+#else
+        showAudioFileImporter = true
+#endif
+    }
+
+    private func handleFileImportResult(_ result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            retainSelectedFileSecurityScope(url)
+            selectFile(url, startImmediately: true)
+        case .failure(let error):
+            fileStatusTone = .error
+            fileStatusMessage = error.localizedDescription
+        }
     }
 
     private func handleFileDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -1134,6 +1302,17 @@ private struct CLSSmokeRootView: View {
         }
     }
 
+    private func retainSelectedFileSecurityScope(_ url: URL) {
+        guard url.startAccessingSecurityScopedResource() else { return }
+        releaseSelectedFileSecurityScope()
+        scopedFileAccessURL = url
+    }
+
+    private func releaseSelectedFileSecurityScope() {
+        scopedFileAccessURL?.stopAccessingSecurityScopedResource()
+        scopedFileAccessURL = nil
+    }
+
     private func startFileTranscription() {
         guard let selectedFileURL else {
             fileStatusTone = .error
@@ -1143,6 +1322,11 @@ private struct CLSSmokeRootView: View {
         guard let selection = selectedSelection else {
             fileStatusTone = .error
             fileStatusMessage = "Choose a speech provider first."
+            return
+        }
+        guard whisperRuntimeIsAvailableIfNeeded(for: selection) else {
+            fileStatusTone = .error
+            fileStatusMessage = WhisperRuntimeSmoke.linkStatus().displayDescription
             return
         }
 
@@ -1179,6 +1363,11 @@ private struct CLSSmokeRootView: View {
                 vadAvailability: vadAvailability
             )
         }
+    }
+
+    private func whisperRuntimeIsAvailableIfNeeded(for selection: SpeechModelSelection) -> Bool {
+        guard case .installed = selection else { return true }
+        return WhisperRuntimeSmoke.linkStatus().isUsable
     }
 
     private func cancelFileTranscription(updateStatus: Bool = true) {
@@ -1461,15 +1650,23 @@ private struct CLSSmokeRootView: View {
     }
 
     private func copyEventDescriptions(_ descriptions: [String]) {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(descriptions.joined(separator: "\n"), forType: .string)
+        copyToPasteboard(descriptions.joined(separator: "\n"))
     }
 
     private func copyTranscript(_ snapshot: LiveTranscriptDebugSnapshot) {
+        copyToPasteboard(snapshot.transcriptText)
+    }
+
+    private func copyToPasteboard(_ text: String) {
+#if os(macOS)
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setString(snapshot.transcriptText, forType: .string)
+        pasteboard.setString(text, forType: .string)
+#elseif canImport(UIKit)
+        UIPasteboard.general.string = text
+#else
+        _ = text
+#endif
     }
 
     private func refreshVisibleTranscriptSnapshotIfNeeded(force: Bool = false) {
@@ -1778,6 +1975,14 @@ private struct CLSSmokeLiveRecordingContext {
 private enum CLSSmokeLiveInput: String, CaseIterable, Identifiable {
     case microphone
     case systemAudio
+
+    static var allCases: [CLSSmokeLiveInput] {
+#if os(macOS)
+        return [.microphone, .systemAudio]
+#else
+        return [.microphone]
+#endif
+    }
 
     var id: String { rawValue }
 

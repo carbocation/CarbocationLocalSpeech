@@ -9,6 +9,18 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         XCTAssertFalse(status.displayDescription.isEmpty)
     }
 
+    func testDefaultMetalPolicyDisablesIOSSimulatorMetal() {
+#if os(iOS) && targetEnvironment(simulator)
+        XCTAssertFalse(WhisperRuntimeDefaults.useMetal)
+        XCTAssertFalse(WhisperEngineConfiguration().useMetal)
+        XCTAssertFalse(WhisperLoadConfiguration().useMetal)
+#else
+        XCTAssertTrue(WhisperRuntimeDefaults.useMetal)
+        XCTAssertTrue(WhisperEngineConfiguration().useMetal)
+        XCTAssertTrue(WhisperLoadConfiguration().useMetal)
+#endif
+    }
+
     @MainActor
     func testEngineLoadsInstalledModelMetadataWithoutRunningInference() async throws {
         let root = try makeTemporaryDirectory()

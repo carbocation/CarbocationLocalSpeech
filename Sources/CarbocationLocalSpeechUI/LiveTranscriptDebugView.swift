@@ -1,6 +1,11 @@
 import CarbocationLocalSpeech
-import AppKit
 import SwiftUI
+
+#if os(macOS)
+import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
 
 public struct LiveTranscriptDebugView: View {
     public var events: [TranscriptEvent]
@@ -128,7 +133,7 @@ public struct LiveTranscriptDebugView: View {
         .padding(.horizontal, 20)
         .padding(.vertical, 16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Color(nsColor: .textBackgroundColor))
+        .background(CLSPlatformColor.textBackground)
     }
 
     @ViewBuilder private func transcriptText(_ snapshot: LiveTranscriptDebugSnapshot) -> some View {
@@ -185,7 +190,7 @@ public struct LiveTranscriptDebugView: View {
                 Text("Provider activity will appear here.")
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(nsColor: .windowBackgroundColor))
+            .background(CLSPlatformColor.windowBackground)
         } else {
             let liveLines = Array(lines.suffix(liveEventLineLimit))
             let totalLineCount = totalEventDescriptionCount ?? lines.count
@@ -216,7 +221,7 @@ public struct LiveTranscriptDebugView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(nsColor: .windowBackgroundColor))
+            .background(CLSPlatformColor.windowBackground)
         }
     }
 
@@ -236,9 +241,15 @@ public struct LiveTranscriptDebugView: View {
     }
 
     private func copyToPasteboard(_ text: String) {
+#if os(macOS)
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+#elseif canImport(UIKit)
+        UIPasteboard.general.string = text
+#else
+        _ = text
+#endif
     }
 
     public static func describe(_ event: TranscriptEvent) -> String {
@@ -273,6 +284,28 @@ public struct LiveTranscriptDebugView: View {
 
     private static func format(_ value: Double) -> String {
         String(format: "%.2f", value)
+    }
+}
+
+private enum CLSPlatformColor {
+    static var textBackground: Color {
+#if os(macOS)
+        Color(nsColor: .textBackgroundColor)
+#elseif canImport(UIKit)
+        Color(uiColor: .systemBackground)
+#else
+        Color(.background)
+#endif
+    }
+
+    static var windowBackground: Color {
+#if os(macOS)
+        Color(nsColor: .windowBackgroundColor)
+#elseif canImport(UIKit)
+        Color(uiColor: .secondarySystemBackground)
+#else
+        Color(.background)
+#endif
     }
 }
 
