@@ -270,6 +270,332 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(prepared.duration, Double(4) / 48_000, accuracy: 0.000_1)
     }
 
+    func testCAFRecorderWritesMonoFloat32Samples() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("mono.caf")
+        let recorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(fileURL: url))
+        let chunk = AudioChunk(
+            samples: [0, 0.25, -0.5, 0.75],
+            sampleRate: 8_000,
+            channelCount: 1,
+            startTime: 0
+        )
+
+        try await recorder.record(chunk)
+        let maybeSummary = try await recorder.finish()
+        let summary = try XCTUnwrap(maybeSummary)
+        let recorded = try readPCMFile(at: url)
+
+        XCTAssertEqual(summary.fileURL, url)
+        XCTAssertEqual(summary.sampleRate, 8_000, accuracy: 0.01)
+        XCTAssertEqual(summary.channelCount, 1)
+        XCTAssertEqual(summary.frameCount, 4)
+        XCTAssertEqual(summary.duration, 4.0 / 8_000.0, accuracy: 0.000_001)
+        XCTAssertEqual(recorded.sampleRate, 8_000, accuracy: 0.01)
+        XCTAssertEqual(recorded.channelCount, 1)
+        XCTAssertEqual(recorded.frameCount, 4)
+        XCTAssertSamplesEqual(recorded.samples, chunk.samples)
+    }
+
+    func testWAVRecorderWritesPCM16AndClampsSamples() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("clamped.wav")
+        let recorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(
+            fileURL: url,
+            format: .wavPCM16
+        ))
+        let chunk = AudioChunk(
+            samples: [-2, -1, -0.5, 0, 0.5, 1, 2],
+            sampleRate: 16_000,
+            channelCount: 1,
+            startTime: 0
+        )
+
+        try await recorder.record(chunk)
+        let maybeSummary = try await recorder.finish()
+        let summary = try XCTUnwrap(maybeSummary)
+        let recorded = try readPCMFile(at: url)
+
+        XCTAssertEqual(summary.frameCount, 7)
+        XCTAssertEqual(recorded.sampleRate, 16_000, accuracy: 0.01)
+        XCTAssertEqual(recorded.channelCount, 1)
+        XCTAssertEqual(recorded.frameCount, 7)
+        XCTAssertEqual(recorded.samples[0], -1, accuracy: 0.000_1)
+        XCTAssertEqual(recorded.samples[1], -1, accuracy: 0.000_1)
+        XCTAssertEqual(recorded.samples[2], -0.5, accuracy: 0.001)
+        XCTAssertEqual(recorded.samples[3], 0, accuracy: 0.001)
+        XCTAssertEqual(recorded.samples[4], 0.5, accuracy: 0.001)
+        XCTAssertEqual(recorded.samples[5], 1, accuracy: 0.000_1)
+        XCTAssertEqual(recorded.samples[6], 1, accuracy: 0.000_1)
+    }
+
+    func testRecorderWritesStereoInterleavedChunks() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("stereo.caf")
+        let recorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(fileURL: url))
+        let samples: [Float] = [
+            0.1, 0.2,
+            0.3, 0.4,
+            -0.1, -0.2
+        ]
+        let chunk = AudioChunk(
+            samples: samples,
+            sampleRate: 44_100,
+            channelCount: 2,
+            startTime: 0
+        )
+
+        try await recorder.record(chunk)
+        let maybeSummary = try await recorder.finish()
+        let summary = try XCTUnwrap(maybeSummary)
+        let recorded = try readPCMFile(at: url)
+
+        XCTAssertEqual(summary.channelCount, 2)
+        XCTAssertEqual(summary.frameCount, 3)
+        XCTAssertEqual(recorded.channelCount, 2)
+        XCTAssertEqual(recorded.frameCount, 3)
+        XCTAssertSamplesEqual(recorded.samples, samples)
+    }
+
+    func testRecorderRejectsFormatChangesAfterCreation() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("format-change.caf")
+        let recorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(fileURL: url))
+
+        try await recorder.record(AudioChunk(
+            samples: [0, 0.1],
+            sampleRate: 16_000,
+            channelCount: 1,
+            startTime: 0
+        ))
+
+        do {
+            try await recorder.record(AudioChunk(
+                samples: [0, 0.1],
+                sampleRate: 48_000,
+                channelCount: 1,
+                startTime: 0.1
+            ))
+            XCTFail("Expected format change to throw.")
+        } catch AudioRecordingError.formatChanged(
+            let expectedSampleRate,
+            let actualSampleRate,
+            let expectedChannelCount,
+            let actualChannelCount
+        ) {
+            XCTAssertEqual(expectedSampleRate, 16_000, accuracy: 0.01)
+            XCTAssertEqual(actualSampleRate, 48_000, accuracy: 0.01)
+            XCTAssertEqual(expectedChannelCount, 1)
+            XCTAssertEqual(actualChannelCount, 1)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testRecorderRejectsUnalignedFrames() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("unaligned.caf")
+        let recorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(fileURL: url))
+
+        do {
+            try await recorder.record(AudioChunk(
+                samples: [0, 0.1, 0.2],
+                sampleRate: 16_000,
+                channelCount: 2,
+                startTime: 0
+            ))
+            XCTFail("Expected invalid frame count to throw.")
+        } catch AudioRecordingError.invalidFrameCount(let sampleCount, let channelCount) {
+            XCTAssertEqual(sampleCount, 3)
+            XCTAssertEqual(channelCount, 2)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testRecorderFinishIsIdempotentAndEmptyRecordingReturnsNil() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("empty.caf")
+        let recorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(fileURL: url))
+
+        let firstFinish = try await recorder.finish()
+        let secondFinish = try await recorder.finish()
+        XCTAssertNil(firstFinish)
+        XCTAssertNil(secondFinish)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testRecorderRejectsRecordAfterFinish() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("finished.caf")
+        let recorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(fileURL: url))
+
+        let summary = try await recorder.finish()
+        XCTAssertNil(summary)
+        do {
+            try await recorder.record(AudioChunk(
+                samples: [0.1],
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0
+            ))
+            XCTFail("Expected record after finish to throw.")
+        } catch AudioRecordingError.recordingFinished {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testRecorderExistingFileBehavior() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("existing.caf")
+        try Data("existing".utf8).write(to: url)
+        let chunk = AudioChunk(
+            samples: [0.1, -0.1],
+            sampleRate: 16_000,
+            channelCount: 1,
+            startTime: 0
+        )
+
+        let defaultRecorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(fileURL: url))
+        do {
+            try await defaultRecorder.record(chunk)
+            XCTFail("Expected existing file to throw.")
+        } catch AudioRecordingError.fileAlreadyExists(let existingURL) {
+            XCTAssertEqual(existingURL, url)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let overwriteRecorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(
+            fileURL: url,
+            overwriteExistingFile: true
+        ))
+        try await overwriteRecorder.record(chunk)
+        let maybeSummary = try await overwriteRecorder.finish()
+        let summary = try XCTUnwrap(maybeSummary)
+        XCTAssertEqual(summary.frameCount, 2)
+        XCTAssertEqual(try readPCMFile(at: url).samples.count, 2)
+    }
+
+    func testRecordingStreamForwardsChunksAndWritesSameAudio() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("stream.caf")
+        let chunks = [
+            AudioChunk(samples: [0.1, 0.2], sampleRate: 16_000, channelCount: 1, startTime: 0),
+            AudioChunk(samples: [0.3, 0.4], sampleRate: 16_000, channelCount: 1, startTime: 0.000_125)
+        ]
+        let source = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            for chunk in chunks {
+                continuation.yield(chunk)
+            }
+            continuation.finish()
+        }
+        let recorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(fileURL: url))
+        let stream = AudioChunkStreams.recording(source, recorder: recorder)
+
+        var forwarded: [AudioChunk] = []
+        for try await chunk in stream {
+            forwarded.append(chunk)
+        }
+
+        let maybeSummary = try await recorder.finish()
+        let summary = try XCTUnwrap(maybeSummary)
+        let recorded = try readPCMFile(at: url)
+        XCTAssertEqual(forwarded, chunks)
+        XCTAssertEqual(summary.frameCount, 4)
+        XCTAssertSamplesEqual(recorded.samples, chunks.flatMap(\.samples))
+    }
+
+    func testRecordingStreamPropagatesSourceErrors() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("source-error.caf")
+        let chunk = AudioChunk(samples: [0.1, 0.2], sampleRate: 16_000, channelCount: 1, startTime: 0)
+        let source = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(chunk)
+            continuation.finish(throwing: AudioRecordingStreamTestError.source)
+        }
+        let recorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(fileURL: url))
+        let stream = AudioChunkStreams.recording(source, recorder: recorder)
+
+        var forwarded: [AudioChunk] = []
+        do {
+            for try await emitted in stream {
+                forwarded.append(emitted)
+            }
+            XCTFail("Expected source error.")
+        } catch AudioRecordingStreamTestError.source {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let maybeSummary = try await recorder.finish()
+        let summary = try XCTUnwrap(maybeSummary)
+        XCTAssertEqual(forwarded, [chunk])
+        XCTAssertEqual(summary.frameCount, 2)
+    }
+
+    func testRecordingStreamPropagatesRecorderErrorsBeforeForwardingChunk() async throws {
+        let root = try makeTemporaryDirectory()
+        let url = root.appendingPathComponent("recorder-error.caf")
+        let first = AudioChunk(samples: [0.1, 0.2], sampleRate: 16_000, channelCount: 1, startTime: 0)
+        let changed = AudioChunk(samples: [0.3, 0.4], sampleRate: 48_000, channelCount: 1, startTime: 0.1)
+        let source = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(first)
+            continuation.yield(changed)
+            continuation.finish()
+        }
+        let recorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(fileURL: url))
+        let stream = AudioChunkStreams.recording(source, recorder: recorder)
+
+        var forwarded: [AudioChunk] = []
+        do {
+            for try await emitted in stream {
+                forwarded.append(emitted)
+            }
+            XCTFail("Expected recorder error.")
+        } catch AudioRecordingError.formatChanged(_, _, _, _) {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let maybeSummary = try await recorder.finish()
+        let summary = try XCTUnwrap(maybeSummary)
+        XCTAssertEqual(forwarded, [first])
+        XCTAssertEqual(summary.frameCount, 2)
+    }
+
+    func testAudioChunkTapErrorsBeforeForwardingFailingChunk() async throws {
+        let chunks = [
+            AudioChunk(samples: [0.1], sampleRate: 16_000, channelCount: 1, startTime: 0),
+            AudioChunk(samples: [0.2], sampleRate: 16_000, channelCount: 1, startTime: 0.000_0625)
+        ]
+        let source = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            for chunk in chunks {
+                continuation.yield(chunk)
+            }
+            continuation.finish()
+        }
+        let stream = AudioChunkStreams.tap(source) { chunk in
+            if chunk.samples[0] == 0.2 {
+                throw AudioRecordingStreamTestError.tap
+            }
+        }
+
+        var forwarded: [AudioChunk] = []
+        do {
+            for try await chunk in stream {
+                forwarded.append(chunk)
+            }
+            XCTFail("Expected tap error.")
+        } catch AudioRecordingStreamTestError.tap {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertEqual(forwarded, [chunks[0]])
+    }
+
     @MainActor
     func testModelLibraryAddsDownloadedPartialUsingRequestedFilename() throws {
         let root = try makeTemporaryDirectory()
@@ -3884,6 +4210,120 @@ private func completedTranscriptText(in events: [TranscriptEvent]) -> String {
         }
         return nil
     }.last ?? ""
+}
+
+private enum AudioRecordingStreamTestError: Error {
+    case source
+    case tap
+}
+
+private struct RecordedPCMFile {
+    var samples: [Float]
+    var sampleRate: Double
+    var channelCount: Int
+    var frameCount: Int
+}
+
+private enum RecordedPCMReadError: Error {
+    case couldNotCreateBuffer
+    case unsupportedFormat
+}
+
+private func readPCMFile(at url: URL) throws -> RecordedPCMFile {
+    let file = try AVAudioFile(forReading: url)
+    let frameCapacity = AVAudioFrameCount(max(0, min(Int64(UInt32.max), file.length)))
+    guard let buffer = AVAudioPCMBuffer(
+        pcmFormat: file.processingFormat,
+        frameCapacity: frameCapacity
+    ) else {
+        throw RecordedPCMReadError.couldNotCreateBuffer
+    }
+
+    try file.read(into: buffer)
+    let channelCount = Int(buffer.format.channelCount)
+    let frameCount = Int(buffer.frameLength)
+    var samples: [Float] = []
+    samples.reserveCapacity(frameCount * channelCount)
+
+    if let channels = buffer.floatChannelData {
+        appendSamples(
+            from: channels,
+            frameCount: frameCount,
+            channelCount: channelCount,
+            isInterleaved: buffer.format.isInterleaved,
+            to: &samples
+        )
+    } else if let channels = buffer.int16ChannelData {
+        appendSamples(
+            from: channels,
+            frameCount: frameCount,
+            channelCount: channelCount,
+            isInterleaved: buffer.format.isInterleaved,
+            to: &samples
+        )
+    } else {
+        throw RecordedPCMReadError.unsupportedFormat
+    }
+
+    return RecordedPCMFile(
+        samples: samples,
+        sampleRate: buffer.format.sampleRate,
+        channelCount: channelCount,
+        frameCount: frameCount
+    )
+}
+
+private func appendSamples(
+    from channels: UnsafePointer<UnsafeMutablePointer<Float>>,
+    frameCount: Int,
+    channelCount: Int,
+    isInterleaved: Bool,
+    to samples: inout [Float]
+) {
+    for frame in 0..<frameCount {
+        for channel in 0..<channelCount {
+            let sourceChannel = isInterleaved ? 0 : channel
+            let sampleIndex = isInterleaved ? frame * channelCount + channel : frame
+            samples.append(channels[sourceChannel][sampleIndex])
+        }
+    }
+}
+
+private func appendSamples(
+    from channels: UnsafePointer<UnsafeMutablePointer<Int16>>,
+    frameCount: Int,
+    channelCount: Int,
+    isInterleaved: Bool,
+    to samples: inout [Float]
+) {
+    for frame in 0..<frameCount {
+        for channel in 0..<channelCount {
+            let sourceChannel = isInterleaved ? 0 : channel
+            let sampleIndex = isInterleaved ? frame * channelCount + channel : frame
+            let sample = channels[sourceChannel][sampleIndex]
+            samples.append(Float(sample) / Float(Int16.max))
+        }
+    }
+}
+
+private func XCTAssertSamplesEqual(
+    _ actual: [Float],
+    _ expected: [Float],
+    accuracy: Float = 0.000_1,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    XCTAssertEqual(actual.count, expected.count, file: file, line: line)
+    for index in 0..<min(actual.count, expected.count) {
+        XCTAssertEqual(
+            Double(actual[index]),
+            Double(expected[index]),
+            accuracy: Double(accuracy),
+            "sample \(index)",
+            file: file,
+            line: line
+        )
+    }
 }
 
 private func hasRepeatedNormalizedNGram(_ text: String, size: Int) -> Bool {

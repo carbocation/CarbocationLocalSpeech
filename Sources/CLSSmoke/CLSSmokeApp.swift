@@ -203,6 +203,7 @@ private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.vadMode") private var vadModeStorageValue = CLSSmokeVADMode.automatic.rawValue
     @AppStorage("CLSSmoke.vadSensitivity") private var vadSensitivityStorageValue = CLSSmokeVADSensitivity.medium.rawValue
     @AppStorage("CLSSmoke.liveInput") private var liveInputStorageValue = CLSSmokeLiveInput.microphone.rawValue
+    @AppStorage("CLSSmoke.recordLiveAudio") private var recordLiveAudio = false
     @AppStorage("CLSSmoke.werReferenceText") private var werReferenceText = ""
     @State private var systemOptions: [SpeechSystemModelOption] = []
     @State private var visibleEventDescriptions: [String] = []
@@ -217,6 +218,7 @@ private struct CLSSmokeRootView: View {
     @State private var captureSession: (any AudioCapturing)?
     @State private var transcriptionTask: Task<Void, Never>?
     @State private var activeSessionID: UUID?
+    @State private var activeRecordingURL: URL?
     @State private var lastLoggedAudioLevelTime: TimeInterval?
     @State private var lastLoggedVoiceActivityTime: TimeInterval?
     @State private var lastLoggedVoiceActivityState: VoiceActivityState?
@@ -442,6 +444,8 @@ private struct CLSSmokeRootView: View {
 
             liveInputSettings
 
+            liveRecordingStatus
+
             vadSettings
 
             if selectedLiveInput == .microphone {
@@ -478,6 +482,27 @@ private struct CLSSmokeRootView: View {
                     .foregroundStyle(.orange)
                     .lineLimit(2)
             }
+
+            HStack(spacing: 10) {
+                Text("Recording")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 80, alignment: .leading)
+
+                Toggle("Record live audio", isOn: $recordLiveAudio)
+                    .toggleStyle(.checkbox)
+                    .disabled(isStarting || isListening || isFileTranscribing)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var liveRecordingStatus: some View {
+        if let activeRecordingURL {
+            Label(activeRecordingURL.path, systemImage: "record.circle")
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
     }
 
@@ -754,6 +779,7 @@ private struct CLSSmokeRootView: View {
 
         let sessionID = UUID()
         activeSessionID = sessionID
+        activeRecordingURL = nil
         loadedInfo = nil
         resetTranscriptDiagnostics()
         isStarting = true
@@ -783,6 +809,7 @@ private struct CLSSmokeRootView: View {
         task?.cancel()
         isStarting = false
         isListening = false
+        activeRecordingURL = nil
 
         if unloadProvider {
             loadedInfo = nil
@@ -805,6 +832,7 @@ private struct CLSSmokeRootView: View {
         vadSensitivity: CLSSmokeVADSensitivity,
         vadAvailability: CLSSmokeVADAvailability
     ) async {
+        var recordingContext: CLSSmokeLiveRecordingContext?
         do {
             if liveInput == .microphone {
                 guard await ensureMicrophoneAccess() else {
@@ -853,8 +881,17 @@ private struct CLSSmokeRootView: View {
                 preferredChannelCount: 1,
                 frameDuration: 0.1
             ))
+            if recordLiveAudio {
+                let context = try makeLiveRecordingContext(for: liveInput)
+                recordingContext = context
+                activeRecordingURL = context.fileURL
+                logLiveRecordingStarted(context)
+            }
+            let transcriptionAudio = recordingContext.map {
+                AudioChunkStreams.recording(audio, recorder: $0.recorder)
+            } ?? audio
             let stream = LocalSpeechEngine.shared.stream(
-                audio: audio,
+                audio: transcriptionAudio,
                 options: StreamingTranscriptionOptions(
                     transcription: TranscriptionOptions(
                         useCase: .dictation,
@@ -880,12 +917,18 @@ private struct CLSSmokeRootView: View {
                 }
             }
 
+            await finishLiveRecording(recordingContext)
             guard activeSessionID == id else { return }
             await LocalSpeechEngine.shared.unload()
             finishSession(id: id, message: "Listening completed.", tone: .secondary)
         } catch is CancellationError {
+            await finishLiveRecording(recordingContext)
             finishSession(id: id, message: "Stopped.", tone: .secondary)
         } catch {
+            if let recordingContext {
+                logLiveRecordingFailure(error, context: recordingContext)
+            }
+            await finishLiveRecording(recordingContext)
             guard activeSessionID == id else { return }
             await LocalSpeechEngine.shared.unload()
             finishSession(id: id, message: error.localizedDescription, tone: .error)
@@ -904,6 +947,82 @@ private struct CLSSmokeRootView: View {
                 excludesCurrentProcessAudio: true
             ))
         }
+    }
+
+    private func makeLiveRecordingContext(for input: CLSSmokeLiveInput) throws -> CLSSmokeLiveRecordingContext {
+        let fileURL = Self.liveRecordingURL(for: input)
+        return CLSSmokeLiveRecordingContext(
+            fileURL: fileURL,
+            recorder: AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(
+                fileURL: fileURL,
+                format: .cafFloat32,
+                overwriteExistingFile: false,
+                createParentDirectories: true
+            ))
+        )
+    }
+
+    private func logLiveRecordingStarted(_ context: CLSSmokeLiveRecordingContext) {
+        let message = "started file=\(context.fileURL.lastPathComponent) path=\(context.fileURL.path)"
+        appendEvent(.diagnostic(TranscriptionDiagnostic(
+            source: "smoke.recording",
+            message: message
+        )))
+        CLSSmokeConsoleDiagnostics.log("recording \(message)")
+    }
+
+    private func logLiveRecordingFailure(_ error: Error, context: CLSSmokeLiveRecordingContext) {
+        let message = "sessionError file=\(context.fileURL.lastPathComponent) error=\(error.localizedDescription)"
+        appendEvent(.diagnostic(TranscriptionDiagnostic(
+            source: "smoke.recording",
+            message: message
+        )))
+        CLSSmokeConsoleDiagnostics.log("recording \(message) path=\(context.fileURL.path)")
+    }
+
+    private func finishLiveRecording(_ context: CLSSmokeLiveRecordingContext?) async {
+        guard let context else { return }
+        defer {
+            if activeRecordingURL == context.fileURL {
+                activeRecordingURL = nil
+            }
+        }
+
+        do {
+            if let summary = try await context.recorder.finish() {
+                let message = "finished file=\(summary.fileURL.lastPathComponent) duration=\(Self.formatDuration(summary.duration)) frames=\(summary.frameCount) sampleRate=\(Int(summary.sampleRate)) channels=\(summary.channelCount)"
+                appendEvent(.diagnostic(TranscriptionDiagnostic(
+                    source: "smoke.recording",
+                    message: message
+                )))
+                CLSSmokeConsoleDiagnostics.log("recording \(message) path=\(summary.fileURL.path)")
+            } else {
+                let message = "empty file=\(context.fileURL.lastPathComponent)"
+                appendEvent(.diagnostic(TranscriptionDiagnostic(
+                    source: "smoke.recording",
+                    message: message
+                )))
+                CLSSmokeConsoleDiagnostics.log("recording \(message) path=\(context.fileURL.path)")
+            }
+        } catch {
+            let message = "finishFailed file=\(context.fileURL.lastPathComponent) error=\(error.localizedDescription)"
+            appendEvent(.diagnostic(TranscriptionDiagnostic(
+                source: "smoke.recording",
+                message: message
+            )))
+            CLSSmokeConsoleDiagnostics.log("recording \(message) path=\(context.fileURL.path)")
+        }
+    }
+
+    private static func liveRecordingURL(for input: CLSSmokeLiveInput, date: Date = Date()) -> URL {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let timestamp = formatter.string(from: date)
+        let filename = "cls-live-\(timestamp)-\(input.recordingFilenameComponent).caf"
+        return SpeechModelStorage.appSupportDirectory(appSupportFolderName: "CLSSmoke")
+            .appendingPathComponent("Recordings", isDirectory: true)
+            .appendingPathComponent(filename)
     }
 
     private func chooseAudioFile() {
@@ -1603,6 +1722,11 @@ private struct CLSSmokeVADAvailability: Hashable {
     var diagnosticValue: String
 }
 
+private struct CLSSmokeLiveRecordingContext {
+    var fileURL: URL
+    var recorder: AudioChunkFileRecorder
+}
+
 private enum CLSSmokeLiveInput: String, CaseIterable, Identifiable {
     case microphone
     case systemAudio
@@ -1629,6 +1753,15 @@ private enum CLSSmokeLiveInput: String, CaseIterable, Identifiable {
 
     var diagnosticValue: String {
         rawValue
+    }
+
+    var recordingFilenameComponent: String {
+        switch self {
+        case .microphone:
+            return "microphone"
+        case .systemAudio:
+            return "system-audio"
+        }
     }
 }
 

@@ -229,6 +229,47 @@ Apple Speech does not support every Whisper option. For example, translation and
 
 Model-backed VAD is request-configurable with `TranscriptionOptions.voiceActivityDetection`. The default `.automatic` policy uses model VAD for live dictation-style streams and avoids it for file transcription; use `.enabled` or `.disabled` when the accuracy/power tradeoff should be explicit.
 
+### Record Live Audio
+
+Live recording is app-owned. Create a recorder for the file location and retention policy you want, then wrap the public `AudioChunk` stream before passing it into transcription:
+
+```swift
+import CarbocationLocalSpeech
+import CarbocationLocalSpeechRuntime
+
+let capture = AVAudioEngineCaptureSession()
+let audio = capture.start(configuration: AudioCaptureConfiguration(
+    preferredSampleRate: 16_000,
+    preferredChannelCount: 1,
+    frameDuration: 0.1
+))
+
+let recordingsDirectory = SpeechModelStorage
+    .appSupportDirectory(appSupportFolderName: "YourApp")
+    .appendingPathComponent("Recordings", isDirectory: true)
+let recorder = AudioChunkFileRecorder(configuration: AudioRecordingConfiguration(
+    fileURL: recordingsDirectory.appendingPathComponent("live-session.caf"),
+    format: .cafFloat32,
+    overwriteExistingFile: false,
+    createParentDirectories: true
+))
+let recordedAudio = AudioChunkStreams.recording(audio, recorder: recorder)
+
+let events = LocalSpeechEngine.shared.stream(
+    audio: recordedAudio,
+    options: StreamingTranscriptionOptions()
+)
+
+for try await event in events {
+    // Update app UI with transcript events.
+}
+
+let recording = try await recorder.finish()
+print(recording?.duration ?? 0)
+```
+
+Use `.cafFloat32` to preserve captured float samples. Use `.wavPCM16` when another app needs WAV PCM; samples are clamped to `[-1, 1]` during conversion.
+
 ### Install a Whisper Model
 
 The SwiftUI picker can import local `.bin` files, download curated Whisper models, resume interrupted downloads, and delete installed models. Use it directly in a settings surface:
