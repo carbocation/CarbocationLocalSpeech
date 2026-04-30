@@ -12,6 +12,7 @@ The package owns shared speech infrastructure: neutral model storage, Whisper mo
 - [Integration Guide](#integration-guide)
 - [Requirements](#requirements)
 - [Reference](#reference)
+- [License](#license)
 - [For Package Developers](#for-package-developers)
 
 ## Quick Start
@@ -370,6 +371,10 @@ For unreleased work you can point at `branch: "main"`, but Whisper inference the
 | Published binary tag | Imports the package and runs Whisper through the downloaded XCFramework. | Imports the package and runs Whisper through the downloaded XCFramework. | Imports the package and runs Whisper through the downloaded XCFramework; Metal is disabled by default for simulator runtime safety. |
 | `main` without a local binary artifact | Builds core/UI/Apple Speech surfaces; Whisper reports unavailable unless a local macOS source artifact exists. | Builds core/UI/Apple Speech surfaces; Whisper reports unavailable. | Builds core/UI/Apple Speech surfaces; Whisper reports unavailable. |
 | `main` plus `Vendor/whisper-artifacts/release/whisper.xcframework` | Imports and runs against the local XCFramework. | Imports and runs against the local XCFramework. | Imports and runs against the local XCFramework; Metal is disabled by default for simulator runtime safety. |
+
+## License
+
+CarbocationLocalSpeech's own code is available under the [MIT License](LICENSE). Third-party components and generated binary `whisper.xcframework` artifacts built from `whisper.cpp` / `ggml` are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ---
 
