@@ -49,8 +49,6 @@ let systemAudioTapsAreAvailable = !forceDisableSystemAudioTaps && coreAudioSwift
 let localSpeechSwiftSettings: [SwiftSetting] = systemAudioTapsAreAvailable
     ? [.define("CARBOCATION_HAS_SYSTEM_AUDIO_TAPS", .when(platforms: [.macOS]))]
     : []
-let clsSmokeMacOSInfoPlist = "\(packageRoot)/Sources/CLSSmoke/Info.plist"
-let clsSmokeIOSInfoPlist = "\(packageRoot)/Sources/CLSSmoke/Info-iOS.plist"
 
 // canImport(Speech) is true on older SDKs that lack the platform 26 analyzer API.
 func macOSSDKContainsModernSpeechSymbols() -> Bool {
@@ -286,8 +284,7 @@ let package = Package(
         .library(name: "CarbocationWhisperRuntime", targets: ["CarbocationWhisperRuntime"]),
         .library(name: "CarbocationAppleSpeechRuntime", targets: ["CarbocationAppleSpeechRuntime"]),
         .library(name: "CarbocationLocalSpeechRuntime", targets: ["CarbocationLocalSpeechRuntime"]),
-        .library(name: "CarbocationLocalSpeechUI", targets: ["CarbocationLocalSpeechUI"]),
-        .executable(name: "CLSSmoke", targets: ["CLSSmoke"])
+        .library(name: "CarbocationLocalSpeechUI", targets: ["CarbocationLocalSpeechUI"])
     ],
     targets: [
         .target(
@@ -341,29 +338,6 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AppKit", .when(platforms: [.macOS])),
                 .linkedFramework("SwiftUI")
-            ]
-        ),
-        .executableTarget(
-            name: "CLSSmoke",
-            dependencies: [
-                "CarbocationLocalSpeechUI",
-                "CarbocationLocalSpeechRuntime",
-                "CarbocationWhisperRuntime"
-            ],
-            exclude: ["Info.plist", "Info-iOS.plist"],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-sectcreate",
-                    "-Xlinker", "__TEXT",
-                    "-Xlinker", "__info_plist",
-                    "-Xlinker", clsSmokeMacOSInfoPlist
-                ], .when(platforms: [.macOS])),
-                .unsafeFlags([
-                    "-Xlinker", "-sectcreate",
-                    "-Xlinker", "__TEXT",
-                    "-Xlinker", "__info_plist",
-                    "-Xlinker", clsSmokeIOSInfoPlist
-                ], .when(platforms: [.iOS]))
             ]
         ),
         .testTarget(

@@ -352,9 +352,6 @@ Apple Speech is exposed only when the SDK, OS, locale, permissions, and on-devic
 | `CarbocationLocalSpeechUI` | SwiftUI settings, provider picker, model picker, status, diagnostics. | You want the bundled UI surfaces. |
 | `CarbocationWhisperRuntime` | Lower-level whisper.cpp runtime. | You need provider-specific control the unified runtime does not expose. |
 | `CarbocationAppleSpeechRuntime` | Lower-level Apple Speech runtime. | Same as above, for Apple Speech. |
-| `CLSSmoke` | Local smoke-test app for package development. | Working on the package itself. |
-
-For iOS simulator/device smoke testing, open `CLSSmoke.xcodeproj` and run the shared `CLSSmoke` scheme. The SwiftPM `CLSSmoke` executable product is still useful for macOS/package builds, but SwiftPM emits a raw iOS simulator executable rather than an installable `.app` bundle.
 
 ### How the binary release works
 
@@ -432,6 +429,12 @@ The package's `whisper` SwiftPM module imports a checked-in copy of the upstream
 Scripts/sync-whisper-headers.sh
 Scripts/sync-whisper-headers.sh --check
 ```
+
+### Run the CLSSmoke developer app
+
+`CLSSmoke` is a standalone local app for package development. It is intentionally outside the root Swift package product list so package consumers only see the SDK/runtime/UI libraries.
+
+Open `Apps/Apps.xcodeproj`, then run the paired `CLSSmoke-iOS` or `CLSSmoke-macOS` scheme. The shared apps project references this checkout as a local package dependency via `..`, matching the dependency direction of a consuming app.
 
 ### Bump whisper.cpp
 
@@ -535,14 +538,15 @@ The automated release smoke builds an iOS simulator consumer, but performance an
 ### Package layout
 
 ```text
-CLSSmoke.xcodeproj/               iOS app wrapper for the smoke app
+Apps/
+  Apps.xcodeproj/                 Shared Xcode project for local developer apps
+  CLSSmoke/                       Standalone local smoke-test app sources and resources
 Sources/
   CarbocationLocalSpeech/         Core models, audio, transcript, provider, VAD, diarization APIs
   CarbocationLocalSpeechRuntime/  Unified facade over Whisper and Apple Speech
   CarbocationWhisperRuntime/      whisper.cpp-backed runtime
   CarbocationAppleSpeechRuntime/  Apple Speech-backed runtime
   CarbocationLocalSpeechUI/       SwiftUI settings and picker views
-  CLSSmoke/                       Xcode-friendly smoke app
   whisper/                        module map and synced C headers for whisper.cpp
 Tests/
 Scripts/

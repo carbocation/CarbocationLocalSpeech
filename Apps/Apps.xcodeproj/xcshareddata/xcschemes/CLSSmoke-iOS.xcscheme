@@ -16,8 +16,8 @@
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "10000000000000000000000F"
                BuildableName = "CLSSmoke.app"
-               BlueprintName = "CLSSmokeIOS"
-               ReferencedContainer = "container:CLSSmoke.xcodeproj">
+               BlueprintName = "CLSSmoke-iOS"
+               ReferencedContainer = "container:Apps.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -46,8 +46,8 @@
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "10000000000000000000000F"
             BuildableName = "CLSSmoke.app"
-            BlueprintName = "CLSSmokeIOS"
-            ReferencedContainer = "container:CLSSmoke.xcodeproj">
+            BlueprintName = "CLSSmoke-iOS"
+            ReferencedContainer = "container:Apps.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -63,8 +63,8 @@
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "10000000000000000000000F"
             BuildableName = "CLSSmoke.app"
-            BlueprintName = "CLSSmokeIOS"
-            ReferencedContainer = "container:CLSSmoke.xcodeproj">
+            BlueprintName = "CLSSmoke-iOS"
+            ReferencedContainer = "container:Apps.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

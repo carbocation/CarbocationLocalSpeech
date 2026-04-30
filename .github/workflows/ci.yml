@@ -54,11 +54,23 @@ jobs:
               --sdk "$IOS_SIMULATOR_SDK" \
               --target CarbocationLocalSpeechUI
 
-      - name: Build CLSSmoke for iOS simulator
+      - name: Build CLSSmoke app for iOS simulator
         run: |
-          IOS_SIMULATOR_SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
-          env CLANG_MODULE_CACHE_PATH=.build/module-cache SWIFTPM_CACHE_PATH=.build/swiftpm-cache \
-            swift build \
-              --triple arm64-apple-ios17.0-simulator \
-              --sdk "$IOS_SIMULATOR_SDK" \
-              --product CLSSmoke
+          xcodebuild \
+            -project Apps/Apps.xcodeproj \
+            -scheme CLSSmoke-iOS \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            -derivedDataPath .build/clssmoke-ios-derived \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build CLSSmoke app for macOS
+        run: |
+          xcodebuild \
+            -project Apps/Apps.xcodeproj \
+            -scheme CLSSmoke-macOS \
+            -configuration Debug \
+            -derivedDataPath .build/clssmoke-macos-derived \
+            CODE_SIGNING_ALLOWED=NO \
+            build

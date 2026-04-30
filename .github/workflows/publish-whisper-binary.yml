@@ -78,11 +78,14 @@ jobs:
               --triple arm64-apple-ios17.0-simulator \
               --sdk "$IOS_SIMULATOR_SDK" \
               --target CarbocationLocalSpeechUI
-          env CLANG_MODULE_CACHE_PATH=.build/module-cache SWIFTPM_CACHE_PATH=.build/swiftpm-cache \
-            swift build \
-              --triple arm64-apple-ios17.0-simulator \
-              --sdk "$IOS_SIMULATOR_SDK" \
-              --product CLSSmoke
+          xcodebuild \
+            -project Apps/Apps.xcodeproj \
+            -scheme CLSSmoke-iOS \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            -derivedDataPath .build/clssmoke-ios-derived \
+            CODE_SIGNING_ALLOWED=NO \
+            build
 
       - name: Validate clean iOS consumer against local binary artifact
         run: Scripts/test-local-binary-artifact.sh
