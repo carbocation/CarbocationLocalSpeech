@@ -67,30 +67,29 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         )
     }
 
-    @MainActor
-    func testModelLibraryImportsRefreshesAndDeletesBinModels() throws {
+    func testModelLibraryImportsRefreshesAndDeletesBinModels() async throws {
         let root = try makeTemporaryDirectory()
         let source = root.appendingPathComponent("ggml-base.en.bin")
         try Data("fake whisper weights".utf8).write(to: source)
         let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
 
         let library = SpeechModelLibrary(root: modelsRoot)
-        let model = try library.importFile(at: source, displayName: "Base English")
+        let importResult = try await library.importFile(at: source, displayName: "Base English")
+        let model = importResult.model
 
-        XCTAssertEqual(library.models.count, 1)
+        XCTAssertEqual(importResult.snapshot.models.count, 1)
         XCTAssertEqual(model.displayName, "Base English")
         XCTAssertEqual(model.providerKind, .whisperCpp)
         XCTAssertEqual(model.languageScope, .englishOnly)
         XCTAssertTrue(FileManager.default.fileExists(atPath: model.primaryWeightsURL(in: modelsRoot)!.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: model.metadataURL(in: modelsRoot).path))
-        XCTAssertEqual(library.totalDiskUsageBytes(), Int64("fake whisper weights".utf8.count))
+        XCTAssertEqual(importResult.snapshot.totalDiskUsageBytes, Int64("fake whisper weights".utf8.count))
 
-        try library.delete(id: model.id)
-        XCTAssertTrue(library.models.isEmpty)
+        let deleteResult = try await library.delete(id: model.id)
+        XCTAssertTrue(deleteResult.snapshot.models.isEmpty)
     }
 
-    @MainActor
-    func testModelLibrarySupportsMultiAssetBundles() throws {
+    func testModelLibrarySupportsMultiAssetBundles() async throws {
         let root = try makeTemporaryDirectory()
         let bundle = root.appendingPathComponent("bundle", isDirectory: true)
         try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
@@ -114,15 +113,44 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             source: .imported
         )
         let library = SpeechModelLibrary(root: root.appendingPathComponent("SpeechModels", isDirectory: true))
-        let installed = try library.add(assetBundleAt: bundle, metadata: metadata)
+        let importResult = try await library.add(assetBundleAt: bundle, metadata: metadata)
+        let installed = importResult.model
 
         XCTAssertEqual(installed.id, id)
-        XCTAssertEqual(library.models.first?.assets.count, 3)
-        XCTAssertEqual(library.totalDiskUsageBytes(), 16)
+        XCTAssertEqual(importResult.snapshot.models.first?.assets.count, 3)
+        XCTAssertEqual(importResult.snapshot.totalDiskUsageBytes, 16)
     }
 
-    @MainActor
-    func testModelLibrarySynthesizesVADAssetForMetadataFreeFolders() throws {
+    func testModelLibraryRejectsAndCleansUpBundleMissingPrimaryAsset() async throws {
+        let root = try makeTemporaryDirectory()
+        let bundle = root.appendingPathComponent("bundle", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        let id = UUID()
+        let metadata = InstalledSpeechModel(
+            id: id,
+            displayName: "Missing Primary",
+            assets: [
+                SpeechModelAsset(role: .primaryWeights, relativePath: "missing.bin", sizeBytes: 0)
+            ],
+            source: .imported
+        )
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let library = SpeechModelLibrary(root: modelsRoot)
+
+        do {
+            _ = try await library.add(assetBundleAt: bundle, metadata: metadata)
+            XCTFail("Expected missing primary weights.")
+        } catch SpeechModelLibraryError.missingPrimaryWeights {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let snapshot = await library.snapshot()
+        XCTAssertTrue(snapshot.models.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: modelsRoot.appendingPathComponent(id.uuidString).path))
+    }
+
+    func testModelLibrarySynthesizesVADAssetForMetadataFreeFolders() async throws {
         let root = try makeTemporaryDirectory()
         let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
         let modelDirectory = modelsRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -131,10 +159,130 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         try Data("vad".utf8).write(to: modelDirectory.appendingPathComponent("ggml-silero-v6.2.0.bin"))
 
         let library = SpeechModelLibrary(root: modelsRoot)
-        let model = try XCTUnwrap(library.models.first)
+        let snapshot = await library.refresh()
+        let model = try XCTUnwrap(snapshot.models.first)
 
         XCTAssertEqual(model.primaryWeightsAsset?.relativePath, "ggml-base.en.bin")
         XCTAssertEqual(model.vadWeightsAsset?.relativePath, "ggml-silero-v6.2.0.bin")
+    }
+
+    func testModelLibraryInitDoesNotScanUntilRefresh() async throws {
+        let root = try makeTemporaryDirectory()
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let modelDirectory = modelsRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        try Data("weights".utf8).write(to: modelDirectory.appendingPathComponent("ggml-base.en.bin"))
+
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let initial = await library.snapshot()
+        XCTAssertTrue(initial.models.isEmpty)
+
+        let refreshed = await library.refresh()
+        XCTAssertEqual(refreshed.models.count, 1)
+    }
+
+    func testResolveInstalledModelRefreshesOnDemand() async throws {
+        let root = try makeTemporaryDirectory()
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let id = UUID()
+        let modelDirectory = modelsRoot.appendingPathComponent(id.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        try Data("weights".utf8).write(to: modelDirectory.appendingPathComponent("ggml-base.en.bin"))
+
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let cached = await library.model(id: id)
+        XCTAssertNil(cached)
+
+        let resolved = await library.resolveInstalledModel(id: id)
+        XCTAssertEqual(resolved?.id, id)
+        XCTAssertEqual(resolved?.displayName, "ggml-base.en")
+    }
+
+    func testResolveInstalledModelCanUseCachedSnapshotOnly() async throws {
+        let root = try makeTemporaryDirectory()
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let id = UUID()
+        let modelDirectory = modelsRoot.appendingPathComponent(id.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        try Data("weights".utf8).write(to: modelDirectory.appendingPathComponent("ggml-base.en.bin"))
+
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let missing = await library.resolveInstalledModel(id: id, refreshing: false)
+        XCTAssertNil(missing)
+
+        _ = await library.refresh()
+        let cached = await library.resolveInstalledModel(id: id, refreshing: false)
+        XCTAssertEqual(cached?.id, id)
+    }
+
+    func testResolveInstalledModelReturnsNilForDeletedModelAfterRefresh() async throws {
+        let root = try makeTemporaryDirectory()
+        let source = root.appendingPathComponent("ggml-base.en.bin")
+        try Data("weights".utf8).write(to: source)
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let importResult = try await library.importFile(at: source, displayName: "Base")
+        let model = importResult.model
+
+        try FileManager.default.removeItem(at: modelsRoot.appendingPathComponent(model.id.uuidString, isDirectory: true))
+
+        let cached = await library.resolveInstalledModel(id: model.id, refreshing: false)
+        XCTAssertEqual(cached?.id, model.id)
+        let refreshed = await library.resolveInstalledModel(id: model.id)
+        XCTAssertNil(refreshed)
+    }
+
+    func testModelLibrarySnapshotsSkipModelsMissingPrimaryWeights() async throws {
+        let root = try makeTemporaryDirectory()
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let modelDirectory = modelsRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        try Data("vad".utf8).write(to: modelDirectory.appendingPathComponent("ggml-silero-v6.2.0.bin"))
+
+        let metadata = InstalledSpeechModel(
+            id: try XCTUnwrap(UUID(uuidString: modelDirectory.lastPathComponent)),
+            displayName: "Missing Primary",
+            assets: [
+                SpeechModelAsset(role: .primaryWeights, relativePath: "missing.bin", sizeBytes: 0),
+                SpeechModelAsset(role: .vadWeights, relativePath: "ggml-silero-v6.2.0.bin", sizeBytes: 3)
+            ],
+            source: .imported
+        )
+        try LocalSpeechJSON.makePrettyEncoder()
+            .encode(metadata)
+            .write(to: modelDirectory.appendingPathComponent("metadata.json"))
+
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let snapshot = await library.refresh()
+        XCTAssertTrue(snapshot.models.isEmpty)
+    }
+
+    func testModelLibrarySnapshotsOmitMissingOptionalAssets() async throws {
+        let root = try makeTemporaryDirectory()
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let modelDirectory = modelsRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        try Data("weights".utf8).write(to: modelDirectory.appendingPathComponent("ggml-base.en.bin"))
+
+        let metadata = InstalledSpeechModel(
+            id: try XCTUnwrap(UUID(uuidString: modelDirectory.lastPathComponent)),
+            displayName: "Base",
+            assets: [
+                SpeechModelAsset(role: .primaryWeights, relativePath: "ggml-base.en.bin", sizeBytes: 0),
+                SpeechModelAsset(role: .vadWeights, relativePath: "missing-vad.bin", sizeBytes: 0),
+                SpeechModelAsset(role: .coreMLEncoder, relativePath: "missing-encoder.mlmodelc", sizeBytes: 0)
+            ],
+            source: .imported
+        )
+        try LocalSpeechJSON.makePrettyEncoder()
+            .encode(metadata)
+            .write(to: modelDirectory.appendingPathComponent("metadata.json"))
+
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let snapshot = await library.refresh()
+        let model = try XCTUnwrap(snapshot.models.first)
+        XCTAssertEqual(model.assets.map(\.role), [.primaryWeights])
+        XCTAssertEqual(model.primaryWeightsAsset?.sizeBytes, Int64("weights".utf8.count))
     }
 
     func testHuggingFaceSpeechURLParsesExpectedForms() {
@@ -620,8 +768,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(forwarded, [chunks[0]])
     }
 
-    @MainActor
-    func testModelLibraryAddsDownloadedPartialUsingRequestedFilename() throws {
+    func testModelLibraryAddsDownloadedPartialUsingRequestedFilename() async throws {
         let root = try makeTemporaryDirectory()
         let partial = root.appendingPathComponent("cls-partial-abcdef.bin")
         try Data("downloaded whisper weights".utf8).write(to: partial)
@@ -629,7 +776,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         try Data("downloaded vad weights".utf8).write(to: vadPartial)
 
         let library = SpeechModelLibrary(root: root.appendingPathComponent("SpeechModels", isDirectory: true))
-        let model = try library.add(
+        let result = try await library.add(
             primaryAssetAt: partial,
             displayName: "Base English",
             filename: "ggml-base.en.bin",
@@ -639,6 +786,7 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             vadAssetAt: vadPartial,
             vadFilename: "ggml-silero-v6.2.0.bin"
         )
+        let model = result.model
 
         XCTAssertEqual(model.primaryWeightsAsset?.relativePath, "ggml-base.en.bin")
         XCTAssertEqual(model.vadWeightsAsset?.relativePath, "ggml-silero-v6.2.0.bin")
@@ -646,6 +794,64 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: model.vadWeightsURL(in: library.root)!.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: vadPartial.path))
+    }
+
+    func testModelLibraryPreservesSnapshotAfterFailedAdd() async throws {
+        let root = try makeTemporaryDirectory()
+        let source = root.appendingPathComponent("ggml-base.en.bin")
+        try Data("weights".utf8).write(to: source)
+        let library = SpeechModelLibrary(root: root.appendingPathComponent("SpeechModels", isDirectory: true))
+        let installed = try await library.importFile(at: source, displayName: "Base")
+
+        do {
+            _ = try await library.add(
+                primaryAssetAt: root.appendingPathComponent("missing.bin"),
+                displayName: "Missing",
+                source: .imported
+            )
+            XCTFail("Expected missing source file.")
+        } catch SpeechModelLibraryError.sourceFileMissing {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let snapshot = await library.snapshot()
+        XCTAssertEqual(snapshot, installed.snapshot)
+    }
+
+    func testModelLibraryPartialDeleteReturnsUpdatedSnapshot() async throws {
+        let root = try makeTemporaryDirectory()
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let partialsRoot = try SpeechModelDownloader.partialsDirectory(in: modelsRoot)
+        let stem = "cls-partial-abcdef"
+        let partialURL = partialsRoot.appendingPathComponent("\(stem).bin")
+        let sidecarURL = partialsRoot.appendingPathComponent("\(stem).json")
+
+        FileManager.default.createFile(atPath: partialURL.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: partialURL)
+        try handle.truncate(atOffset: 100)
+        try handle.close()
+        let sidecar = #"""
+        {
+          "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+          "totalBytes": 100,
+          "displayName": "Base",
+          "schemaVersion": 2,
+          "chunkSize": 10,
+          "doneChunks": [0, 2, 3]
+        }
+        """#
+        try Data(sidecar.utf8).write(to: sidecarURL)
+
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let refreshed = await library.refresh()
+        let partial = try XCTUnwrap(refreshed.partials.first)
+        XCTAssertEqual(refreshed.partials.count, 1)
+
+        let deleteResult = await library.deletePartial(partial)
+        XCTAssertTrue(deleteResult.snapshot.partials.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: partialURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sidecarURL.path))
     }
 
     func testPartialDownloadListingAndDeletion() throws {

@@ -67,7 +67,6 @@ See [Products](#products) for the full list.
 Build a model library once at startup, then load a saved selection and transcribe a file:
 
 ```swift
-@MainActor
 func makeLibrary() -> SpeechModelLibrary {
     SpeechModelLibrary(
         root: SpeechModelStorage.modelsDirectory(appSupportFolderName: "YourApp")
@@ -79,10 +78,12 @@ func transcribe(
     using library: SpeechModelLibrary,
     storedSelection: String
 ) async throws -> String {
-    let selection = try LocalSpeechEngine.selection(from: storedSelection)
+    guard let plan = await LocalSpeechEngine.loadPlan(from: storedSelection, in: library) else {
+        throw LocalSpeechEngineError.invalidSelection(storedSelection)
+    }
 
     try await LocalSpeechEngine.shared.load(
-        selection: selection,
+        selection: plan.selection,
         from: library,
         options: SpeechLoadOptions(installSystemAssetsIfNeeded: true)
     )
@@ -105,7 +106,6 @@ func transcribe(
 Each app creates one `SpeechModelLibrary`. The default helper writes models into a shared App Group (`group.com.carbocation.shared`) and falls back to your app's Application Support folder if the group is unavailable.
 
 ```swift
-@MainActor
 func makeLibrary() -> SpeechModelLibrary {
     SpeechModelLibrary(
         root: SpeechModelStorage.modelsDirectory(appSupportFolderName: "YourApp")
@@ -137,7 +137,8 @@ Persist `SpeechModelSelection.storageValue`, not a model filename. Installed Whi
 
 ```swift
 let systemOptions = await LocalSpeechEngine.systemModelOptions(locale: .current)
-let installed = await MainActor.run { library.models.first }
+let snapshot = await library.refresh()
+let installed = snapshot.models.first
 
 let selection: SpeechModelSelection
 if let appleSpeech = systemOptions.first(where: { $0.availability.isAvailable }) {
@@ -154,14 +155,22 @@ let valueToPersist = selection.storageValue
 Restore later with:
 
 ```swift
-let selection = try LocalSpeechEngine.selection(from: valueFromPreferences)
+guard let plan = await LocalSpeechEngine.loadPlan(
+    from: valueFromPreferences,
+    in: library,
+    locale: .current
+) else {
+    throw LocalSpeechEngineError.invalidSelection(valueFromPreferences)
+}
 ```
+
+Use `loadPlan` for restored-selection UI state such as usable-provider checks, labels, and capabilities. For direct installed-model lists, call `await library.refresh()` and read the returned snapshot.
 
 ### Transcribe a file
 
 ```swift
 let loaded = try await LocalSpeechEngine.shared.load(
-    selection: selection,
+    selection: plan.selection,
     from: library,
     options: SpeechLoadOptions(
         locale: .current,
@@ -180,7 +189,7 @@ let transcript = try await LocalSpeechEngine.shared.transcribe(
 )
 ```
 
-Apple Speech does not accept every Whisper option — translation and word timestamps are rejected for it. Check `LocalSpeechEngine.capabilities(for:in:)` before exposing provider-specific controls.
+Apple Speech does not accept every Whisper option — translation and word timestamps are rejected for it. Check `plan.capabilities` before exposing provider-specific controls for a restored selection.
 
 `TranscriptionOptions.voiceActivityDetection` defaults to `.automatic`, which uses model VAD for live dictation streams and skips it for file transcription. Use `.enabled` or `.disabled` when you want to make the accuracy/power tradeoff explicit.
 
@@ -272,22 +281,21 @@ let downloadedVAD = try await SpeechModelDownloader.download(
     expectedSHA256: vadModel.sha256
 )
 
-let installed = try await MainActor.run {
-    try library.add(
-        primaryAssetAt: downloaded.tempURL,
-        displayName: catalogModel.displayName,
-        filename: catalogModel.hfFilename,
-        source: .curated,
-        sourceURL: catalogModel.downloadURL,
-        hfRepo: catalogModel.hfRepo,
-        hfFilename: catalogModel.hfFilename,
-        sha256: downloaded.sha256,
-        capabilities: catalogModel.capabilities,
-        vadAssetAt: downloadedVAD.tempURL,
-        vadFilename: vadModel.hfFilename,
-        vadSHA256: downloadedVAD.sha256
-    )
-}
+let installResult = try await library.add(
+    primaryAssetAt: downloaded.tempURL,
+    displayName: catalogModel.displayName,
+    filename: catalogModel.hfFilename,
+    source: .curated,
+    sourceURL: catalogModel.downloadURL,
+    hfRepo: catalogModel.hfRepo,
+    hfFilename: catalogModel.hfFilename,
+    sha256: downloaded.sha256,
+    capabilities: catalogModel.capabilities,
+    vadAssetAt: downloadedVAD.tempURL,
+    vadFilename: vadModel.hfFilename,
+    vadSHA256: downloadedVAD.sha256
+)
+let installed = installResult.model
 
 let selection = SpeechModelSelection.installed(installed.id)
 ```

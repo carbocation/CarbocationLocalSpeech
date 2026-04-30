@@ -38,6 +38,25 @@ public struct LocalSpeechLoadedModelInfo: Hashable, Sendable {
     }
 }
 
+public struct LocalSpeechLoadPlan: Hashable, Sendable {
+    public var selection: SpeechModelSelection
+    public var displayName: String
+    public var capabilities: SpeechModelCapabilities
+    public var availability: SpeechProviderAvailability
+
+    public init(
+        selection: SpeechModelSelection,
+        displayName: String,
+        capabilities: SpeechModelCapabilities,
+        availability: SpeechProviderAvailability
+    ) {
+        self.selection = selection
+        self.displayName = displayName
+        self.capabilities = capabilities
+        self.availability = availability
+    }
+}
+
 public enum LocalSpeechEngineError: Error, LocalizedError, Sendable {
     case invalidSelection(String)
     case installedModelNotFound(UUID)
@@ -90,6 +109,42 @@ public actor LocalSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
         return selection
     }
 
+    public nonisolated static func loadPlan(
+        from storageValue: String,
+        in library: SpeechModelLibrary,
+        locale: Locale = .current,
+        refreshingLibrary: Bool = true
+    ) async -> LocalSpeechLoadPlan? {
+        guard let selection = SpeechModelSelection(storageValue: storageValue) else {
+            return nil
+        }
+
+        switch selection {
+        case .installed(let id):
+            guard let model = await library.resolveInstalledModel(id: id, refreshing: refreshingLibrary) else {
+                return nil
+            }
+            return LocalSpeechLoadPlan(
+                selection: selection,
+                displayName: model.displayName,
+                capabilities: model.capabilities,
+                availability: .available
+            )
+        case .system:
+            guard let option = await systemModelOptions(locale: locale).first(where: { $0.selection == selection }),
+                  option.availability.isLoadPlannable
+            else {
+                return nil
+            }
+            return LocalSpeechLoadPlan(
+                selection: option.selection,
+                displayName: option.displayName,
+                capabilities: option.capabilities,
+                availability: option.availability
+            )
+        }
+    }
+
     public nonisolated static func capabilities(
         for selection: SpeechModelSelection,
         in library: SpeechModelLibrary?
@@ -97,9 +152,8 @@ public actor LocalSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
         switch selection {
         case .installed(let id):
             guard let library else { return .whisperCppDefault }
-            return await MainActor.run {
-                library.model(id: id)?.capabilities ?? .whisperCppDefault
-            }
+            let model = await library.model(id: id)
+            return model?.capabilities ?? .whisperCppDefault
         case .system(.appleSpeech):
             return .appleSpeechDefault
         }
@@ -113,8 +167,8 @@ public actor LocalSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
     ) async throws -> LocalSpeechLoadedModelInfo {
         switch selection {
         case .installed(let id):
-            let model = await MainActor.run { library.model(id: id) }
-            let root = await MainActor.run { library.root }
+            let model = await library.model(id: id)
+            let root = library.root
             guard let model else {
                 throw LocalSpeechEngineError.installedModelNotFound(id)
             }
@@ -292,6 +346,17 @@ public actor LocalSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
                     task.cancel()
                 }
             }
+        }
+    }
+}
+
+private extension SpeechProviderAvailability {
+    var isLoadPlannable: Bool {
+        switch self {
+        case .available, .unavailable(.assetDownloadRequired):
+            return true
+        case .unavailable:
+            return false
         }
     }
 }

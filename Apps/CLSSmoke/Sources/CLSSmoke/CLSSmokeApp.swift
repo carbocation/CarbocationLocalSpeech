@@ -267,6 +267,7 @@ private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.recordLiveAudio") private var recordLiveAudio = false
     @AppStorage("CLSSmoke.werReferenceText") private var werReferenceText = ""
     @State private var systemOptions: [SpeechSystemModelOption] = []
+    @State private var librarySnapshot = SpeechModelLibrarySnapshot.empty
     @State private var visibleEventDescriptions: [String] = []
     @State private var visibleEventDescriptionTotalCount = 0
     @State private var visibleTranscriptSnapshot = LiveTranscriptDebugSnapshot()
@@ -329,6 +330,7 @@ private struct CLSSmokeRootView: View {
         rootContent
             .task {
                 refreshWERState()
+                librarySnapshot = await library.refresh()
                 systemOptions = await LocalSpeechEngine.systemModelOptions(locale: .current)
             }
             .onDisappear {
@@ -391,8 +393,8 @@ private struct CLSSmokeRootView: View {
                 onSelectionConfirmed: { selection in
                     startListening(with: selection)
                 },
-                onDeleteModel: { model in
-                    try? library.delete(id: model.id)
+                onLibraryChanged: { snapshot in
+                    librarySnapshot = snapshot
                 }
             )
         }
@@ -928,6 +930,7 @@ private struct CLSSmokeRootView: View {
     }
 
     private func startListening(with selection: SpeechModelSelection) {
+        let storedSelectionValue = selectionStorageValue
         let vadMode = selectedVADMode
         let vadSensitivity = selectedVADSensitivity
         let vadAvailability = vadAvailability(for: selection)
@@ -935,11 +938,6 @@ private struct CLSSmokeRootView: View {
         guard liveInput != .systemAudio || systemAudioInputIsAvailable else {
             statusTone = .error
             statusMessage = "System audio input requires macOS 15 or newer."
-            return
-        }
-        guard whisperRuntimeIsAvailableIfNeeded(for: selection) else {
-            statusTone = .error
-            statusMessage = WhisperRuntimeSmoke.linkStatus().displayDescription
             return
         }
         guard vadMode != .enabled || vadAvailability.isAvailable else {
@@ -964,11 +962,10 @@ private struct CLSSmokeRootView: View {
         transcriptionTask = Task {
             await runLiveTranscriptionSession(
                 id: sessionID,
-                selection: selection,
+                selectionStorageValue: storedSelectionValue,
                 liveInput: liveInput,
                 vadMode: vadMode,
-                vadSensitivity: vadSensitivity,
-                vadAvailability: vadAvailability
+                vadSensitivity: vadSensitivity
             )
         }
     }
@@ -1000,11 +997,10 @@ private struct CLSSmokeRootView: View {
 
     private func runLiveTranscriptionSession(
         id: UUID,
-        selection: SpeechModelSelection,
+        selectionStorageValue: String,
         liveInput: CLSSmokeLiveInput,
         vadMode: CLSSmokeVADMode,
-        vadSensitivity: CLSSmokeVADSensitivity,
-        vadAvailability: CLSSmokeVADAvailability
+        vadSensitivity: CLSSmokeVADSensitivity
     ) async {
         var recordingContext: CLSSmokeLiveRecordingContext?
         do {
@@ -1016,7 +1012,28 @@ private struct CLSSmokeRootView: View {
             }
 
             guard activeSessionID == id else { return }
-            switch selection {
+            guard let plan = await LocalSpeechEngine.loadPlan(
+                from: selectionStorageValue,
+                in: library,
+                locale: .current
+            ) else {
+                finishSession(id: id, message: "Selected speech provider is no longer available.", tone: .error)
+                return
+            }
+            librarySnapshot = await library.snapshot()
+
+            guard whisperRuntimeIsAvailableIfNeeded(for: plan.selection) else {
+                finishSession(id: id, message: WhisperRuntimeSmoke.linkStatus().displayDescription, tone: .error)
+                return
+            }
+
+            let vadAvailability = vadAvailability(for: plan.selection)
+            guard vadMode != .enabled || vadAvailability.isAvailable else {
+                finishSession(id: id, message: "Model VAD is not available for the selected provider.", tone: .error)
+                return
+            }
+
+            switch plan.selection {
             case .installed:
                 statusMessage = "Loading Whisper model. First run can take a few seconds..."
             case .system:
@@ -1024,7 +1041,7 @@ private struct CLSSmokeRootView: View {
             }
 
             let loaded = try await LocalSpeechEngine.shared.load(
-                selection: selection,
+                selection: plan.selection,
                 from: library,
                 options: SpeechLoadOptions(
                     locale: .current,
@@ -1319,25 +1336,15 @@ private struct CLSSmokeRootView: View {
             fileStatusMessage = "Choose an audio or movie file first."
             return
         }
-        guard let selection = selectedSelection else {
+        guard selectedSelection != nil else {
             fileStatusTone = .error
             fileStatusMessage = "Choose a speech provider first."
             return
         }
-        guard whisperRuntimeIsAvailableIfNeeded(for: selection) else {
-            fileStatusTone = .error
-            fileStatusMessage = WhisperRuntimeSmoke.linkStatus().displayDescription
-            return
-        }
 
+        let storedSelectionValue = selectionStorageValue
         let vadMode = selectedVADMode
         let vadSensitivity = selectedVADSensitivity
-        let vadAvailability = vadAvailability(for: selection)
-        guard vadMode != .enabled || vadAvailability.isAvailable else {
-            fileStatusTone = .error
-            fileStatusMessage = "Model VAD is not available for the selected provider."
-            return
-        }
 
         cancelFileTranscription(updateStatus: false)
         stopListening(updateStatus: false, unloadProvider: false)
@@ -1357,10 +1364,9 @@ private struct CLSSmokeRootView: View {
             await runFileTranscriptionSession(
                 id: sessionID,
                 fileURL: selectedFileURL,
-                selection: selection,
+                selectionStorageValue: storedSelectionValue,
                 vadMode: vadMode,
-                vadSensitivity: vadSensitivity,
-                vadAvailability: vadAvailability
+                vadSensitivity: vadSensitivity
             )
         }
     }
@@ -1385,17 +1391,49 @@ private struct CLSSmokeRootView: View {
     private func runFileTranscriptionSession(
         id: UUID,
         fileURL: URL,
-        selection: SpeechModelSelection,
+        selectionStorageValue: String,
         vadMode: CLSSmokeVADMode,
-        vadSensitivity: CLSSmokeVADSensitivity,
-        vadAvailability: CLSSmokeVADAvailability
+        vadSensitivity: CLSSmokeVADSensitivity
     ) async {
         do {
             guard activeFileTranscriptionID == id else { return }
             fileStatusMessage = "Loading selected provider..."
 
+            guard let plan = await LocalSpeechEngine.loadPlan(
+                from: selectionStorageValue,
+                in: library,
+                locale: .current
+            ) else {
+                finishFileTranscription(
+                    id: id,
+                    message: "Selected speech provider is no longer available.",
+                    tone: .error
+                )
+                return
+            }
+            librarySnapshot = await library.snapshot()
+
+            guard whisperRuntimeIsAvailableIfNeeded(for: plan.selection) else {
+                finishFileTranscription(
+                    id: id,
+                    message: WhisperRuntimeSmoke.linkStatus().displayDescription,
+                    tone: .error
+                )
+                return
+            }
+
+            let vadAvailability = vadAvailability(for: plan.selection)
+            guard vadMode != .enabled || vadAvailability.isAvailable else {
+                finishFileTranscription(
+                    id: id,
+                    message: "Model VAD is not available for the selected provider.",
+                    tone: .error
+                )
+                return
+            }
+
             let loaded = try await LocalSpeechEngine.shared.load(
-                selection: selection,
+                selection: plan.selection,
                 from: library,
                 options: SpeechLoadOptions(
                     locale: .current,
@@ -1486,25 +1524,18 @@ private struct CLSSmokeRootView: View {
     private func vadAvailability(for selection: SpeechModelSelection) -> CLSSmokeVADAvailability {
         switch selection {
         case .installed(let id):
-            guard let model = library.model(id: id) else {
+            guard let model = librarySnapshot.model(id: id) else {
                 return CLSSmokeVADAvailability(
                     isAvailable: false,
                     message: "Whisper model VAD unavailable: selected model is not installed.",
                     diagnosticValue: "unavailable:missing-installed-model"
                 )
             }
-            guard let vadURL = model.vadWeightsURL(in: library.root) else {
+            guard model.vadWeightsURL(in: library.root) != nil else {
                 return CLSSmokeVADAvailability(
                     isAvailable: false,
                     message: "Whisper model VAD unavailable: selected model has no VAD asset.",
                     diagnosticValue: "unavailable:no-vad-asset"
-                )
-            }
-            guard FileManager.default.fileExists(atPath: vadURL.path) else {
-                return CLSSmokeVADAvailability(
-                    isAvailable: false,
-                    message: "Whisper model VAD unavailable: VAD asset file is missing.",
-                    diagnosticValue: "unavailable:missing-vad-file"
                 )
             }
             return CLSSmokeVADAvailability(

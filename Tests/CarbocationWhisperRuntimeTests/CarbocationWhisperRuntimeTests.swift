@@ -21,7 +21,6 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
 #endif
     }
 
-    @MainActor
     func testEngineLoadsInstalledModelMetadataWithoutRunningInference() async throws {
         let root = try makeTemporaryDirectory()
         let source = root.appendingPathComponent("ggml-base.en.bin")
@@ -30,7 +29,7 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         try Data("fake vad".utf8).write(to: vadSource)
 
         let library = SpeechModelLibrary(root: root.appendingPathComponent("SpeechModels", isDirectory: true))
-        let model = try library.add(
+        let result = try await library.add(
             primaryAssetAt: source,
             displayName: "Base",
             filename: "ggml-base.en.bin",
@@ -38,6 +37,7 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
             vadAssetAt: vadSource,
             vadFilename: "ggml-silero-v6.2.0.bin"
         )
+        let model = result.model
         let engine = WhisperEngine()
         let loaded = try await engine.load(model: model, from: library.root)
         let currentModelID = await engine.currentModelID()

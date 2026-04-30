@@ -26,54 +26,23 @@ public enum SpeechModelLibraryError: Error, LocalizedError, Sendable {
     }
 }
 
-@MainActor
-public final class SpeechModelLibrary {
-    public private(set) var models: [InstalledSpeechModel] = []
-    public private(set) var partials: [PartialSpeechModelDownload] = []
+public struct SpeechModelLibrarySnapshot: Hashable, Sendable {
+    public static let empty = SpeechModelLibrarySnapshot()
 
-    public let root: URL
-    private let fileManager: FileManager
+    public let models: [InstalledSpeechModel]
+    public let partials: [PartialSpeechModelDownload]
+    public let totalDiskUsageBytes: Int64
 
-    public init(root: URL, fileManager: FileManager = .default) {
-        self.root = root
-        self.fileManager = fileManager
-        try? fileManager.createDirectory(at: root, withIntermediateDirectories: true)
-        refresh()
-    }
-
-    public func refresh() {
-        var found: [InstalledSpeechModel] = []
-        let decoder = LocalSpeechJSON.makeDecoder()
-
-        guard let entries = try? fileManager.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            models = []
-            partials = []
-            return
-        }
-
-        for entry in entries {
-            var isDirectory: ObjCBool = false
-            guard fileManager.fileExists(atPath: entry.path, isDirectory: &isDirectory),
-                  isDirectory.boolValue
-            else { continue }
-
-            let metadataURL = entry.appendingPathComponent("metadata.json")
-            if let data = try? Data(contentsOf: metadataURL),
-               let metadata = try? decoder.decode(InstalledSpeechModel.self, from: data) {
-                found.append(metadata)
-            } else if let synthesized = synthesizeMetadata(for: entry) {
-                found.append(synthesized)
-            }
-        }
-
-        models = found.sorted {
-            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
-        }
-        partials = SpeechModelDownloader.listPartials(in: root, fileManager: fileManager)
+    public init(
+        models: [InstalledSpeechModel] = [],
+        partials: [PartialSpeechModelDownload] = [],
+        totalDiskUsageBytes: Int64? = nil
+    ) {
+        self.models = models
+        self.partials = partials
+        self.totalDiskUsageBytes = totalDiskUsageBytes
+            ?? models.reduce(Int64(0)) { $0 + $1.totalSizeBytes }
+            + partials.reduce(Int64(0)) { $0 + $1.bytesOnDisk }
     }
 
     public func model(id: UUID) -> InstalledSpeechModel? {
@@ -84,8 +53,62 @@ public final class SpeechModelLibrary {
         guard let uuid = UUID(uuidString: id) else { return nil }
         return model(id: uuid)
     }
+}
 
-    public func importFile(at sourceURL: URL, displayName: String? = nil) throws -> InstalledSpeechModel {
+public struct SpeechModelImportResult: Hashable, Sendable {
+    public let model: InstalledSpeechModel
+    public let snapshot: SpeechModelLibrarySnapshot
+
+    public init(model: InstalledSpeechModel, snapshot: SpeechModelLibrarySnapshot) {
+        self.model = model
+        self.snapshot = snapshot
+    }
+}
+
+public struct SpeechModelDeleteResult: Hashable, Sendable {
+    public let snapshot: SpeechModelLibrarySnapshot
+
+    public init(snapshot: SpeechModelLibrarySnapshot) {
+        self.snapshot = snapshot
+    }
+}
+
+public actor SpeechModelLibrary {
+    public nonisolated let root: URL
+
+    private let fileManager: FileManager
+    private var cachedSnapshot = SpeechModelLibrarySnapshot.empty
+
+    public init(root: URL, fileManager: FileManager = .default) {
+        self.root = root
+        self.fileManager = fileManager
+        try? fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+    }
+
+    public func snapshot() async -> SpeechModelLibrarySnapshot {
+        cachedSnapshot
+    }
+
+    public func refresh() async -> SpeechModelLibrarySnapshot {
+        let snapshot = loadSnapshot()
+        cachedSnapshot = snapshot
+        return snapshot
+    }
+
+    public func model(id: UUID) async -> InstalledSpeechModel? {
+        cachedSnapshot.model(id: id)
+    }
+
+    public func model(id: String) async -> InstalledSpeechModel? {
+        cachedSnapshot.model(id: id)
+    }
+
+    public func resolveInstalledModel(id: UUID, refreshing: Bool = true) async -> InstalledSpeechModel? {
+        let snapshot = refreshing ? loadAndCacheSnapshot() : cachedSnapshot
+        return snapshot.model(id: id)
+    }
+
+    public func importFile(at sourceURL: URL, displayName: String? = nil) async throws -> SpeechModelImportResult {
         let filename = sourceURL.lastPathComponent
         guard filename.lowercased().hasSuffix(".bin") else {
             throw SpeechModelLibraryError.notAWhisperModel(filename)
@@ -119,14 +142,14 @@ public final class SpeechModelLibrary {
         )
 
         do {
-            try writeMetadata(metadata)
+            try writeMetadataSync(metadata)
         } catch {
             try? fileManager.removeItem(at: directory)
             throw SpeechModelLibraryError.metadataWriteFailed(error.localizedDescription)
         }
 
-        refresh()
-        return metadata
+        let snapshot = loadAndCacheSnapshot()
+        return SpeechModelImportResult(model: metadata, snapshot: snapshot)
     }
 
     public func add(
@@ -142,7 +165,7 @@ public final class SpeechModelLibrary {
         vadAssetAt temporaryVADURL: URL? = nil,
         vadFilename requestedVADFilename: String? = nil,
         vadSHA256: String? = nil
-    ) throws -> InstalledSpeechModel {
+    ) async throws -> SpeechModelImportResult {
         let filename = requestedFilename?.nilIfBlank ?? temporaryURL.lastPathComponent
         guard filename.lowercased().hasSuffix(".bin") else {
             throw SpeechModelLibraryError.notAWhisperModel(filename)
@@ -213,17 +236,17 @@ public final class SpeechModelLibrary {
         }
 
         do {
-            try writeMetadata(metadata)
+            try writeMetadataSync(metadata)
         } catch {
             try? fileManager.removeItem(at: directory)
             throw SpeechModelLibraryError.metadataWriteFailed(error.localizedDescription)
         }
 
-        refresh()
-        return metadata
+        let snapshot = loadAndCacheSnapshot()
+        return SpeechModelImportResult(model: metadata, snapshot: snapshot)
     }
 
-    public func add(assetBundleAt temporaryDirectory: URL, metadata: InstalledSpeechModel) throws -> InstalledSpeechModel {
+    public func add(assetBundleAt temporaryDirectory: URL, metadata: InstalledSpeechModel) async throws -> SpeechModelImportResult {
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: temporaryDirectory.path, isDirectory: &isDirectory),
               isDirectory.boolValue
@@ -240,36 +263,127 @@ public final class SpeechModelLibrary {
         }
 
         try fileManager.moveItem(at: temporaryDirectory, to: destination)
+        guard let installedMetadata = diskValidModel(metadata, in: destination) else {
+            try? fileManager.removeItem(at: destination)
+            throw SpeechModelLibraryError.missingPrimaryWeights
+        }
         do {
-            try writeMetadata(metadata)
+            try writeMetadataSync(installedMetadata)
         } catch {
             try? fileManager.removeItem(at: destination)
             throw SpeechModelLibraryError.metadataWriteFailed(error.localizedDescription)
         }
 
-        refresh()
-        return metadata
+        let snapshot = loadAndCacheSnapshot()
+        return SpeechModelImportResult(model: installedMetadata, snapshot: snapshot)
     }
 
-    public func delete(id: UUID) throws {
+    public func delete(id: UUID) async throws -> SpeechModelDeleteResult {
         let directory = root.appendingPathComponent(id.uuidString, isDirectory: true)
         if fileManager.fileExists(atPath: directory.path) {
             try fileManager.removeItem(at: directory)
         }
-        refresh()
+        return SpeechModelDeleteResult(snapshot: loadAndCacheSnapshot())
     }
 
-    public func deletePartial(_ partial: PartialSpeechModelDownload) {
+    public func deletePartial(_ partial: PartialSpeechModelDownload) async -> SpeechModelDeleteResult {
         SpeechModelDownloader.deletePartial(partial, fileManager: fileManager)
-        refresh()
+        return SpeechModelDeleteResult(snapshot: loadAndCacheSnapshot())
     }
 
-    public func totalDiskUsageBytes() -> Int64 {
-        models.reduce(Int64(0)) { $0 + $1.totalSizeBytes }
-            + partials.reduce(Int64(0)) { $0 + $1.bytesOnDisk }
+    public func totalDiskUsageBytes() async -> Int64 {
+        cachedSnapshot.totalDiskUsageBytes
     }
 
-    public func writeMetadata(_ model: InstalledSpeechModel) throws {
+    public func writeMetadata(_ model: InstalledSpeechModel) async throws {
+        try writeMetadataSync(model)
+        _ = loadAndCacheSnapshot()
+    }
+
+    private func loadAndCacheSnapshot() -> SpeechModelLibrarySnapshot {
+        let snapshot = loadSnapshot()
+        cachedSnapshot = snapshot
+        return snapshot
+    }
+
+    private func loadSnapshot() -> SpeechModelLibrarySnapshot {
+        var found: [InstalledSpeechModel] = []
+        let decoder = LocalSpeechJSON.makeDecoder()
+
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return .empty
+        }
+
+        for entry in entries {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: entry.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue
+            else { continue }
+
+            let metadataURL = entry.appendingPathComponent("metadata.json")
+            if let data = try? Data(contentsOf: metadataURL),
+               let metadata = try? decoder.decode(InstalledSpeechModel.self, from: data),
+               let normalized = diskValidModel(metadata, in: entry) {
+                found.append(normalized)
+            } else if let synthesized = synthesizeMetadata(for: entry) {
+                found.append(synthesized)
+            }
+        }
+
+        let models = found.sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+        let partials = SpeechModelDownloader.listPartials(in: root, fileManager: fileManager)
+        return SpeechModelLibrarySnapshot(models: models, partials: partials)
+    }
+
+    private func diskValidModel(_ model: InstalledSpeechModel, in directory: URL) -> InstalledSpeechModel? {
+        var assets: [SpeechModelAsset] = []
+        var hasPrimaryWeights = false
+
+        for asset in model.assets {
+            let url = directory.appendingPathComponent(asset.relativePath)
+            guard fileManager.fileExists(atPath: url.path) else {
+                if asset.role == .primaryWeights {
+                    return nil
+                }
+                continue
+            }
+
+            var updated = asset
+            updated.sizeBytes = Self.sizeOfItem(at: url, fileManager: fileManager)
+            assets.append(updated)
+            if asset.role == .primaryWeights {
+                hasPrimaryWeights = true
+            }
+        }
+
+        guard hasPrimaryWeights else { return nil }
+
+        return InstalledSpeechModel(
+            id: model.id,
+            displayName: model.displayName,
+            providerKind: model.providerKind,
+            family: model.family,
+            variant: model.variant,
+            languageScope: model.languageScope,
+            quantization: model.quantization,
+            assets: assets,
+            source: model.source,
+            sourceURL: model.sourceURL,
+            hfRepo: model.hfRepo,
+            hfFilename: model.hfFilename,
+            sha256: model.sha256,
+            capabilities: model.capabilities,
+            installedAt: model.installedAt
+        )
+    }
+
+    private func writeMetadataSync(_ model: InstalledSpeechModel) throws {
         let encoder = LocalSpeechJSON.makePrettyEncoder()
         let data = try encoder.encode(model)
         let url = model.metadataURL(in: root)
@@ -285,7 +399,6 @@ public final class SpeechModelLibrary {
                 options: [.skipsHiddenFiles]
               ),
               let primary = files.first(where: { isLikelyPrimaryWeights($0) })
-                ?? files.first(where: { $0.pathExtension.lowercased() == "bin" })
         else { return nil }
 
         var assets: [SpeechModelAsset] = [

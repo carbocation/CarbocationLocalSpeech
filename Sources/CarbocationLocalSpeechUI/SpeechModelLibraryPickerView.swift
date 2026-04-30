@@ -24,18 +24,19 @@ public struct SpeechModelLibraryPickerView: View {
     private let labelPolicy: SpeechModelPickerLabelPolicy
     private let physicalMemoryBytes: UInt64
     private let onSelectionConfirmed: @MainActor (SpeechModelSelection) -> Void
-    private let onDeleteModel: (@MainActor (InstalledSpeechModel) -> Void)?
+    private let onDeleteModel: (@MainActor (InstalledSpeechModel) async throws -> SpeechModelDeleteResult)?
     private let onDownloadCuratedModel: ((CuratedSpeechModel) -> Void)?
     private let onImportRequested: (() -> Void)?
     private let onCustomURLRequested: (() -> Void)?
+    private let onLibraryChanged: @MainActor (SpeechModelLibrarySnapshot) -> Void
 
+    @State private var librarySnapshot = SpeechModelLibrarySnapshot.empty
     @State private var activeDownload: SpeechModelLibraryDownload?
     @State private var notice: PickerNotice?
     @State private var showCustomSheet = false
     @State private var showImportModelImporter = false
     @State private var showDeleteConfirm: InstalledSpeechModel?
     @State private var showDeletePartialConfirm: PartialSpeechModelDownload?
-    @State private var refreshToken = UUID()
 
     public init(
         library: SpeechModelLibrary,
@@ -49,10 +50,11 @@ public struct SpeechModelLibraryPickerView: View {
         labelPolicy: SpeechModelPickerLabelPolicy = .default,
         physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory,
         onSelectionConfirmed: @escaping @MainActor (SpeechModelSelection) -> Void = { _ in },
-        onDeleteModel: (@MainActor (InstalledSpeechModel) -> Void)? = nil,
+        onDeleteModel: (@MainActor (InstalledSpeechModel) async throws -> SpeechModelDeleteResult)? = nil,
         onDownloadCuratedModel: ((CuratedSpeechModel) -> Void)? = nil,
         onImportRequested: (() -> Void)? = nil,
-        onCustomURLRequested: (() -> Void)? = nil
+        onCustomURLRequested: (() -> Void)? = nil,
+        onLibraryChanged: @escaping @MainActor (SpeechModelLibrarySnapshot) -> Void = { _ in }
     ) {
         self.library = library
         self._selectionStorageValue = selectionStorageValue
@@ -69,6 +71,7 @@ public struct SpeechModelLibraryPickerView: View {
         self.onDownloadCuratedModel = onDownloadCuratedModel
         self.onImportRequested = onImportRequested
         self.onCustomURLRequested = onCustomURLRequested
+        self.onLibraryChanged = onLibraryChanged
     }
 
     private var selectedSystemOption: SpeechSystemModelOption? {
@@ -76,7 +79,7 @@ public struct SpeechModelLibraryPickerView: View {
     }
 
     private var selectedInstalledModel: InstalledSpeechModel? {
-        library.model(id: selectionStorageValue)
+        librarySnapshot.model(id: selectionStorageValue)
     }
 
     private var selectedSelection: SpeechModelSelection? {
@@ -104,7 +107,7 @@ public struct SpeechModelLibraryPickerView: View {
                         Divider()
                     }
                     installedSection
-                    if !library.partials.isEmpty {
+                    if !librarySnapshot.partials.isEmpty {
                         Divider()
                         interruptedSection
                     }
@@ -117,7 +120,6 @@ public struct SpeechModelLibraryPickerView: View {
                     }
                 }
                 .padding(20)
-                .id(refreshToken)
             }
             if showsConfirmationFooter {
                 Divider()
@@ -125,7 +127,7 @@ public struct SpeechModelLibraryPickerView: View {
             }
         }
         .task {
-            refresh()
+            await refresh()
         }
         .fileImporter(
             isPresented: $showImportModelImporter,
@@ -169,12 +171,7 @@ public struct SpeechModelLibraryPickerView: View {
             presenting: showDeletePartialConfirm
         ) { partial in
             Button("Delete", role: .destructive) {
-                library.deletePartial(partial)
-                notice = PickerNotice(
-                    message: "Deleted interrupted download for \(partial.displayName).",
-                    tone: .positive
-                )
-                refresh()
+                deletePartial(partial)
             }
             Button("Cancel", role: .cancel) {}
         } message: { partial in
@@ -267,18 +264,18 @@ public struct SpeechModelLibraryPickerView: View {
                 Text("Installed Models")
                     .font(.headline)
                 Spacer()
-                Text("Total: \(formatBytes(library.totalDiskUsageBytes()))")
+                Text("Total: \(formatBytes(librarySnapshot.totalDiskUsageBytes))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            if library.models.isEmpty {
+            if librarySnapshot.models.isEmpty {
                 Text("No Whisper models installed. Download one below, or import an existing whisper.cpp .bin file.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 6)
             } else {
-                ForEach(library.models) { model in
+                ForEach(librarySnapshot.models) { model in
                     installedModelRow(model)
                 }
             }
@@ -301,8 +298,10 @@ public struct SpeechModelLibraryPickerView: View {
                 Spacer()
 
                 Button {
-                    refresh()
-                    notice = PickerNotice(message: "Model library refreshed.", tone: .secondary)
+                    Task {
+                        await refresh()
+                        notice = PickerNotice(message: "Model library refreshed.", tone: .secondary)
+                    }
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
@@ -391,7 +390,7 @@ public struct SpeechModelLibraryPickerView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Interrupted Downloads")
                 .font(.headline)
-            ForEach(library.partials) { partial in
+            ForEach(librarySnapshot.partials) { partial in
                 interruptedRow(partial)
             }
         }
@@ -449,7 +448,7 @@ public struct SpeechModelLibraryPickerView: View {
     }
 
     private func curatedModelRow(_ model: CuratedSpeechModel) -> some View {
-        let alreadyInstalled = library.models.contains {
+        let alreadyInstalled = librarySnapshot.models.contains {
             SpeechModelPickerLabelPolicy.installedModel($0, matches: model)
         }
         let statusLabel = labelPolicy.curatedModelLabel(for: model)
@@ -506,7 +505,7 @@ public struct SpeechModelLibraryPickerView: View {
                 Button("Cancel", role: .destructive) {
                     download.cancel()
                     activeDownload = nil
-                    refresh()
+                    Task { await refresh() }
                 }
             }
             .font(.caption)
@@ -581,7 +580,7 @@ public struct SpeechModelLibraryPickerView: View {
     private func downloadCuratedModel(_ model: CuratedSpeechModel) {
         if let onDownloadCuratedModel {
             onDownloadCuratedModel(model)
-            refresh()
+            Task { await refresh() }
             return
         }
 
@@ -622,7 +621,7 @@ public struct SpeechModelLibraryPickerView: View {
     private func requestCustomDownload() {
         if let onCustomURLRequested {
             onCustomURLRequested()
-            refresh()
+            Task { await refresh() }
             return
         }
         showCustomSheet = true
@@ -654,26 +653,28 @@ public struct SpeechModelLibraryPickerView: View {
         activeDownload = download
         download.start(into: library) { result in
             switch result {
-            case .success(let model):
+            case .success(let importResult):
+                let model = importResult.model
                 if selectionStorageValue.isEmpty {
                     selectionStorageValue = SpeechModelSelection.installed(model.id).storageValue
                 }
+                applySnapshot(importResult.snapshot)
                 notice = PickerNotice(message: "Installed \(model.displayName).", tone: .positive)
             case .failure(let error):
                 notice = PickerNotice(
                     message: "Failed to download \(displayName): \(error.localizedDescription)",
                     tone: .warning
                 )
+                Task { await refresh() }
             }
             activeDownload = nil
-            refresh()
         }
     }
 
     private func importLocalModel() {
         if let onImportRequested {
             onImportRequested()
-            refresh()
+            Task { await refresh() }
             return
         }
 
@@ -693,42 +694,53 @@ public struct SpeechModelLibraryPickerView: View {
     }
 
     private func importModel(at url: URL) {
-        let didStart = url.startAccessingSecurityScopedResource()
-        defer { if didStart { url.stopAccessingSecurityScopedResource() } }
-        do {
-            let model = try library.importFile(at: url)
-            if selectionStorageValue.isEmpty {
-                selectionStorageValue = SpeechModelSelection.installed(model.id).storageValue
+        Task {
+            let didStart = url.startAccessingSecurityScopedResource()
+            defer { if didStart { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let result = try await library.importFile(at: url)
+                let model = result.model
+                if selectionStorageValue.isEmpty {
+                    selectionStorageValue = SpeechModelSelection.installed(model.id).storageValue
+                }
+                applySnapshot(result.snapshot)
+                notice = PickerNotice(message: "Imported \(model.displayName).", tone: .positive)
+            } catch {
+                notice = PickerNotice(
+                    message: "Failed to import model: \(error.localizedDescription)",
+                    tone: .warning
+                )
             }
-            notice = PickerNotice(message: "Imported \(model.displayName).", tone: .positive)
-            refresh()
-        } catch {
-            notice = PickerNotice(
-                message: "Failed to import model: \(error.localizedDescription)",
-                tone: .warning
-            )
         }
     }
 
     private func delete(_ model: InstalledSpeechModel) {
-        do {
-            if let onDeleteModel {
-                onDeleteModel(model)
-                library.refresh()
-            } else {
-                try library.delete(id: model.id)
+        Task {
+            do {
+                let result: SpeechModelDeleteResult
+                if let onDeleteModel {
+                    result = try await onDeleteModel(model)
+                } else {
+                    result = try await library.delete(id: model.id)
+                }
+                applySnapshot(result.snapshot)
+                notice = PickerNotice(message: "Deleted \(model.displayName).", tone: .positive)
+            } catch {
+                notice = PickerNotice(
+                    message: "Failed to delete \(model.displayName): \(error.localizedDescription)",
+                    tone: .warning
+                )
             }
-            if selectionStorageValue == SpeechModelSelection.installed(model.id).storageValue {
-                selectionStorageValue = systemOptions.first?.selection.storageValue
-                    ?? library.models.first.map { SpeechModelSelection.installed($0.id).storageValue }
-                    ?? ""
-            }
-            notice = PickerNotice(message: "Deleted \(model.displayName).", tone: .positive)
-            refresh()
-        } catch {
+        }
+    }
+
+    private func deletePartial(_ partial: PartialSpeechModelDownload) {
+        Task {
+            let result = await library.deletePartial(partial)
+            applySnapshot(result.snapshot)
             notice = PickerNotice(
-                message: "Failed to delete \(model.displayName): \(error.localizedDescription)",
-                tone: .warning
+                message: "Deleted interrupted download for \(partial.displayName).",
+                tone: .positive
             )
         }
     }
@@ -739,24 +751,31 @@ public struct SpeechModelLibraryPickerView: View {
     }
 #endif
 
-    private func refresh() {
-        library.refresh()
-        normalizeSelection()
-        refreshToken = UUID()
+    @discardableResult
+    private func refresh() async -> SpeechModelLibrarySnapshot {
+        let snapshot = await library.refresh()
+        applySnapshot(snapshot)
+        return snapshot
     }
 
-    private func normalizeSelection() {
+    private func applySnapshot(_ snapshot: SpeechModelLibrarySnapshot) {
+        librarySnapshot = snapshot
+        normalizeSelection(using: snapshot)
+        onLibraryChanged(snapshot)
+    }
+
+    private func normalizeSelection(using snapshot: SpeechModelLibrarySnapshot) {
         if selectionStorageValue.isEmpty {
             selectionStorageValue = systemOptions.first?.selection.storageValue
-                ?? library.models.first.map { SpeechModelSelection.installed($0.id).storageValue }
+                ?? snapshot.models.first.map { SpeechModelSelection.installed($0.id).storageValue }
                 ?? ""
-        } else if selectedSystemOption == nil && selectedInstalledModel == nil {
+        } else if selectedSystemOption == nil && snapshot.model(id: selectionStorageValue) == nil {
             if case .system = SpeechModelSelection(storageValue: selectionStorageValue),
                systemOptions.isEmpty {
                 return
             }
             selectionStorageValue = systemOptions.first?.selection.storageValue
-                ?? library.models.first.map { SpeechModelSelection.installed($0.id).storageValue }
+                ?? snapshot.models.first.map { SpeechModelSelection.installed($0.id).storageValue }
                 ?? ""
         }
     }
@@ -844,7 +863,7 @@ private final class SpeechModelLibraryDownload {
 
     func start(
         into library: SpeechModelLibrary,
-        completion: @escaping @MainActor (Result<InstalledSpeechModel, Error>) -> Void
+        completion: @escaping @MainActor (Result<SpeechModelImportResult, Error>) -> Void
     ) {
         guard !isRunning else { return }
         isRunning = true
@@ -892,7 +911,7 @@ private final class SpeechModelLibraryDownload {
                         errorMessage = "Downloaded \(displayName), but VAD download failed: \(error.localizedDescription)"
                     }
                 }
-                let model = try library.add(
+                let importResult = try await library.add(
                     primaryAssetAt: result.tempURL,
                     displayName: displayName,
                     filename: filename,
@@ -909,7 +928,7 @@ private final class SpeechModelLibraryDownload {
                 primaryTempURL = nil
                 vadTempURL = nil
                 isRunning = false
-                completion(.success(model))
+                completion(.success(importResult))
             } catch is CancellationError {
                 if let primaryTempURL {
                     try? FileManager.default.removeItem(at: primaryTempURL)
