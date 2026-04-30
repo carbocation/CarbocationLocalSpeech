@@ -281,6 +281,7 @@ private struct CLSSmokeRootView: View {
     @State private var transcriptionTask: Task<Void, Never>?
     @State private var activeSessionID: UUID?
     @State private var activeRecordingURL: URL?
+    @State private var transcriptDisplayRefreshTask: Task<Void, Never>?
     @State private var lastLoggedAudioLevelTime: TimeInterval?
     @State private var lastLoggedVoiceActivityTime: TimeInterval?
     @State private var lastLoggedVoiceActivityState: VoiceActivityState?
@@ -336,6 +337,7 @@ private struct CLSSmokeRootView: View {
             .onDisappear {
                 cancelFileTranscription(updateStatus: false)
                 stopListening()
+                cancelDeferredTranscriptDisplayRefresh()
                 releaseSelectedFileSecurityScope()
             }
             .onChange(of: werReferenceText) {
@@ -1702,13 +1704,36 @@ private struct CLSSmokeRootView: View {
 
     private func refreshVisibleTranscriptSnapshotIfNeeded(force: Bool = false) {
         let now = Date()
-        guard force || now.timeIntervalSince(liveDiagnostics.lastTranscriptDisplayUpdateDate) >= transcriptDisplayUpdateInterval else {
+        let elapsed = now.timeIntervalSince(liveDiagnostics.lastTranscriptDisplayUpdateDate)
+        guard force || elapsed >= transcriptDisplayUpdateInterval else {
+            scheduleDeferredTranscriptDisplayRefresh(after: transcriptDisplayUpdateInterval - elapsed)
             return
         }
 
+        cancelDeferredTranscriptDisplayRefresh()
         visibleTranscriptSnapshot = liveDiagnostics.transcriptSnapshot
         liveDiagnostics.lastTranscriptDisplayUpdateDate = now
         refreshCurrentTranscriptWERReport(force: force)
+    }
+
+    private func scheduleDeferredTranscriptDisplayRefresh(after delay: TimeInterval) {
+        guard transcriptDisplayRefreshTask == nil else { return }
+
+        let nanoseconds = UInt64(max(0, delay) * 1_000_000_000)
+        transcriptDisplayRefreshTask = Task { @MainActor in
+            if nanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: nanoseconds)
+            }
+            guard !Task.isCancelled else { return }
+
+            transcriptDisplayRefreshTask = nil
+            refreshVisibleTranscriptSnapshotIfNeeded(force: true)
+        }
+    }
+
+    private func cancelDeferredTranscriptDisplayRefresh() {
+        transcriptDisplayRefreshTask?.cancel()
+        transcriptDisplayRefreshTask = nil
     }
 
     private func shouldForceTranscriptDisplayUpdate(
@@ -1922,6 +1947,7 @@ private struct CLSSmokeRootView: View {
     }
 
     private func resetTranscriptDiagnostics() {
+        cancelDeferredTranscriptDisplayRefresh()
         visibleEventDescriptions.removeAll(keepingCapacity: true)
         visibleEventDescriptionTotalCount = 0
         visibleTranscriptSnapshot = LiveTranscriptDebugSnapshot()
