@@ -5,3 +5,5 @@ Vendor/whisper-artifacts/
 *.xcframework.zip
 *.swiftpm/
 Package.resolved
+**/xcuserdata/
+*.xcuserstate
