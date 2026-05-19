@@ -409,7 +409,29 @@ Run the tests:
 swift test
 ```
 
-The default suite skips live inference. Set `CARBOCATION_LOCAL_SPEECH_TEST_MODEL` to the path of an installed `.bin` model to enable it.
+The default suite skips live inference. Real Whisper tests are opt-in so CI and normal local runs do not need model weights.
+
+To run against one explicit installed model:
+
+```sh
+CARBOCATION_LOCAL_SPEECH_TEST_MODEL="/path/to/SpeechModels/<UUID>/ggml-tiny.en.bin" swift test --filter CarbocationWhisperRuntimeTests
+```
+
+To run against a model library root, set the root and optionally choose a variant. The variant defaults to `tiny.en` when omitted:
+
+```sh
+CARBOCATION_LOCAL_SPEECH_TEST_LIBRARY_ROOT="/path/to/SpeechModels" \
+CARBOCATION_LOCAL_SPEECH_TEST_MODEL_VARIANT="small.en" \
+swift test --filter CarbocationWhisperRuntimeTests
+```
+
+For a sandboxed app group on macOS, that root often looks like:
+
+```sh
+CARBOCATION_LOCAL_SPEECH_TEST_LIBRARY_ROOT="$HOME/Library/Group Containers/group.com.example.shared/SpeechModels" swift test --filter CarbocationWhisperRuntimeTests
+```
+
+The real-audio test uses the checked-in `whisper.cpp` JFK sample plus a reference transcript and reports word error rate. Model weights and CoreML encoder sidecars are never committed; the resolver preserves installed VAD and `*.mlmodelc` sidecars when they are present so the same path can be reused for later speed and CoreML benchmarking.
 
 ### Build the local Whisper source artifact
 

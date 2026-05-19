@@ -252,37 +252,59 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         XCTAssertEqual(resolved.commitment, .providerFinals)
     }
 
+    func testRealWhisperModelResolverPreservesLibrarySidecars() async throws {
+        let root = try makeTemporaryDirectory().appendingPathComponent("SpeechModels", isDirectory: true)
+        let modelID = UUID()
+        let modelDirectory = root.appendingPathComponent(modelID.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        try Data("fake model".utf8).write(to: modelDirectory.appendingPathComponent("ggml-tiny.en.bin"))
+        try Data("fake vad".utf8).write(to: modelDirectory.appendingPathComponent("ggml-silero-v6.2.0.bin"))
+        let coreMLDirectory = modelDirectory.appendingPathComponent("ggml-tiny.en-encoder.mlmodelc", isDirectory: true)
+        try FileManager.default.createDirectory(at: coreMLDirectory, withIntermediateDirectories: true)
+        try Data("fake coreml".utf8).write(to: coreMLDirectory.appendingPathComponent("model"))
+
+        let resolved = try await WhisperRealTestModelResolver.resolve(environment: [
+            WhisperRealTestModelResolver.libraryRootEnv: root.path
+        ])
+
+        XCTAssertEqual(resolved?.model.id, modelID)
+        XCTAssertEqual(resolved?.model.variant, "tiny.en")
+        XCTAssertEqual(resolved?.model.assets.map(\.role).sorted(by: { $0.rawValue < $1.rawValue }), [
+            .coreMLEncoder,
+            .primaryWeights,
+            .vadWeights
+        ])
+        XCTAssertEqual(resolved?.werThreshold, 0.60)
+    }
+
+    func testRealWhisperModelResolverUsesRequestedLibraryVariant() async throws {
+        let root = try makeTemporaryDirectory().appendingPathComponent("SpeechModels", isDirectory: true)
+        let tinyDirectory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let smallID = UUID()
+        let smallDirectory = root.appendingPathComponent(smallID.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tinyDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: smallDirectory, withIntermediateDirectories: true)
+        try Data("fake tiny".utf8).write(to: tinyDirectory.appendingPathComponent("ggml-tiny.en.bin"))
+        try Data("fake small".utf8).write(to: smallDirectory.appendingPathComponent("ggml-small.en.bin"))
+
+        let resolved = try await WhisperRealTestModelResolver.resolve(environment: [
+            WhisperRealTestModelResolver.libraryRootEnv: root.path,
+            WhisperRealTestModelResolver.modelVariantEnv: "small.en"
+        ])
+
+        XCTAssertEqual(resolved?.model.id, smallID)
+        XCTAssertEqual(resolved?.model.variant, "small.en")
+        XCTAssertEqual(resolved?.werThreshold, 0.35)
+    }
+
     @MainActor
-    func testLiveWhisperCppTranscribesPreparedAudioWhenModelIsProvided() async throws {
-        guard let modelPath = ProcessInfo.processInfo.environment["CARBOCATION_LOCAL_SPEECH_TEST_MODEL"],
-              !modelPath.isEmpty
-        else {
-            throw XCTSkip("Set CARBOCATION_LOCAL_SPEECH_TEST_MODEL to a local whisper.cpp .bin model to run live inference.")
+    func testLiveWhisperCppLoadsRealModelWhenProvided() async throws {
+        guard let resolved = try await WhisperRealTestModelResolver.resolve() else {
+            throw XCTSkip(Self.liveWhisperSkipReason)
         }
 
-        let modelURL = URL(fileURLWithPath: modelPath)
-        let modelDirectory = modelURL.deletingLastPathComponent()
-        guard let modelID = UUID(uuidString: modelDirectory.lastPathComponent) else {
-            throw XCTSkip("Live inference test expects the model path to be rooted as SpeechModels/<UUID>/<model>.bin.")
-        }
-
-        let attributes = try FileManager.default.attributesOfItem(atPath: modelURL.path)
-        let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
-        let model = InstalledSpeechModel(
-            id: modelID,
-            displayName: modelURL.deletingPathExtension().lastPathComponent,
-            assets: [
-                SpeechModelAsset(
-                    role: .primaryWeights,
-                    relativePath: modelURL.lastPathComponent,
-                    sizeBytes: size
-                )
-            ],
-            source: .imported
-        )
-
-        let engine = WhisperEngine(configuration: WhisperEngineConfiguration(useCoreML: false, threadCount: 2))
-        _ = try await engine.load(model: model, from: modelDirectory.deletingLastPathComponent())
+        let engine = WhisperEngine(configuration: Self.liveWhisperConfiguration(for: resolved))
+        _ = try await engine.load(model: resolved.model, from: resolved.libraryRoot)
 
         let sampleRate = 16_000.0
         let samples = (0..<Int(sampleRate)).map { index in
@@ -304,10 +326,119 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         XCTAssertEqual(transcript.duration, 1)
     }
 
+    @MainActor
+    func testLiveWhisperCppTranscribesKnownAudioWithinWERBudget() async throws {
+        guard let resolved = try await WhisperRealTestModelResolver.resolve() else {
+            throw XCTSkip(Self.liveWhisperSkipReason)
+        }
+
+        let fixture = try KnownSpeechFixture.jfk()
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: fixture.audioURL.path),
+            "Missing known speech fixture audio at \(fixture.audioURL.path)."
+        )
+
+        let engine = WhisperEngine(configuration: Self.liveWhisperConfiguration(for: resolved))
+        _ = try await engine.load(model: resolved.model, from: resolved.libraryRoot)
+
+        let transcript: Transcript
+        do {
+            transcript = try await engine.transcribe(
+                file: fixture.audioURL,
+                options: TranscriptionOptions(
+                    language: fixture.language,
+                    suppressBlankAudio: false,
+                    temperature: 0
+                )
+            )
+        } catch {
+            await engine.unload()
+            throw error
+        }
+        await engine.unload()
+
+        let hypothesis = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(transcript.backend?.kind, .whisperCpp)
+        XCTAssertFalse(hypothesis.isEmpty, "Whisper returned an empty transcript for \(fixture.name).")
+
+        guard let report = WhisperWERCalculator.report(
+            referenceText: fixture.referenceText,
+            hypothesisText: hypothesis
+        ) else {
+            XCTFail("Could not compute WER for \(fixture.name). Hypothesis: \(Self.excerpt(hypothesis))")
+            return
+        }
+        guard let wordErrorRate = report.wordErrorRate else {
+            XCTFail("\(report.summaryText) for \(fixture.name). Hypothesis: \(Self.excerpt(hypothesis))")
+            return
+        }
+
+        Self.emitRealWhisperWER(
+            report,
+            threshold: resolved.werThreshold,
+            fixture: fixture,
+            model: resolved,
+            hypothesis: hypothesis
+        )
+
+        XCTAssertLessThanOrEqual(
+            wordErrorRate,
+            resolved.werThreshold,
+            """
+            Known-audio Whisper WER exceeded budget for \(resolved.model.displayName).
+            Fixture: \(fixture.name)
+            Model: \(resolved.modelURL.path)
+            Threshold: \(String(format: "%.1f%%", resolved.werThreshold * 100))
+            Actual: \(report.summaryText)
+            Reference: \(fixture.referenceText)
+            Hypothesis: \(Self.excerpt(hypothesis))
+            """
+        )
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("CarbocationWhisperRuntimeTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private static let liveWhisperSkipReason = """
+    Set CARBOCATION_LOCAL_SPEECH_TEST_MODEL to an installed whisper.cpp .bin model, or set \
+    CARBOCATION_LOCAL_SPEECH_TEST_LIBRARY_ROOT to a SpeechModels directory. \
+    CARBOCATION_LOCAL_SPEECH_TEST_MODEL_VARIANT defaults to tiny.en when using a library root.
+    """
+
+    private static func liveWhisperConfiguration(for model: ResolvedWhisperTestModel) -> WhisperEngineConfiguration {
+        WhisperEngineConfiguration(
+            useCoreML: model.hasCoreMLEncoder,
+            threadCount: 2
+        )
+    }
+
+    private static func excerpt(_ text: String, limit: Int = 240) -> String {
+        let singleLine = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard singleLine.count > limit else { return singleLine }
+        return "\(singleLine.prefix(limit))..."
+    }
+
+    private static func emitRealWhisperWER(
+        _ report: WhisperWERReport,
+        threshold: Double,
+        fixture: KnownSpeechFixture,
+        model: ResolvedWhisperTestModel,
+        hypothesis: String
+    ) {
+        let rate = report.wordErrorRate.map { String(format: "%.1f%%", $0 * 100) } ?? "n/a"
+        let thresholdText = String(format: "%.1f%%", threshold * 100)
+        let sidecarText = model.hasCoreMLEncoder ? "yes" : "no"
+        let message = """
+        [CarbocationLocalSpeech] \(fixture.name) WER \(rate) <= \(thresholdText); \(report.summaryText); model \(model.model.displayName); CoreML sidecar: \(sidecarText)
+        [CarbocationLocalSpeech] hypothesis: \(excerpt(hypothesis))
+
+        """
+        FileHandle.standardError.write(Data(message.utf8))
     }
 }

@@ -346,7 +346,8 @@ let package = Package(
         ),
         .testTarget(
             name: "CarbocationWhisperRuntimeTests",
-            dependencies: ["CarbocationWhisperRuntime"]
+            dependencies: ["CarbocationWhisperRuntime"],
+            resources: [.process("Fixtures")]
         ),
         .testTarget(
             name: "CarbocationAppleSpeechRuntimeTests",
