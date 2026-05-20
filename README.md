@@ -433,6 +433,63 @@ CARBOCATION_LOCAL_SPEECH_TEST_LIBRARY_ROOT="$HOME/Library/Group Containers/group
 
 The real-audio test uses the checked-in `whisper.cpp` JFK sample plus a reference transcript and reports word error rate. Model weights and CoreML encoder sidecars are never committed; the resolver preserves installed VAD and `*.mlmodelc` sidecars when they are present so the same path can be reused for later speed and CoreML benchmarking.
 
+### Benchmark Whisper and CoreML
+
+The package includes a macOS-first benchmark executable for repeatable local timing:
+
+```sh
+swift run clss-benchmark \
+  --library-root "$HOME/Library/Group Containers/group.com.example.shared/SpeechModels" \
+  --variant small.en \
+  --iterations 5 \
+  --warmups 1 \
+  --output .build/benchmarks/small-en.json
+```
+
+The report prints load/context-init timing, first transcription timing, warm-run median/best timing, real-time factor, WER, transcript excerpt, backend status, `whisper_print_system_info()`, and CoreML sidecar status. With upstream `whisper.cpp`, a CoreML-enabled artifact loads the matching sidecar automatically when it is present. Use `--json` to print the full JSON report to stdout.
+
+To prepare and compare a CoreML-enabled local source artifact:
+
+```sh
+Scripts/setup-coreml-python.sh --python python3.10
+
+Scripts/benchmark-whisper-coreml.sh \
+  --library-root "$HOME/Library/Group Containers/group.com.example.shared/SpeechModels" \
+  --variant small.en \
+  --iterations 5 \
+  --warmups 1 \
+  --python "$PWD/.venv-coreml/bin/python"
+```
+
+If you intentionally use a global Python instead of the venv, install the converter dependencies into that interpreter and pass it explicitly:
+
+```sh
+python3.10 -m pip uninstall -y whisper
+python3.10 -m pip install --upgrade "torch>=2.1" coremltools ane_transformers openai-whisper
+
+Scripts/benchmark-whisper-coreml.sh \
+  --library-root "$HOME/Library/Group Containers/group.com.example.shared/SpeechModels" \
+  --variant small.en \
+  --iterations 5 \
+  --warmups 1 \
+  --python python3.10
+```
+
+That script builds the baseline macOS `whisper.cpp` artifact, benchmarks it, prepares `ggml-small.en-encoder.mlmodelc` beside `ggml-small.en.bin`, rebuilds with `WHISPER_COREML=ON`, benchmarks again, and writes both JSON reports under `.build/benchmarks/`. Pass `--python` or set `PYTHON=python3.10` when the CoreML converter dependencies are installed into a Python that is not available as `python3`. The converter needs the `openai-whisper` PyPI package, which imports as `whisper`; the unrelated package named `whisper` is not sufficient. Generated CoreML folders and model weights stay out of git.
+
+To rerun against the current local source artifact without rebuilding whisper.cpp:
+
+```sh
+Scripts/benchmark-whisper-coreml.sh \
+  --current-artifact \
+  --library-root "$HOME/Library/Group Containers/group.com.example.shared/SpeechModels" \
+  --variant small.en \
+  --iterations 5 \
+  --warmups 1
+```
+
+If the current artifact was built with `WHISPER_COREML=ON` and the sidecar is present, upstream `whisper.cpp` is expected to activate CoreML automatically. Add `--coreml` only to mark the report as an explicitly requested CoreML run.
+
 ### Build the local Whisper source artifact
 
 For local Whisper inference from this checkout:

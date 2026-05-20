@@ -284,7 +284,8 @@ let package = Package(
         .library(name: "CarbocationWhisperRuntime", targets: ["CarbocationWhisperRuntime"]),
         .library(name: "CarbocationAppleSpeechRuntime", targets: ["CarbocationAppleSpeechRuntime"]),
         .library(name: "CarbocationLocalSpeechRuntime", targets: ["CarbocationLocalSpeechRuntime"]),
-        .library(name: "CarbocationLocalSpeechUI", targets: ["CarbocationLocalSpeechUI"])
+        .library(name: "CarbocationLocalSpeechUI", targets: ["CarbocationLocalSpeechUI"]),
+        .executable(name: "clss-benchmark", targets: ["CLSSBenchmark"])
     ],
     targets: [
         .target(
@@ -340,14 +341,28 @@ let package = Package(
                 .linkedFramework("SwiftUI")
             ]
         ),
+        .target(
+            name: "CarbocationWhisperBenchmarkSupport",
+            dependencies: [
+                "CarbocationLocalSpeech",
+                "CarbocationWhisperRuntime"
+            ],
+            resources: [.process("Resources")]
+        ),
+        .executableTarget(
+            name: "CLSSBenchmark",
+            dependencies: ["CarbocationWhisperBenchmarkSupport"]
+        ),
         .testTarget(
             name: "CarbocationLocalSpeechTests",
             dependencies: ["CarbocationLocalSpeech"]
         ),
         .testTarget(
             name: "CarbocationWhisperRuntimeTests",
-            dependencies: ["CarbocationWhisperRuntime"],
-            resources: [.process("Fixtures")]
+            dependencies: [
+                "CarbocationWhisperRuntime",
+                "CarbocationWhisperBenchmarkSupport"
+            ]
         ),
         .testTarget(
             name: "CarbocationAppleSpeechRuntimeTests",

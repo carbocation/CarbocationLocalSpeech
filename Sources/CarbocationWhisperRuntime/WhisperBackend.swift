@@ -1,6 +1,6 @@
 import Foundation
 
-public enum WhisperBackendStatus: Hashable, Sendable {
+public enum WhisperBackendStatus: Codable, Hashable, Sendable {
     case linked
     case missingSourceArtifact(expectedLibraryPath: String)
     case binaryArtifact

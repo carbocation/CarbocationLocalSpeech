@@ -1,17 +1,29 @@
 import CarbocationLocalSpeech
 import Foundation
 
-struct ResolvedWhisperTestModel: Hashable {
-    var model: InstalledSpeechModel
-    var libraryRoot: URL
-    var modelURL: URL
-    var requestedVariant: String?
+public struct ResolvedWhisperBenchmarkModel: Hashable, Sendable {
+    public var model: InstalledSpeechModel
+    public var libraryRoot: URL
+    public var modelURL: URL
+    public var requestedVariant: String?
 
-    var hasCoreMLEncoder: Bool {
+    public init(
+        model: InstalledSpeechModel,
+        libraryRoot: URL,
+        modelURL: URL,
+        requestedVariant: String?
+    ) {
+        self.model = model
+        self.libraryRoot = libraryRoot
+        self.modelURL = modelURL
+        self.requestedVariant = requestedVariant
+    }
+
+    public var hasCoreMLEncoder: Bool {
         model.assets.contains { $0.role == .coreMLEncoder }
     }
 
-    var werThreshold: Double {
+    public var werThreshold: Double {
         let descriptor = [
             model.variant,
             model.primaryWeightsAsset?.relativePath,
@@ -33,7 +45,7 @@ struct ResolvedWhisperTestModel: Hashable {
     }
 }
 
-enum WhisperRealTestModelResolutionError: LocalizedError {
+public enum WhisperBenchmarkModelResolutionError: LocalizedError {
     case explicitModelMissing(URL)
     case explicitModelIsDirectory(URL)
     case explicitModelIsNotWhisperWeights(URL)
@@ -43,55 +55,71 @@ enum WhisperRealTestModelResolutionError: LocalizedError {
     case missingPrimaryWeights(InstalledSpeechModel)
     case sidecarLinkFailed(URL, URL, String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .explicitModelMissing(let url):
-            return "CARBOCATION_LOCAL_SPEECH_TEST_MODEL points to a missing file: \(url.path)"
+            return "Explicit model path points to a missing file: \(url.path)"
         case .explicitModelIsDirectory(let url):
-            return "CARBOCATION_LOCAL_SPEECH_TEST_MODEL must point at a .bin file, not a directory: \(url.path)"
+            return "Explicit model path must point at a .bin file, not a directory: \(url.path)"
         case .explicitModelIsNotWhisperWeights(let url):
-            return "CARBOCATION_LOCAL_SPEECH_TEST_MODEL must point at a whisper.cpp primary .bin model, not \(url.lastPathComponent)."
+            return "Explicit model path must point at a whisper.cpp primary .bin model, not \(url.lastPathComponent)."
         case .libraryRootMissing(let url):
-            return "CARBOCATION_LOCAL_SPEECH_TEST_LIBRARY_ROOT points to a missing directory: \(url.path)"
+            return "Library root points to a missing directory: \(url.path)"
         case .libraryRootIsNotDirectory(let url):
-            return "CARBOCATION_LOCAL_SPEECH_TEST_LIBRARY_ROOT must point at a SpeechModels directory: \(url.path)"
+            return "Library root must point at a SpeechModels directory: \(url.path)"
         case .variantNotFound(let variant, let available):
             let list = available.isEmpty ? "none" : available.joined(separator: ", ")
-            return "Could not find test model variant '\(variant)' in CARBOCATION_LOCAL_SPEECH_TEST_LIBRARY_ROOT. Available variants: \(list)."
+            return "Could not find model variant '\(variant)' in library root. Available variants: \(list)."
         case .missingPrimaryWeights(let model):
-            return "Resolved test model '\(model.displayName)' does not include primary weights."
+            return "Resolved model '\(model.displayName)' does not include primary weights."
         case .sidecarLinkFailed(let source, let destination, let detail):
-            return "Could not prepare explicit test model sidecar \(source.lastPathComponent) at \(destination.path): \(detail)"
+            return "Could not prepare explicit model sidecar \(source.lastPathComponent) at \(destination.path): \(detail)"
         }
     }
 }
 
-enum WhisperRealTestModelResolver {
-    static let explicitModelEnv = "CARBOCATION_LOCAL_SPEECH_TEST_MODEL"
-    static let libraryRootEnv = "CARBOCATION_LOCAL_SPEECH_TEST_LIBRARY_ROOT"
-    static let modelVariantEnv = "CARBOCATION_LOCAL_SPEECH_TEST_MODEL_VARIANT"
-    static let defaultModelVariant = "tiny.en"
+public enum WhisperBenchmarkModelResolver {
+    public static let explicitModelEnv = "CARBOCATION_LOCAL_SPEECH_TEST_MODEL"
+    public static let libraryRootEnv = "CARBOCATION_LOCAL_SPEECH_TEST_LIBRARY_ROOT"
+    public static let modelVariantEnv = "CARBOCATION_LOCAL_SPEECH_TEST_MODEL_VARIANT"
+    public static let defaultModelVariant = "tiny.en"
 
-    static func resolve(
+    public static func resolve(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default
-    ) async throws -> ResolvedWhisperTestModel? {
-        if let modelPath = nonBlank(environment[explicitModelEnv]) {
+    ) async throws -> ResolvedWhisperBenchmarkModel? {
+        try await resolve(
+            explicitModelPath: nonBlank(environment[explicitModelEnv]),
+            libraryRootPath: nonBlank(environment[libraryRootEnv]),
+            variant: nonBlank(environment[modelVariantEnv]),
+            defaultVariant: defaultModelVariant,
+            fileManager: fileManager
+        )
+    }
+
+    public static func resolve(
+        explicitModelPath: String?,
+        libraryRootPath: String?,
+        variant: String?,
+        defaultVariant: String = defaultModelVariant,
+        fileManager: FileManager = .default
+    ) async throws -> ResolvedWhisperBenchmarkModel? {
+        if let explicitModelPath = nonBlank(explicitModelPath) {
             return try await resolveExplicitModel(
-                at: url(forPath: modelPath),
-                requestedVariant: nonBlank(environment[modelVariantEnv]),
+                at: url(forPath: explicitModelPath),
+                requestedVariant: nonBlank(variant),
                 fileManager: fileManager
             )
         }
 
-        guard let rootPath = nonBlank(environment[libraryRootEnv]) else {
+        guard let libraryRootPath = nonBlank(libraryRootPath) else {
             return nil
         }
 
-        let variant = nonBlank(environment[modelVariantEnv]) ?? defaultModelVariant
+        let resolvedVariant = nonBlank(variant) ?? defaultVariant
         return try await resolveLibraryModel(
-            root: url(forPath: rootPath),
-            variant: variant,
+            root: url(forPath: libraryRootPath),
+            variant: resolvedVariant,
             fileManager: fileManager
         )
     }
@@ -100,20 +128,20 @@ enum WhisperRealTestModelResolver {
         at modelURL: URL,
         requestedVariant: String?,
         fileManager: FileManager
-    ) async throws -> ResolvedWhisperTestModel {
+    ) async throws -> ResolvedWhisperBenchmarkModel {
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: modelURL.path, isDirectory: &isDirectory) else {
-            throw WhisperRealTestModelResolutionError.explicitModelMissing(modelURL)
+            throw WhisperBenchmarkModelResolutionError.explicitModelMissing(modelURL)
         }
         guard !isDirectory.boolValue else {
-            throw WhisperRealTestModelResolutionError.explicitModelIsDirectory(modelURL)
+            throw WhisperBenchmarkModelResolutionError.explicitModelIsDirectory(modelURL)
         }
         guard isLikelyPrimaryWeights(modelURL) else {
-            throw WhisperRealTestModelResolutionError.explicitModelIsNotWhisperWeights(modelURL)
+            throw WhisperBenchmarkModelResolutionError.explicitModelIsNotWhisperWeights(modelURL)
         }
 
         if let installed = try await resolveInstalledModel(at: modelURL, fileManager: fileManager) {
-            return ResolvedWhisperTestModel(
+            return ResolvedWhisperBenchmarkModel(
                 model: installed.model,
                 libraryRoot: installed.libraryRoot,
                 modelURL: modelURL,
@@ -154,10 +182,10 @@ enum WhisperRealTestModelResolver {
         for modelURL: URL,
         requestedVariant: String?,
         fileManager: FileManager
-    ) throws -> ResolvedWhisperTestModel {
+    ) throws -> ResolvedWhisperBenchmarkModel {
         let modelID = UUID()
         let temporaryRoot = fileManager.temporaryDirectory
-            .appendingPathComponent("CarbocationWhisperRuntimeRealModels-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("CarbocationWhisperBenchmarkModels-\(UUID().uuidString)", isDirectory: true)
             .appendingPathComponent("SpeechModels", isDirectory: true)
         let modelDirectory = temporaryRoot.appendingPathComponent(modelID.uuidString, isDirectory: true)
         try fileManager.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
@@ -195,7 +223,7 @@ enum WhisperRealTestModelResolver {
             source: .imported
         )
 
-        return ResolvedWhisperTestModel(
+        return ResolvedWhisperBenchmarkModel(
             model: model,
             libraryRoot: temporaryRoot,
             modelURL: modelDirectory.appendingPathComponent(modelURL.lastPathComponent),
@@ -213,7 +241,7 @@ enum WhisperRealTestModelResolver {
         do {
             try fileManager.createSymbolicLink(at: destination, withDestinationURL: source)
         } catch {
-            throw WhisperRealTestModelResolutionError.sidecarLinkFailed(source, destination, error.localizedDescription)
+            throw WhisperBenchmarkModelResolutionError.sidecarLinkFailed(source, destination, error.localizedDescription)
         }
 
         assets.append(SpeechModelAsset(
@@ -227,19 +255,19 @@ enum WhisperRealTestModelResolver {
         root: URL,
         variant: String,
         fileManager: FileManager
-    ) async throws -> ResolvedWhisperTestModel {
+    ) async throws -> ResolvedWhisperBenchmarkModel {
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: root.path, isDirectory: &isDirectory) else {
-            throw WhisperRealTestModelResolutionError.libraryRootMissing(root)
+            throw WhisperBenchmarkModelResolutionError.libraryRootMissing(root)
         }
         guard isDirectory.boolValue else {
-            throw WhisperRealTestModelResolutionError.libraryRootIsNotDirectory(root)
+            throw WhisperBenchmarkModelResolutionError.libraryRootIsNotDirectory(root)
         }
 
         let library = SpeechModelLibrary(root: root, fileManager: fileManager)
         let snapshot = await library.refresh()
         guard let model = snapshot.models.first(where: { matches($0, variant: variant) }) else {
-            throw WhisperRealTestModelResolutionError.variantNotFound(
+            throw WhisperBenchmarkModelResolutionError.variantNotFound(
                 variant,
                 snapshot.models.compactMap { model in
                     model.variant ?? model.primaryWeightsAsset?.relativePath ?? model.displayName
@@ -247,10 +275,10 @@ enum WhisperRealTestModelResolver {
             )
         }
         guard let modelURL = model.primaryWeightsURL(in: root) else {
-            throw WhisperRealTestModelResolutionError.missingPrimaryWeights(model)
+            throw WhisperBenchmarkModelResolutionError.missingPrimaryWeights(model)
         }
 
-        return ResolvedWhisperTestModel(
+        return ResolvedWhisperBenchmarkModel(
             model: model,
             libraryRoot: root,
             modelURL: modelURL,
@@ -258,7 +286,7 @@ enum WhisperRealTestModelResolver {
         )
     }
 
-    private static func matches(_ model: InstalledSpeechModel, variant: String) -> Bool {
+    public static func matches(_ model: InstalledSpeechModel, variant: String) -> Bool {
         let expected = variant.lowercased()
         if model.variant?.lowercased() == expected {
             return true
@@ -331,3 +359,6 @@ enum WhisperRealTestModelResolver {
         return trimmed.isEmpty ? nil : trimmed
     }
 }
+
+public typealias ResolvedWhisperTestModel = ResolvedWhisperBenchmarkModel
+public typealias WhisperRealTestModelResolver = WhisperBenchmarkModelResolver

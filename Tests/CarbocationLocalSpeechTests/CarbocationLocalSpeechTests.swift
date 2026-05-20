@@ -121,6 +121,28 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(importResult.snapshot.totalDiskUsageBytes, 16)
     }
 
+    func testModelLibraryDiscoversCoreMLSidecarAddedAfterMetadataWrite() async throws {
+        let root = try makeTemporaryDirectory()
+        let source = root.appendingPathComponent("ggml-small.en.bin")
+        try Data("fake whisper weights".utf8).write(to: source)
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let importResult = try await library.importFile(at: source, displayName: "Small English")
+        let model = importResult.model
+        let modelDirectory = model.directory(in: modelsRoot)
+        let coreML = modelDirectory.appendingPathComponent("ggml-small.en-encoder.mlmodelc", isDirectory: true)
+        try FileManager.default.createDirectory(at: coreML, withIntermediateDirectories: true)
+        try Data("fake coreml".utf8).write(to: coreML.appendingPathComponent("model"))
+
+        let snapshot = await library.refresh()
+        let refreshed = try XCTUnwrap(snapshot.model(id: model.id))
+
+        XCTAssertEqual(refreshed.assets.filter { $0.role == .primaryWeights }.count, 1)
+        XCTAssertTrue(refreshed.assets.contains {
+            $0.role == .coreMLEncoder && $0.relativePath == "ggml-small.en-encoder.mlmodelc"
+        })
+    }
+
     func testModelLibraryRejectsAndCleansUpBundleMissingPrimaryAsset() async throws {
         let root = try makeTemporaryDirectory()
         let bundle = root.appendingPathComponent("bundle", isDirectory: true)

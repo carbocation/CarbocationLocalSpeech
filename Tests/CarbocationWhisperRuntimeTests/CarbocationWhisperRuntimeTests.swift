@@ -1,4 +1,5 @@
 @_spi(Internal) import CarbocationLocalSpeech
+@testable import CarbocationWhisperBenchmarkSupport
 @testable import CarbocationWhisperRuntime
 import Foundation
 import XCTest
@@ -19,6 +20,11 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         XCTAssertTrue(WhisperEngineConfiguration().useMetal)
         XCTAssertTrue(WhisperLoadConfiguration().useMetal)
 #endif
+    }
+
+    func testDefaultCoreMLPolicyMatchesLegacyConfiguration() {
+        XCTAssertTrue(WhisperEngineConfiguration().useCoreML)
+        XCTAssertTrue(WhisperLoadConfiguration().useCoreML)
     }
 
     func testEngineLoadsInstalledModelMetadataWithoutRunningInference() async throws {
@@ -295,6 +301,121 @@ final class CarbocationWhisperRuntimeTests: XCTestCase {
         XCTAssertEqual(resolved?.model.id, smallID)
         XCTAssertEqual(resolved?.model.variant, "small.en")
         XCTAssertEqual(resolved?.werThreshold, 0.35)
+    }
+
+    func testBenchmarkTimingAggregation() {
+        XCTAssertEqual(WhisperBenchmarkRunner.median([3, 1, 2]), 2)
+        XCTAssertEqual(WhisperBenchmarkRunner.median([4, 1, 2, 3]), 2.5)
+        XCTAssertEqual(WhisperBenchmarkRunner.best([4, 1, 2, 3]), 1)
+    }
+
+    func testBenchmarkReportJSONEncodingIncludesWERAndCoreMLExpectation() throws {
+        let report = WhisperBenchmarkReport(
+            configuration: WhisperBenchmarkConfigurationSummary(
+                explicitModelPath: nil,
+                libraryRootPath: "/tmp/SpeechModels",
+                variant: "small.en",
+                iterations: 2,
+                warmups: 1,
+                threadCount: 4,
+                useMetal: true,
+                useCoreML: true,
+                suppressNativeLogs: true
+            ),
+            runtime: WhisperBenchmarkRuntimeSummary(
+                backendStatus: "linked",
+                backendStatusDescription: "whisper.cpp source artifact is present.",
+                systemInfo: "WHISPER : COREML = 1 |",
+                coreMLCompiledIn: true,
+                coreMLRequested: true,
+                modelDeclaresCoreMLEncoder: true,
+                expectedCoreMLEncoderPath: "/tmp/SpeechModels/model/ggml-small.en-encoder.mlmodelc",
+                expectedCoreMLEncoderExists: true,
+                expectedCoreMLActive: true
+            ),
+            model: WhisperBenchmarkModelSummary(
+                id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+                displayName: "Whisper small.en (English-only)",
+                variant: "small.en",
+                primaryWeightsPath: "/tmp/SpeechModels/model/ggml-small.en.bin",
+                libraryRootPath: "/tmp/SpeechModels",
+                assetRoles: ["coreMLEncoder", "primaryWeights", "vadWeights"]
+            ),
+            fixture: WhisperBenchmarkFixtureSummary(
+                name: "jfk",
+                audioPath: "/tmp/jfk.wav",
+                language: "en",
+                durationSeconds: 11,
+                referenceWordCount: 19
+            ),
+            timings: WhisperBenchmarkTimingSummary(
+                audioPreparationSeconds: 0.01,
+                loadSeconds: 0.02,
+                contextInitSeconds: 0.03,
+                firstTranscriptionSeconds: 0.4,
+                warmupTranscriptionSeconds: [0.3],
+                warmTranscriptionSeconds: [0.2, 0.25],
+                medianWarmTranscriptionSeconds: 0.225,
+                bestWarmTranscriptionSeconds: 0.2,
+                medianWarmRealTimeFactor: 48.8,
+                bestWarmRealTimeFactor: 55
+            ),
+            wer: WhisperBenchmarkWERSummary(
+                substitutions: 0,
+                deletions: 0,
+                insertions: 0,
+                referenceWordCount: 19,
+                hypothesisWordCount: 19,
+                wordErrorRate: 0,
+                summaryText: "S 0 D 0 I 0 WER 0.0%"
+            ),
+            transcriptExcerpt: "And so my fellow Americans..."
+        )
+
+        let data = try WhisperBenchmarkJSON.encoder().encode(report)
+        let decoded = try WhisperBenchmarkJSON.decoder().decode(WhisperBenchmarkReport.self, from: data)
+
+        XCTAssertEqual(decoded.schemaVersion, 2)
+        XCTAssertEqual(decoded.wer?.wordErrorRate, 0)
+        XCTAssertTrue(decoded.configuration.useCoreML)
+        XCTAssertTrue(decoded.runtime.coreMLRequested)
+        XCTAssertTrue(decoded.runtime.expectedCoreMLActive)
+        XCTAssertTrue(String(data: data, encoding: .utf8)?.contains("\"wordErrorRate\"") ?? false)
+    }
+
+    func testCoreMLExpectedEncoderPathAndActiveCalculation() {
+        let modelURL = URL(fileURLWithPath: "/tmp/ggml-small.en-q5_0.bin")
+        XCTAssertEqual(
+            WhisperRuntimeSmoke.expectedCoreMLEncoderURL(forModelAt: modelURL).path,
+            "/tmp/ggml-small.en-encoder.mlmodelc"
+        )
+
+        let active = WhisperCoreMLExpectation(
+            compiledIn: true,
+            requested: true,
+            modelDeclaresCoreMLEncoder: false,
+            expectedEncoderPath: "/tmp/ggml-small.en-encoder.mlmodelc",
+            expectedEncoderExists: true
+        )
+        XCTAssertTrue(active.expectedActive)
+
+        let inactive = WhisperCoreMLExpectation(
+            compiledIn: false,
+            requested: true,
+            modelDeclaresCoreMLEncoder: true,
+            expectedEncoderPath: "/tmp/ggml-small.en-encoder.mlmodelc",
+            expectedEncoderExists: true
+        )
+        XCTAssertFalse(inactive.expectedActive)
+
+        let notRequested = WhisperCoreMLExpectation(
+            compiledIn: true,
+            requested: false,
+            modelDeclaresCoreMLEncoder: true,
+            expectedEncoderPath: "/tmp/ggml-small.en-encoder.mlmodelc",
+            expectedEncoderExists: true
+        )
+        XCTAssertTrue(notRequested.expectedActive)
     }
 
     @MainActor

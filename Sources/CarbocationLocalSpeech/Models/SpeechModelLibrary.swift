@@ -364,6 +364,8 @@ public actor SpeechModelLibrary {
 
         guard hasPrimaryWeights else { return nil }
 
+        let mergedAssets = assetsWithDiscoveredOptionalSidecars(assets, in: directory)
+
         return InstalledSpeechModel(
             id: model.id,
             displayName: model.displayName,
@@ -372,7 +374,7 @@ public actor SpeechModelLibrary {
             variant: model.variant,
             languageScope: model.languageScope,
             quantization: model.quantization,
-            assets: assets,
+            assets: mergedAssets,
             source: model.source,
             sourceURL: model.sourceURL,
             hfRepo: model.hfRepo,
@@ -381,6 +383,46 @@ public actor SpeechModelLibrary {
             capabilities: model.capabilities,
             installedAt: model.installedAt
         )
+    }
+
+    private func assetsWithDiscoveredOptionalSidecars(
+        _ assets: [SpeechModelAsset],
+        in directory: URL
+    ) -> [SpeechModelAsset] {
+        guard let files = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return assets
+        }
+
+        var merged = assets
+        var existing = Set(assets.map { "\($0.role.rawValue)|\($0.relativePath)" })
+        for file in files {
+            let role: SpeechModelAsset.Role?
+            if isLikelyVADWeights(file) {
+                role = .vadWeights
+            } else if file.pathExtension.lowercased() == "mlmodelc" {
+                role = .coreMLEncoder
+            } else {
+                role = nil
+            }
+
+            guard let role else { continue }
+            let relativePath = file.lastPathComponent
+            let key = "\(role.rawValue)|\(relativePath)"
+            guard !existing.contains(key) else { continue }
+
+            merged.append(SpeechModelAsset(
+                role: role,
+                relativePath: relativePath,
+                sizeBytes: Self.sizeOfItem(at: file, fileManager: fileManager)
+            ))
+            existing.insert(key)
+        }
+
+        return merged
     }
 
     private func writeMetadataSync(_ model: InstalledSpeechModel) throws {

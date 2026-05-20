@@ -1,12 +1,19 @@
 import Foundation
 
-struct KnownSpeechFixture: Hashable {
-    var name: String
-    var audioURL: URL
-    var referenceText: String
-    var language: String
+public struct KnownSpeechFixture: Codable, Hashable, Sendable {
+    public var name: String
+    public var audioURL: URL
+    public var referenceText: String
+    public var language: String
 
-    static func jfk() throws -> KnownSpeechFixture {
+    public init(name: String, audioURL: URL, referenceText: String, language: String) {
+        self.name = name
+        self.audioURL = audioURL
+        self.referenceText = referenceText
+        self.language = language
+    }
+
+    public static func jfk() throws -> KnownSpeechFixture {
         let packageRoot = try PackagePath.packageRoot(startingAt: URL(fileURLWithPath: #filePath))
         let audioURL = packageRoot.appendingPathComponent("Vendor/whisper.cpp/samples/jfk.wav")
         let referenceURL = try resourceURL(for: "jfk", extension: "txt")
@@ -21,14 +28,8 @@ struct KnownSpeechFixture: Hashable {
         )
     }
 
-    private static func resourceURL(
-        for name: String,
-        extension pathExtension: String
-    ) throws -> URL {
-        if let url = Bundle.module.url(
-            forResource: name,
-            withExtension: pathExtension
-        ) {
+    private static func resourceURL(for name: String, extension pathExtension: String) throws -> URL {
+        if let url = Bundle.module.url(forResource: name, withExtension: pathExtension) {
             return url
         }
         throw CocoaError(.fileNoSuchFile)

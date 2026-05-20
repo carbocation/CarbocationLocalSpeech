@@ -1,24 +1,40 @@
 import Foundation
 
-struct WhisperWERReport: Hashable {
-    var substitutions: Int
-    var deletions: Int
-    var insertions: Int
-    var referenceWordCount: Int
-    var hypothesisWordCount: Int
-    var skippedReason: String?
+public struct WhisperWERReport: Codable, Hashable, Sendable {
+    public var substitutions: Int
+    public var deletions: Int
+    public var insertions: Int
+    public var referenceWordCount: Int
+    public var hypothesisWordCount: Int
+    public var skippedReason: String?
 
-    var editCount: Int {
+    public init(
+        substitutions: Int,
+        deletions: Int,
+        insertions: Int,
+        referenceWordCount: Int,
+        hypothesisWordCount: Int,
+        skippedReason: String? = nil
+    ) {
+        self.substitutions = substitutions
+        self.deletions = deletions
+        self.insertions = insertions
+        self.referenceWordCount = referenceWordCount
+        self.hypothesisWordCount = hypothesisWordCount
+        self.skippedReason = skippedReason
+    }
+
+    public var editCount: Int {
         guard skippedReason == nil else { return 0 }
         return substitutions + deletions + insertions
     }
 
-    var wordErrorRate: Double? {
+    public var wordErrorRate: Double? {
         guard skippedReason == nil, referenceWordCount > 0 else { return nil }
         return Double(editCount) / Double(referenceWordCount)
     }
 
-    var summaryText: String {
+    public var summaryText: String {
         if let skippedReason {
             return "WER skipped: \(skippedReason)"
         }
@@ -27,11 +43,11 @@ struct WhisperWERReport: Hashable {
     }
 }
 
-enum WhisperWERCalculator {
-    static let maximumComparedWords = 4_000
+public enum WhisperWERCalculator {
+    public static let maximumComparedWords = 4_000
     private static let maximumComparisonCells = 1_000_000
 
-    static func report(referenceText: String, hypothesisText: String) -> WhisperWERReport? {
+    public static func report(referenceText: String, hypothesisText: String) -> WhisperWERReport? {
         let wordLimit = maximumComparedWords + 1
         let referenceWords = normalizedWords(in: referenceText, limit: wordLimit)
         let hypothesisWords = normalizedWords(in: hypothesisText, limit: wordLimit)
