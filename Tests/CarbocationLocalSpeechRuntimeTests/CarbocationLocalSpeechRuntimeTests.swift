@@ -39,6 +39,7 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertEqual(result.transcript, transcript)
         XCTAssertNil(result.diarization)
         XCTAssertNil(result.speakerAttributedTranscript)
+        XCTAssertEqual(result.diarizationStatus, .notRequested)
     }
 
     func testAnalyzerDiarizationRequestRequiresRegisteredDiarizer() async {
@@ -90,6 +91,7 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         )
 
         XCTAssertEqual(result.diarization, diarization)
+        XCTAssertEqual(result.diarizationStatus, .completed)
         XCTAssertEqual(result.speakerAttributedTranscript?.segments.first?.speaker, speaker)
         XCTAssertEqual(result.speakerAttributedTranscript?.segments.first?.words.first?.speaker, speaker)
         XCTAssertTrue(result.diagnostics.contains { $0.source == "test" })
@@ -185,6 +187,7 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertTrue(events.contains { event in
             if case .completed(let result) = event {
                 return result.diarization == diarization
+                    && result.diarizationStatus == .completed
                     && result.speakerAttributedTranscript?.segments.first?.speaker == speaker
             }
             return false
@@ -518,6 +521,58 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertEqual(attributedSegments.first { $0.text == "latest" }?.speaker, speakerC)
     }
 
+    func testStreamingAnalyzerRestoresHistoricRevisionFromLocalWordOverlap() async throws {
+        let speakerA = SpeakerID(rawValue: "A")
+        let speakerB = SpeakerID(rawValue: "B")
+        let previousTranscript = Transcript(segments: [
+            TranscriptSegment(
+                text: "long speaker",
+                startTime: 0,
+                endTime: 10,
+                words: [TranscriptWord(text: "long", startTime: 0, endTime: 10, speaker: speakerA)],
+                speaker: speakerA
+            ),
+            TranscriptSegment(
+                text: "interruption",
+                startTime: 4.98,
+                endTime: 5.08,
+                words: [TranscriptWord(text: "interruption", startTime: 4.98, endTime: 5.08, speaker: speakerB)],
+                speaker: speakerB
+            )
+        ])
+        let revisedTranscript = Transcript(segments: [
+            TranscriptSegment(
+                text: "yeah",
+                startTime: 5.0,
+                endTime: 5.06,
+                words: [TranscriptWord(text: "yeah", startTime: 5.0, endTime: 5.06)]
+            )
+        ])
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: ChunkedStreamingTranscriber(eventsByChunk: [
+                [.snapshot(StreamingTranscriptSnapshot(stable: previousTranscript))],
+                [.completed(revisedTranscript)]
+            ])
+        )
+
+        let stream = analyzer.stream(
+            audio: testAudioChunks(startTimes: [0, 5]),
+            options: StreamingSpeechAnalysisOptions()
+        )
+
+        var completed: SpeechAnalysisResult?
+        for try await event in stream {
+            if case .completed(let result) = event {
+                completed = result
+            }
+        }
+
+        let segment = try XCTUnwrap(completed?.transcript?.segments.first)
+        XCTAssertEqual(segment.speaker, speakerB)
+        XCTAssertEqual(segment.words.first?.speaker, speakerB)
+        XCTAssertEqual(completed?.diarizationStatus, .notRequested)
+    }
+
     func testStreamingAnalyzerJitterBufferDefersTailAttribution() async throws {
         let speaker = SpeakerID(rawValue: "A")
         let transcript = Transcript(segments: [
@@ -750,7 +805,7 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         for try await event in stream {
             switch event {
             case .transcription(.diagnostic(let diagnostic)):
-                sawDropDiagnostic = diagnostic.message.contains("Dropped diarization stream")
+                sawDropDiagnostic = diagnostic.code == .diarizationDropped
             case .completed(let result):
                 completed = result
             case .transcription, .diarization, .speakerAttributedSnapshot:
@@ -763,6 +818,8 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertTrue(sawDropDiagnostic)
         XCTAssertEqual(completed?.transcript, transcript)
         XCTAssertNil(completed?.diarization)
+        XCTAssertEqual(completed?.diarizationStatus, .dropped)
+        XCTAssertTrue(completed?.diagnostics.contains { $0.code == .diarizationDropped } == true)
     }
 
     func testStreamingAnalyzerIgnoresLateDiarizationAfterSoftDrop() async throws {
@@ -807,6 +864,7 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertFalse(sawLateDiarization)
         XCTAssertEqual(completed?.transcript, transcript)
         XCTAssertNil(completed?.diarization)
+        XCTAssertEqual(completed?.diarizationStatus, .dropped)
     }
 
     func testEngineRegistersDiarizerForAnalyzerConstruction() async {

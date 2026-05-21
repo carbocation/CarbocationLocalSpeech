@@ -15,6 +15,24 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(SpeechModelSelection.self, from: encoded), .system(.appleSpeech))
     }
 
+    func testSpeechAnalysisResultDefaultsLegacyDiarizationStatusWhenDecoding() throws {
+        let result = SpeechAnalysisResult(
+            diarization: DiarizationResult(turns: [], speakers: [], duration: 0),
+            diarizationStatus: .completed
+        )
+        let encoded = try JSONEncoder().encode(result)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        json.removeValue(forKey: "diarizationStatus")
+        let legacyEncoded = try JSONSerialization.data(withJSONObject: json)
+
+        let decoded = try JSONDecoder().decode(SpeechAnalysisResult.self, from: legacyEncoded)
+        XCTAssertEqual(decoded.diarizationStatus, .completed)
+
+        let noDiarizationEncoded = Data(#"{"diagnostics":[]}"#.utf8)
+        let noDiarization = try JSONDecoder().decode(SpeechAnalysisResult.self, from: noDiarizationEncoded)
+        XCTAssertEqual(noDiarization.diarizationStatus, .notRequested)
+    }
+
     func testProviderAvailabilityOfferPolicy() {
         XCTAssertTrue(SpeechProviderAvailability.available.shouldOfferModelOption)
         XCTAssertTrue(SpeechProviderAvailability.unavailable(.assetDownloadRequired).shouldOfferModelOption)

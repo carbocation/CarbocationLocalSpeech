@@ -90,7 +90,8 @@ public actor LocalSpeechAnalyzer: Sendable {
                 transcript: transcript,
                 diarization: diarization,
                 speakerAttributedTranscript: attributedResult?.transcript,
-                diagnostics: diagnostics
+                diagnostics: diagnostics,
+                diarizationStatus: options.diarization == nil ? .notRequested : .completed
             )
         }
     }
@@ -175,7 +176,6 @@ private func streamWithDiarization(
         backlogPolicy: options.backlogPolicy
     )
     let state = StreamingSpeechAnalysisState(diarizationRequest: diarizationRequest)
-    let degradationState = StreamingBacklogDegradationState()
 
     do {
         try await withThrowingTaskGroup(of: Void.self) { group in
@@ -194,12 +194,15 @@ private func streamWithDiarization(
                         }
                         for consumer in result.droppedConsumers where reportedDroppedConsumers.insert(consumer).inserted {
                             if consumer == .diarization {
-                                await degradationState.recordDroppedDiarization()
+                                if let diagnostic = await state.recordDiarizationDropped() {
+                                    continuation.yield(.transcription(.diagnostic(diagnostic)))
+                                }
+                            } else {
+                                continuation.yield(.transcription(.diagnostic(SpeechDiagnostic(
+                                    source: "analyzer",
+                                    message: "Dropped \(consumer.displayName) stream after it exceeded the real-time fan-out buffer limit; transcription will continue."
+                                ))))
                             }
-                            continuation.yield(.transcription(.diagnostic(SpeechDiagnostic(
-                                source: "analyzer",
-                                message: "Dropped \(consumer.displayName) stream after it exceeded the real-time fan-out buffer limit; transcription will continue."
-                            ))))
                         }
                         guard result.hasActiveConsumers else { break }
                     }
@@ -235,7 +238,7 @@ private func streamWithDiarization(
                     )
                     for try await snapshot in diarizationStream {
                         if options.backlogPolicy == .dropDiarization,
-                           await degradationState.diarizationWasDropped() {
+                           await state.diarizationWasDropped() {
                             return
                         }
                         for output in await state.recordDiarization(snapshot) {
@@ -244,7 +247,7 @@ private func streamWithDiarization(
                     }
                 } catch is CancellationError {
                     if options.backlogPolicy == .dropDiarization,
-                       await degradationState.diarizationWasDropped() {
+                       await state.diarizationWasDropped() {
                         return
                     }
                     throw CancellationError()
@@ -342,18 +345,6 @@ private enum AudioStreamConsumer: String, Sendable {
 private struct AudioStreamBroadcastResult: Sendable {
     var hasActiveConsumers: Bool
     var droppedConsumers: [AudioStreamConsumer]
-}
-
-private actor StreamingBacklogDegradationState {
-    private var droppedDiarization = false
-
-    func recordDroppedDiarization() {
-        droppedDiarization = true
-    }
-
-    func diarizationWasDropped() -> Bool {
-        droppedDiarization
-    }
 }
 
 private actor AudioStreamBroadcaster {
@@ -455,9 +446,12 @@ private actor StreamingSpeechAnalysisState {
     private var latestDiarizationSnapshot: StreamingDiarizationSnapshot?
     private var finalTranscript: Transcript?
     private var lockedStableAttributions: [UUID: LockedStableAttribution] = [:]
+    private var diagnostics: [SpeechDiagnostic] = []
+    private var diarizationStatus: SpeechAnalysisDiarizationStatus
 
     init(diarizationRequest: StreamingDiarizationRequest?) {
         self.diarizationRequest = diarizationRequest
+        diarizationStatus = diarizationRequest == nil ? .notRequested : .completed
     }
 
     func recordTranscription(_ event: TranscriptEvent) -> [StreamingSpeechAnalysisEvent] {
@@ -484,6 +478,8 @@ private actor StreamingSpeechAnalysisState {
     }
 
     func recordDiarization(_ snapshot: StreamingDiarizationSnapshot) -> [StreamingSpeechAnalysisEvent] {
+        guard diarizationStatus != .dropped else { return [] }
+
         let retainedSnapshot = snapshotByRetainingStableDiarization(snapshot)
         latestDiarizationSnapshot = retainedSnapshot
         var outputs: [StreamingSpeechAnalysisEvent] = [.diarization(retainedSnapshot)]
@@ -495,17 +491,34 @@ private actor StreamingSpeechAnalysisState {
         return outputs
     }
 
+    func recordDiarizationDropped() -> SpeechDiagnostic? {
+        guard diarizationStatus != .dropped else { return nil }
+        diarizationStatus = .dropped
+        let diagnostic = SpeechDiagnostic(
+            source: "analyzer",
+            message: "Dropped diarization stream after it exceeded the real-time fan-out buffer limit; transcription will continue.",
+            code: .diarizationDropped
+        )
+        diagnostics.append(diagnostic)
+        return diagnostic
+    }
+
+    func diarizationWasDropped() -> Bool {
+        diarizationStatus == .dropped
+    }
+
     func completed() -> StreamingSpeechAnalysisEvent {
         let transcript = finalTranscript ?? latestTranscriptSnapshot?.transcript
-        let diarization = latestDiarizationSnapshot?.diarization
+        let diarization = diarizationStatus == .dropped ? nil : latestDiarizationSnapshot?.diarization
         let attributed = speakerAttributedTranscript(transcript: transcript, diarization: diarization)
-        let diagnostics = (diarization?.diagnostics ?? []) + (attributed?.diagnostics ?? [])
+        let diagnostics = diagnostics + (diarization?.diagnostics ?? []) + (attributed?.diagnostics ?? [])
 
         return .completed(SpeechAnalysisResult(
             transcript: transcript,
             diarization: diarization,
             speakerAttributedTranscript: attributed?.transcript,
-            diagnostics: diagnostics
+            diagnostics: diagnostics,
+            diarizationStatus: diarizationStatus
         ))
     }
 
@@ -1007,16 +1020,23 @@ private actor StreamingSpeechAnalysisState {
             return transcript
         }
         let previousSegmentsByID = Dictionary(uniqueKeysWithValues: previousStable.segments.map { ($0.id, $0) })
-        let segments = transcript.segments.map { segment in
-            guard let previous = previousSegmentsByID[segment.id],
-                  TranscriptSegmentFingerprint(segment: previous) == TranscriptSegmentFingerprint(segment: segment)
-            else {
-                return segmentByRestoringOverlappingSpeakerAttribution(
+        var restorationIndex: SpeakerAttributionRestorationIndex?
+        var segments: [TranscriptSegment] = []
+        segments.reserveCapacity(transcript.segments.count)
+
+        for segment in transcript.segments {
+            if let previous = previousSegmentsByID[segment.id],
+               TranscriptSegmentFingerprint(segment: previous) == TranscriptSegmentFingerprint(segment: segment) {
+                segments.append(segmentByRestoringSpeakerAttribution(segment, from: previous))
+            } else {
+                if restorationIndex == nil {
+                    restorationIndex = SpeakerAttributionRestorationIndex(previousSegments: previousStable.segments)
+                }
+                segments.append(segmentByRestoringOverlappingSpeakerAttribution(
                     segment,
-                    from: previousStable.segments
-                )
+                    using: restorationIndex ?? SpeakerAttributionRestorationIndex(previousSegments: [])
+                ))
             }
-            return segmentByRestoringSpeakerAttribution(segment, from: previous)
         }
         return Transcript(
             segments: segments,
@@ -1048,57 +1068,304 @@ private actor StreamingSpeechAnalysisState {
 
     private func segmentByRestoringOverlappingSpeakerAttribution(
         _ segment: TranscriptSegment,
-        from previousSegments: [TranscriptSegment]
+        using restorationIndex: SpeakerAttributionRestorationIndex
     ) -> TranscriptSegment {
         guard !hasSpeakerAttribution(segment) else { return segment }
-        let attributedPreviousSegments = previousSegments.filter(hasSpeakerAttribution)
-        guard let bestSegment = bestOverlappingSegment(for: segment, in: attributedPreviousSegments) else {
-            return segment
-        }
+        guard !restorationIndex.isEmpty else { return segment }
 
         var restored = segment
+        let segmentSpeaker = restorationIndex.bestSpeaker(for: segment)
         if !restored.words.isEmpty {
             restored.words = restored.words.map { word in
                 var restoredWord = word
-                restoredWord.speaker = bestOverlappingWordSpeaker(
-                    for: word,
-                    in: attributedPreviousSegments
-                ) ?? bestSegment.speaker ?? dominantSpeaker(in: bestSegment.words)
+                restoredWord.speaker = restorationIndex.bestSpeaker(for: word) ?? segmentSpeaker
                 return restoredWord
             }
         }
-        restored.speaker = bestSegment.speaker
-            ?? dominantSpeaker(in: restored.words)
-            ?? dominantSpeaker(in: bestSegment.words)
+        restored.speaker = dominantSpeaker(in: restored.words)
+            ?? segmentSpeaker
         return restored
     }
 
-    private func bestOverlappingSegment(
-        for segment: TranscriptSegment,
-        in previousSegments: [TranscriptSegment]
-    ) -> TranscriptSegment? {
-        previousSegments
-            .map { previous in
-                (previous, max(0, min(segment.endTime, previous.endTime) - max(segment.startTime, previous.startTime)))
-            }
-            .filter { $0.1 > 0 }
-            .max { lhs, rhs in lhs.1 < rhs.1 }?
-            .0
-    }
+    private struct SpeakerAttributionRestorationIndex: Sendable {
+        private static let bucketWidth: TimeInterval = 5
+        private static let minimumOverlapDuration: TimeInterval = 0.02
+        private static let minimumWordCoverage = 0.45
+        private static let minimumSegmentCoverage = 0.45
+        private static let ambiguityRatio = 0.85
 
-    private func bestOverlappingWordSpeaker(
-        for word: TranscriptWord,
-        in previousSegments: [TranscriptSegment]
-    ) -> SpeakerID? {
-        previousSegments
-            .flatMap(\.words)
-            .compactMap { previousWord -> (SpeakerID, TimeInterval)? in
-                guard let speaker = previousWord.speaker else { return nil }
-                let overlap = max(0, min(word.endTime, previousWord.endTime) - max(word.startTime, previousWord.startTime))
-                return overlap > 0 ? (speaker, overlap) : nil
+        private var segmentReferences: [SegmentReference] = []
+        private var wordReferences: [WordReference] = []
+        private var segmentBuckets: [Int: [Int]] = [:]
+        private var wordBuckets: [Int: [Int]] = [:]
+
+        init(previousSegments: [TranscriptSegment]) {
+            for segment in previousSegments where Self.hasSpeakerAttribution(segment) {
+                if let speaker = segment.speaker ?? Self.dominantSpeaker(in: segment.words) {
+                    let reference = SegmentReference(
+                        speaker: speaker,
+                        startTime: segment.startTime,
+                        endTime: segment.endTime
+                    )
+                    let index = segmentReferences.count
+                    segmentReferences.append(reference)
+                    Self.insert(
+                        index: index,
+                        startTime: reference.startTime,
+                        endTime: reference.endTime,
+                        into: &segmentBuckets
+                    )
+                }
+
+                for word in segment.words {
+                    guard let speaker = word.speaker else { continue }
+                    let reference = WordReference(
+                        speaker: speaker,
+                        startTime: word.startTime,
+                        endTime: word.endTime
+                    )
+                    let index = wordReferences.count
+                    wordReferences.append(reference)
+                    Self.insert(
+                        index: index,
+                        startTime: reference.startTime,
+                        endTime: reference.endTime,
+                        into: &wordBuckets
+                    )
+                }
             }
-            .max { lhs, rhs in lhs.1 < rhs.1 }?
-            .0
+        }
+
+        var isEmpty: Bool {
+            segmentReferences.isEmpty && wordReferences.isEmpty
+        }
+
+        func bestSpeaker(for segment: TranscriptSegment) -> SpeakerID? {
+            let candidates = segmentCandidateReferences(startTime: segment.startTime, endTime: segment.endTime)
+            guard !candidates.isEmpty else { return nil }
+
+            var bestBySpeaker: [SpeakerID: SpeakerScore] = [:]
+            for candidate in candidates {
+                guard let metrics = overlapMetrics(
+                    currentStart: segment.startTime,
+                    currentEnd: segment.endTime,
+                    previousStart: candidate.startTime,
+                    previousEnd: candidate.endTime
+                ) else {
+                    continue
+                }
+                guard metrics.currentCoverage >= Self.minimumSegmentCoverage else { continue }
+                let score = SpeakerScore(
+                    speaker: candidate.speaker,
+                    score: metrics.currentCoverage * 0.7 + min(metrics.previousCoverage, 1) * 0.3,
+                    overlap: metrics.overlap,
+                    previousCoverage: metrics.previousCoverage
+                )
+                if let existing = bestBySpeaker[candidate.speaker],
+                   existing.score > score.score {
+                    continue
+                }
+                bestBySpeaker[candidate.speaker] = score
+            }
+
+            var scores = Array(bestBySpeaker.values)
+            if scores.count > 1 {
+                scores.removeAll { $0.previousCoverage < 0.10 && $0.overlap < 0.5 }
+            }
+            return unambiguousSpeaker(from: scores)
+        }
+
+        func bestSpeaker(for word: TranscriptWord) -> SpeakerID? {
+            let candidates = wordCandidateReferences(startTime: word.startTime, endTime: word.endTime)
+            guard !candidates.isEmpty else { return nil }
+
+            var overlapBySpeaker: [SpeakerID: TimeInterval] = [:]
+            for candidate in candidates {
+                let overlap = Self.intervalOverlap(
+                    start: word.startTime,
+                    end: word.endTime,
+                    otherStart: candidate.startTime,
+                    otherEnd: candidate.endTime
+                )
+                guard overlap > 0 else { continue }
+                overlapBySpeaker[candidate.speaker, default: 0] += overlap
+            }
+
+            let duration = max(word.endTime - word.startTime, .ulpOfOne)
+            let scores = overlapBySpeaker.map { speaker, overlap in
+                SpeakerScore(
+                    speaker: speaker,
+                    score: overlap / duration,
+                    overlap: overlap,
+                    previousCoverage: 1
+                )
+            }.filter { score in
+                score.score >= Self.minimumWordCoverage
+                    && score.overlap >= min(Self.minimumOverlapDuration, duration * Self.minimumWordCoverage)
+            }
+
+            return unambiguousSpeaker(from: scores)
+        }
+
+        private static func insert(
+            index: Int,
+            startTime: TimeInterval,
+            endTime: TimeInterval,
+            into buckets: inout [Int: [Int]]
+        ) {
+            for bucket in Self.bucketRange(startTime: startTime, endTime: endTime) {
+                buckets[bucket, default: []].append(index)
+            }
+        }
+
+        private func segmentCandidateReferences(
+            startTime: TimeInterval,
+            endTime: TimeInterval
+        ) -> [SegmentReference] {
+            candidateIndices(startTime: startTime, endTime: endTime, buckets: segmentBuckets).compactMap { index in
+                guard segmentReferences.indices.contains(index) else { return nil }
+                let reference = segmentReferences[index]
+                return Self.intervalsOverlap(
+                    start: startTime,
+                    end: endTime,
+                    otherStart: reference.startTime,
+                    otherEnd: reference.endTime
+                ) ? reference : nil
+            }
+        }
+
+        private func wordCandidateReferences(
+            startTime: TimeInterval,
+            endTime: TimeInterval
+        ) -> [WordReference] {
+            candidateIndices(startTime: startTime, endTime: endTime, buckets: wordBuckets).compactMap { index in
+                guard wordReferences.indices.contains(index) else { return nil }
+                let reference = wordReferences[index]
+                return Self.intervalsOverlap(
+                    start: startTime,
+                    end: endTime,
+                    otherStart: reference.startTime,
+                    otherEnd: reference.endTime
+                ) ? reference : nil
+            }
+        }
+
+        private func candidateIndices(
+            startTime: TimeInterval,
+            endTime: TimeInterval,
+            buckets: [Int: [Int]]
+        ) -> [Int] {
+            var seen = Set<Int>()
+            var output: [Int] = []
+            for bucket in Self.bucketRange(startTime: startTime, endTime: endTime) {
+                for index in buckets[bucket] ?? [] where seen.insert(index).inserted {
+                    output.append(index)
+                }
+            }
+            return output
+        }
+
+        private func overlapMetrics(
+            currentStart: TimeInterval,
+            currentEnd: TimeInterval,
+            previousStart: TimeInterval,
+            previousEnd: TimeInterval
+        ) -> OverlapMetrics? {
+            let overlap = Self.intervalOverlap(
+                start: currentStart,
+                end: currentEnd,
+                otherStart: previousStart,
+                otherEnd: previousEnd
+            )
+            guard overlap > 0 else { return nil }
+
+            let currentDuration = max(currentEnd - currentStart, .ulpOfOne)
+            let previousDuration = max(previousEnd - previousStart, .ulpOfOne)
+            return OverlapMetrics(
+                overlap: overlap,
+                currentCoverage: overlap / currentDuration,
+                previousCoverage: overlap / previousDuration
+            )
+        }
+
+        private func unambiguousSpeaker(from scores: [SpeakerScore]) -> SpeakerID? {
+            let sorted = scores.sorted {
+                if $0.score == $1.score {
+                    return $0.overlap > $1.overlap
+                }
+                return $0.score > $1.score
+            }
+            guard let best = sorted.first else { return nil }
+            if let competitor = sorted.dropFirst().first(where: { $0.speaker != best.speaker }),
+               competitor.score >= best.score * Self.ambiguityRatio {
+                return nil
+            }
+            return best.speaker
+        }
+
+        private static func bucketRange(startTime: TimeInterval, endTime: TimeInterval) -> ClosedRange<Int> {
+            let start = min(startTime, endTime)
+            let end = max(startTime, endTime)
+            let first = Int(floor(start / bucketWidth))
+            let adjustedEnd = end == start ? end : max(start, end - .ulpOfOne)
+            let last = max(first, Int(floor(adjustedEnd / bucketWidth)))
+            return first...last
+        }
+
+        private static func intervalsOverlap(
+            start: TimeInterval,
+            end: TimeInterval,
+            otherStart: TimeInterval,
+            otherEnd: TimeInterval
+        ) -> Bool {
+            start < otherEnd && otherStart < end
+        }
+
+        private static func intervalOverlap(
+            start: TimeInterval,
+            end: TimeInterval,
+            otherStart: TimeInterval,
+            otherEnd: TimeInterval
+        ) -> TimeInterval {
+            max(0, min(end, otherEnd) - max(start, otherStart))
+        }
+
+        private static func hasSpeakerAttribution(_ segment: TranscriptSegment) -> Bool {
+            segment.speaker != nil || segment.words.contains { $0.speaker != nil }
+        }
+
+        private static func dominantSpeaker(in words: [TranscriptWord]) -> SpeakerID? {
+            let durationsBySpeaker = words.reduce(into: [SpeakerID: TimeInterval]()) { durations, word in
+                guard let speaker = word.speaker else { return }
+                durations[speaker, default: 0] += max(0, word.endTime - word.startTime)
+            }
+            return durationsBySpeaker.max { lhs, rhs in lhs.value < rhs.value }?.key
+        }
+
+        private struct SegmentReference: Sendable {
+            var speaker: SpeakerID
+            var startTime: TimeInterval
+            var endTime: TimeInterval
+        }
+
+        private struct WordReference: Sendable {
+            var speaker: SpeakerID
+            var startTime: TimeInterval
+            var endTime: TimeInterval
+        }
+
+        private struct OverlapMetrics: Sendable {
+            var overlap: TimeInterval
+            var currentCoverage: Double
+            var previousCoverage: Double
+        }
+
+        private struct SpeakerScore: Sendable {
+            var speaker: SpeakerID
+            var score: Double
+            var overlap: TimeInterval
+            var previousCoverage: Double
+        }
     }
 
     private func dominantSpeaker(in words: [TranscriptWord]) -> SpeakerID? {

@@ -1,14 +1,25 @@
 import Foundation
 
+public enum SpeechDiagnosticCode: String, Codable, Hashable, Sendable {
+    case diarizationDropped
+}
+
 public struct SpeechDiagnostic: Codable, Hashable, Sendable {
     public var source: String
     public var message: String
     public var time: TimeInterval?
+    public var code: SpeechDiagnosticCode?
 
-    public init(source: String, message: String, time: TimeInterval? = nil) {
+    public init(
+        source: String,
+        message: String,
+        time: TimeInterval? = nil,
+        code: SpeechDiagnosticCode? = nil
+    ) {
         self.source = source
         self.message = message
         self.time = time
+        self.code = code
     }
 }
 
@@ -325,22 +336,63 @@ public enum SpeechAnalysisError: Error, LocalizedError, Sendable {
     }
 }
 
+public enum SpeechAnalysisDiarizationStatus: String, Codable, Hashable, Sendable {
+    case notRequested
+    case completed
+    case dropped
+}
+
 public struct SpeechAnalysisResult: Codable, Hashable, Sendable {
     public var transcript: Transcript?
     public var diarization: DiarizationResult?
     public var speakerAttributedTranscript: Transcript?
     public var diagnostics: [SpeechDiagnostic]
+    public var diarizationStatus: SpeechAnalysisDiarizationStatus
 
     public init(
         transcript: Transcript? = nil,
         diarization: DiarizationResult? = nil,
         speakerAttributedTranscript: Transcript? = nil,
-        diagnostics: [SpeechDiagnostic] = []
+        diagnostics: [SpeechDiagnostic] = [],
+        diarizationStatus: SpeechAnalysisDiarizationStatus = .notRequested
     ) {
         self.transcript = transcript
         self.diarization = diarization
         self.speakerAttributedTranscript = speakerAttributedTranscript
         self.diagnostics = diagnostics
+        self.diarizationStatus = diarizationStatus
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case transcript
+        case diarization
+        case speakerAttributedTranscript
+        case diagnostics
+        case diarizationStatus
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        transcript = try container.decodeIfPresent(Transcript.self, forKey: .transcript)
+        diarization = try container.decodeIfPresent(DiarizationResult.self, forKey: .diarization)
+        speakerAttributedTranscript = try container.decodeIfPresent(
+            Transcript.self,
+            forKey: .speakerAttributedTranscript
+        )
+        diagnostics = try container.decodeIfPresent([SpeechDiagnostic].self, forKey: .diagnostics) ?? []
+        diarizationStatus = try container.decodeIfPresent(
+            SpeechAnalysisDiarizationStatus.self,
+            forKey: .diarizationStatus
+        ) ?? (diarization == nil ? .notRequested : .completed)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(transcript, forKey: .transcript)
+        try container.encodeIfPresent(diarization, forKey: .diarization)
+        try container.encodeIfPresent(speakerAttributedTranscript, forKey: .speakerAttributedTranscript)
+        try container.encode(diagnostics, forKey: .diagnostics)
+        try container.encode(diarizationStatus, forKey: .diarizationStatus)
     }
 }
 

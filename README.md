@@ -361,7 +361,14 @@ let events = analyzer.stream(
 )
 
 for try await event in events {
-    // Handle transcription, diarization, speaker-attributed snapshots, and final analysis.
+    if case .transcription(.diagnostic(let diagnostic)) = event,
+       diagnostic.code == .diarizationDropped {
+        // Show a non-fatal warning while transcription continues.
+    }
+    if case .completed(let result) = event,
+       result.diarizationStatus == .dropped {
+        // The transcript is complete, but diarization was shut down before the end.
+    }
 }
 
 try await diarizer.unloadModels()
@@ -369,7 +376,7 @@ try await diarizer.unloadModels()
 
 For live attribution, keep `attributionCacheRetentionWindow` comfortably larger than the ASR revision horizon. A practical default is at least 3x the transcriber's rolling context window, and 10 minutes is a reasonable floor for long meetings. Setting it near zero minimizes memory but can only recover historic ASR revisions from the already-emitted stable transcript snapshot.
 
-Use `backlogPolicy: .fatal` when complete diarization is required. Use `.dropDiarization` for meeting capture UIs where transcription should continue if Core ML diarization falls behind during a CPU or ANE spike.
+Use `backlogPolicy: .fatal` when complete diarization is required. Use `.dropDiarization` for meeting capture UIs where transcription should continue if Core ML diarization falls behind during a CPU or ANE spike. Soft drops are exposed structurally through `SpeechDiagnostic.code == .diarizationDropped` during streaming and `SpeechAnalysisResult.diarizationStatus == .dropped` at completion.
 
 ## Requirements
 
