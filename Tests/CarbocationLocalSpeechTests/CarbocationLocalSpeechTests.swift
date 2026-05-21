@@ -43,8 +43,29 @@ final class CarbocationLocalSpeechTests: XCTestCase {
     }
 
     func testAudioCaptureConfigurationDefaultsToManagingApplicationAudioSession() {
-        XCTAssertTrue(AudioCaptureConfiguration().configuresApplicationAudioSession)
+        let configuration = AudioCaptureConfiguration()
+        XCTAssertTrue(configuration.configuresApplicationAudioSession)
+        XCTAssertTrue(configuration.resilience.isEnabled)
+        XCTAssertEqual(configuration.resilience.retainedBufferDuration, 2.0)
+        XCTAssertEqual(configuration.resilience.maximumConsecutiveRecoveryAttempts, 5)
         XCTAssertFalse(AudioCaptureConfiguration(configuresApplicationAudioSession: false).configuresApplicationAudioSession)
+    }
+
+    func testAudioCaptureResilienceConfigurationNormalizesUnsafeValues() {
+        let configuration = AudioCaptureResilienceConfiguration(
+            retainedBufferDuration: -1,
+            maximumConsecutiveRecoveryAttempts: 0,
+            recoveryDebounceDuration: 1.0,
+            initialRecoveryDelay: -1,
+            maximumRecoveryDelay: 0
+        )
+
+        XCTAssertEqual(configuration.retainedBufferDuration, 0.1)
+        XCTAssertEqual(configuration.maximumConsecutiveRecoveryAttempts, 1)
+        XCTAssertEqual(configuration.recoveryDebounceDuration, 0.1)
+        XCTAssertEqual(configuration.initialRecoveryDelay, 0.01)
+        XCTAssertEqual(configuration.maximumRecoveryDelay, 0.01)
+        XCTAssertEqual(configuration.retryDelay(afterFailedAttempt: 1), 0.01)
     }
 
     func testSpeechModelStorageUsesSharedGroupWhenAvailable() throws {
@@ -462,6 +483,30 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(prepared.samples[2], 0.0, accuracy: 0.000_1)
         XCTAssertEqual(prepared.samples[3], -0.3, accuracy: 0.000_1)
         XCTAssertEqual(prepared.duration, Double(4) / 48_000, accuracy: 0.000_1)
+    }
+
+    func testAudioResamplerPreservesCaptureRecoveryMetadata() throws {
+        let recoveryEvent = AudioCaptureRecoveryEvent(
+            reason: .routeChanged,
+            attemptCount: 2,
+            unavailableDuration: 3.0,
+            message: "recovered"
+        )
+        let chunk = AudioChunk(
+            samples: [0.1, 0.3, -0.1, -0.3],
+            sampleRate: 8_000,
+            channelCount: 2,
+            startTime: 4.0,
+            duration: 0.000_25,
+            recoveryEvent: recoveryEvent
+        )
+
+        let resampled = try AudioResampler16kMono().prepareChunk(chunk)
+
+        XCTAssertEqual(resampled.sampleRate, 16_000, accuracy: 0.000_1)
+        XCTAssertEqual(resampled.channelCount, 1)
+        XCTAssertEqual(resampled.startTime, 4.0, accuracy: 0.000_1)
+        XCTAssertEqual(resampled.recoveryEvent, recoveryEvent)
     }
 
     func testCAFRecorderWritesMonoFloat32Samples() async throws {
@@ -1784,6 +1829,70 @@ final class CarbocationLocalSpeechTests: XCTestCase {
             }
             return false
         })
+    }
+
+    func testSpeechChunkStreamingPipelineReportsCaptureRecoveryAndResetsVAD() async throws {
+        let recoveryEvent = AudioCaptureRecoveryEvent(
+            reason: .routeChanged,
+            attemptCount: 2,
+            unavailableDuration: 3.0,
+            message: "recovered"
+        )
+        let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 1_600),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 0,
+                duration: 0.1
+            ))
+            continuation.yield(AudioChunk(
+                samples: Array(repeating: 0.05, count: 1_600),
+                sampleRate: 16_000,
+                channelCount: 1,
+                startTime: 3.1,
+                duration: 0.1,
+                recoveryEvent: recoveryEvent
+            ))
+            continuation.finish()
+        }
+        let backend = SpeechBackendDescriptor(kind: .mock, displayName: "Mock")
+        let options = StreamingTranscriptionOptions(
+            transcription: TranscriptionOptions(useCase: .dictation),
+            commitment: .providerFinals,
+            strategy: .balanced,
+            implementation: .emulated,
+            emulation: EmulatedStreamingOptions(
+                window: .rollingBuffer(maxDuration: 1.0, updateInterval: 0.05, overlap: 0)
+            )
+        )
+        let detector = SequenceVoiceActivityDetector(states: [.speech, .speech])
+
+        var events: [TranscriptEvent] = []
+        let stream = SpeechChunkStreamingPipeline.stream(
+            audio: audio,
+            backend: backend,
+            options: options,
+            transcribeTimed: { chunk, _ in
+                Transcript(segments: [
+                    TranscriptSegment(text: "chunk", startTime: 0, endTime: chunk.audio.duration)
+                ])
+            },
+            voiceActivityDetector: detector
+        )
+
+        for try await event in stream {
+            events.append(event)
+        }
+
+        XCTAssertTrue(events.contains { event in
+            guard case .diagnostic(let diagnostic) = event else { return false }
+            return diagnostic.source == "audio.capture"
+                && diagnostic.message.contains("recovery=routeChanged")
+                && diagnostic.message.contains("attempt=2")
+                && diagnostic.message.contains("unavailable=3.000s")
+        })
+        XCTAssertGreaterThanOrEqual(detector.resetCallCount(), 1)
     }
 
     func testSpeechChunkStreamingPipelineCoalescesContextualNonFinalJobs() async throws {
@@ -4614,10 +4723,11 @@ private actor TranscriptionPromptRecorder {
     }
 }
 
-private final class SequenceVoiceActivityDetector: VoiceActivityDetecting, @unchecked Sendable {
+private final class SequenceVoiceActivityDetector: VoiceActivityDetecting, VoiceActivityDetectionStateResetting, @unchecked Sendable {
     private let lock = NSLock()
     private var states: [VoiceActivityState]
     private var index = 0
+    private var resetCount = 0
 
     init(states: [VoiceActivityState]) {
         self.states = states
@@ -4635,5 +4745,17 @@ private final class SequenceVoiceActivityDetector: VoiceActivityDetecting, @unch
             endTime: chunk.startTime + chunk.duration,
             confidence: state == .speech ? 1 : 0
         )
+    }
+
+    func resetVoiceActivityState() {
+        lock.lock()
+        resetCount += 1
+        lock.unlock()
+    }
+
+    func resetCallCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return resetCount
     }
 }

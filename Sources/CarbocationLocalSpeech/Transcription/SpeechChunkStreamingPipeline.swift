@@ -110,6 +110,22 @@ import Foundation
                         for try await chunk in audio {
                             try Task.checkCancellation()
 
+                            if chunk.recoveryEvent != nil {
+                                for emitted in chunker.finish() {
+                                    try await process(
+                                        emitted,
+                                        backend: backend,
+                                        options: options,
+                                        transcribe: transcribe,
+                                        committedSegments: &committedSegments,
+                                        agreementState: &agreementState,
+                                        continuation: continuation
+                                    )
+                                    resetVoiceActivityStateIfNeeded(detector, after: emitted)
+                                }
+                                chunker = SpeechChunker(configuration: configuration)
+                                reportAudioCaptureRecoveryIfNeeded(for: chunk, detector: detector, continuation: continuation)
+                            }
                             continuation.yield(.audioLevel(AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)))
                             let activity = try voiceActivity(for: chunk, detector: detector, continuation: continuation)
 
@@ -148,6 +164,26 @@ import Foundation
                         for try await chunk in audio {
                             try Task.checkCancellation()
 
+                            if chunk.recoveryEvent != nil {
+                                for emitted in window.finish() {
+                                    try await process(
+                                        emitted,
+                                        backend: backend,
+                                        options: options,
+                                        transcribe: transcribe,
+                                        committedSegments: &committedSegments,
+                                        agreementState: &agreementState,
+                                        continuation: continuation
+                                    )
+                                    resetVoiceActivityStateIfNeeded(detector, after: emitted)
+                                }
+                                window = SpeechRollingWindow(
+                                    maximumBufferDuration: maxDuration,
+                                    updateInterval: updateInterval,
+                                    overlapDuration: overlap
+                                )
+                                reportAudioCaptureRecoveryIfNeeded(for: chunk, detector: detector, continuation: continuation)
+                            }
                             continuation.yield(.audioLevel(AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)))
                             try reportVoiceActivityIfNeeded(for: chunk, detector: detector, continuation: continuation)
 
@@ -267,6 +303,34 @@ import Foundation
         return activity
     }
 
+    private static func reportAudioCaptureRecoveryIfNeeded(
+        for chunk: AudioChunk,
+        detector: VoiceActivityDetecting?,
+        continuation: AsyncThrowingStream<TranscriptEvent, Error>.Continuation
+    ) {
+        guard let event = chunk.recoveryEvent else { return }
+        (detector as? VoiceActivityDetectionStateResetting)?.resetVoiceActivityState()
+        continuation.yield(.diagnostic(TranscriptionDiagnostic(
+            source: "audio.capture",
+            message: audioCaptureRecoveryDiagnosticMessage(for: event),
+            time: chunk.startTime
+        )))
+    }
+
+    private static func audioCaptureRecoveryDiagnosticMessage(for event: AudioCaptureRecoveryEvent) -> String {
+        var fields = [
+            "recovery=\(event.reason.rawValue)",
+            "attempt=\(event.attemptCount)"
+        ]
+        if let unavailableDuration = event.unavailableDuration {
+            fields.append("unavailable=\(unavailableDuration.formattedStreamingDebug)s")
+        }
+        if let message = event.message, !message.isEmpty {
+            fields.append("message=\(message)")
+        }
+        return fields.joined(separator: " ")
+    }
+
     private static func resetVoiceActivityStateIfNeeded(
         _ detector: VoiceActivityDetecting?,
         after emitted: SpeechAudioChunk
@@ -348,6 +412,25 @@ import Foundation
             for try await chunk in audio {
                 try Task.checkCancellation()
 
+                if chunk.recoveryEvent != nil {
+                    for emitted in window.finish() {
+                        let queued = chunkWithFrontierIdle(
+                            emitted,
+                            usesNoVAD: usesNoVAD,
+                            duration: frontierLowEnergyDuration
+                        )
+                        await queue.enqueue(queued)
+                        resetVoiceActivityStateIfNeeded(detector, after: queued)
+                    }
+                    window = SpeechContextualRollingWindow(
+                        maximumBufferDuration: maximumBufferDuration,
+                        updateInterval: updateInterval,
+                        finalSilenceDelay: finalSilenceDelay,
+                        voiceActivityMode: .leadingSilence
+                    )
+                    frontierLowEnergyDuration = 0
+                    reportAudioCaptureRecoveryIfNeeded(for: chunk, detector: detector, continuation: continuation)
+                }
                 let level = AudioLevelMeter.measure(samples: chunk.samples, time: chunk.startTime)
                 continuation.yield(.audioLevel(level))
                 if usesNoVAD, isLowEnergyFrontier(level) {
