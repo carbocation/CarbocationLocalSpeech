@@ -68,6 +68,29 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(configuration.retryDelay(afterFailedAttempt: 1), 0.01)
     }
 
+    func testStreamingDiarizationSnapshotFiltersUnreferencedVolatileSpeakers() {
+        let stableSpeaker = SpeakerID(rawValue: "stable")
+        let volatileSpeaker = SpeakerID(rawValue: "volatile")
+        let artifactSpeaker = SpeakerID(rawValue: "artifact")
+        let snapshot = StreamingDiarizationSnapshot(
+            stable: DiarizationResult(
+                turns: [SpeakerTurn(speaker: stableSpeaker, startTime: 0, endTime: 0.5)],
+                speakers: [Speaker(id: stableSpeaker)],
+                duration: 0.5
+            ),
+            volatile: DiarizationResult(
+                turns: [SpeakerTurn(speaker: volatileSpeaker, startTime: 0.5, endTime: 1.0)],
+                speakers: [
+                    Speaker(id: volatileSpeaker),
+                    Speaker(id: artifactSpeaker)
+                ],
+                duration: 1.0
+            )
+        )
+
+        XCTAssertEqual(snapshot.diarization.speakers.map(\.id), [stableSpeaker, volatileSpeaker])
+    }
+
     func testSpeechModelStorageUsesSharedGroupWhenAvailable() throws {
         let groupRoot = try makeTemporaryDirectory()
         var requestedIdentifier: String?

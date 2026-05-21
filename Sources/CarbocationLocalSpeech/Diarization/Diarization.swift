@@ -83,6 +83,74 @@ public struct DiarizationResult: Codable, Hashable, Sendable {
     }
 }
 
+public extension DiarizationResult {
+    static let empty = DiarizationResult(turns: [], speakers: [], duration: 0)
+}
+
+public enum StreamingDiarizationBackend: String, Codable, Hashable, Sendable {
+    case automatic
+    case sortformer
+    case lsEEND
+}
+
+public struct StreamingDiarizationOptions: Codable, Hashable, Sendable {
+    public var options: DiarizationOptions
+    public var backend: StreamingDiarizationBackend
+    public var emitsTentativeTurns: Bool
+
+    public init(
+        options: DiarizationOptions = DiarizationOptions(),
+        backend: StreamingDiarizationBackend = .automatic,
+        emitsTentativeTurns: Bool = true
+    ) {
+        self.options = options
+        self.backend = backend
+        self.emitsTentativeTurns = emitsTentativeTurns
+    }
+}
+
+public struct StreamingDiarizationSnapshot: Codable, Hashable, Sendable {
+    public var stable: DiarizationResult
+    public var volatile: DiarizationResult?
+    public var volatileRange: TranscriptTimeRange?
+
+    public init(
+        stable: DiarizationResult = .empty,
+        volatile: DiarizationResult? = nil,
+        volatileRange: TranscriptTimeRange? = nil
+    ) {
+        self.stable = stable
+        self.volatile = volatile
+        self.volatileRange = volatileRange
+    }
+
+    public var diarization: DiarizationResult {
+        guard let volatile, !volatile.turns.isEmpty else {
+            return stable
+        }
+
+        let combinedTurns = stable.turns + volatile.turns
+        let combinedExclusiveTurns = stable.exclusiveTurns + volatile.exclusiveTurns
+        let referencedSpeakerIDs = (combinedTurns + combinedExclusiveTurns).reduce(into: [SpeakerID]()) { ids, turn in
+            guard !ids.contains(turn.speaker) else { return }
+            ids.append(turn.speaker)
+        }
+        let availableSpeakers = stable.speakers + volatile.speakers
+        let speakers = referencedSpeakerIDs.map { speakerID in
+            availableSpeakers.first { $0.id == speakerID } ?? Speaker(id: speakerID)
+        }
+
+        return DiarizationResult(
+            turns: combinedTurns,
+            exclusiveTurns: combinedExclusiveTurns,
+            speakers: speakers,
+            duration: max(stable.duration, volatile.duration),
+            backend: stable.backend ?? volatile.backend,
+            diagnostics: stable.diagnostics + volatile.diagnostics
+        )
+    }
+}
+
 public enum DiarizationValidationError: Error, LocalizedError, Sendable {
     case invalidValue(String)
     case conflictingBounds(String)
@@ -163,6 +231,17 @@ public protocol SpeakerDiarizer: Sendable {
     func diarize(audio: PreparedAudio, options: DiarizationOptions) async throws -> DiarizationResult
 }
 
+public protocol StreamingSpeakerDiarizer: Sendable {
+    func stream(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        options: StreamingDiarizationOptions
+    ) -> AsyncThrowingStream<StreamingDiarizationSnapshot, Error>
+}
+
+public protocol DiarizationModelLifecycle: Sendable {
+    func unloadModels() async throws
+}
+
 public extension SpeakerDiarizer {
     func diarize(file url: URL, options: DiarizationOptions) async throws -> DiarizationResult {
         let audio = try await AudioResampler16kMono().prepareFile(at: url)
@@ -213,5 +292,55 @@ public struct MockSpeakerDiarizer: SpeakerDiarizer {
         _ = audio
         try options.validate()
         return result
+    }
+}
+
+public struct MockStreamingSpeakerDiarizer: StreamingSpeakerDiarizer {
+    public var snapshots: [StreamingDiarizationSnapshot]
+
+    public init(snapshots: [StreamingDiarizationSnapshot]) {
+        self.snapshots = snapshots
+    }
+
+    public init(turns: [SpeakerTurn], duration: TimeInterval? = nil) {
+        let orderedSpeakerIDs = turns.reduce(into: [SpeakerID]()) { ids, turn in
+            guard !ids.contains(turn.speaker) else { return }
+            ids.append(turn.speaker)
+        }
+        let speakers = orderedSpeakerIDs.map { Speaker(id: $0) }
+        self.snapshots = [
+            StreamingDiarizationSnapshot(stable: DiarizationResult(
+                turns: turns,
+                exclusiveTurns: turns.filter(\.isExclusive),
+                speakers: speakers,
+                duration: duration ?? turns.map(\.endTime).max() ?? 0
+            ))
+        ]
+    }
+
+    public func stream(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        options: StreamingDiarizationOptions
+    ) -> AsyncThrowingStream<StreamingDiarizationSnapshot, Error> {
+        let snapshots = snapshots
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try options.options.validate()
+                    for try await _ in audio {
+                        try Task.checkCancellation()
+                    }
+                    for snapshot in snapshots {
+                        continuation.yield(snapshot)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
     }
 }

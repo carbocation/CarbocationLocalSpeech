@@ -90,6 +90,7 @@ public actor LocalSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
     private let appleSpeechEngine: AppleSpeechEngine
     private var loadedInfo: LocalSpeechLoadedModelInfo?
     private var registeredDiarizer: (any SpeakerDiarizer)?
+    private var registeredStreamingDiarizer: (any StreamingSpeakerDiarizer)?
 
     public init(
         whisperEngine: WhisperEngine = WhisperEngine(),
@@ -103,12 +104,24 @@ public actor LocalSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
         registeredDiarizer = diarizer
     }
 
+    public func registerStreamingDiarizer(_ diarizer: any StreamingSpeakerDiarizer) {
+        registeredStreamingDiarizer = diarizer
+    }
+
     public func activeDiarizer() -> (any SpeakerDiarizer)? {
         registeredDiarizer
     }
 
+    public func activeStreamingDiarizer() -> (any StreamingSpeakerDiarizer)? {
+        registeredStreamingDiarizer
+    }
+
     public func makeAnalyzer() -> LocalSpeechAnalyzer {
-        LocalSpeechAnalyzer(transcriber: self, diarizer: registeredDiarizer)
+        LocalSpeechAnalyzer(
+            transcriber: self,
+            diarizer: registeredDiarizer,
+            streamingDiarizer: registeredStreamingDiarizer
+        )
     }
 
     public nonisolated static func systemModelOptions(locale: Locale) async -> [SpeechSystemModelOption] {
@@ -232,6 +245,16 @@ public actor LocalSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
     public func unload() async {
         loadedInfo = nil
         await whisperEngine.unload()
+        try? await unloadDiarizers()
+    }
+
+    public func unloadDiarizers() async throws {
+        if let registeredDiarizer = registeredDiarizer as? any DiarizationModelLifecycle {
+            try await registeredDiarizer.unloadModels()
+        }
+        if let registeredStreamingDiarizer = registeredStreamingDiarizer as? any DiarizationModelLifecycle {
+            try await registeredStreamingDiarizer.unloadModels()
+        }
     }
 
     public func currentSelection() -> SpeechModelSelection? {

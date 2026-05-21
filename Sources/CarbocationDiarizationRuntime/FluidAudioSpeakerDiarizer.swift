@@ -5,12 +5,24 @@ import Foundation
 
 public enum FluidAudioSpeakerDiarizerError: Error, LocalizedError, Sendable {
     case modelAssetsMissing(String)
+    case modelDownloadFailed(String)
+    case lowDiskSpace(String)
+    case modelCompilationFailed(String)
+    case modelCompilationTimeout(String)
     case inferenceFailed(String)
 
     public var errorDescription: String? {
         switch self {
         case .modelAssetsMissing(let details):
             return "FluidAudio model assets missing: \(details)"
+        case .modelDownloadFailed(let details):
+            return "FluidAudio model download failed: \(details)"
+        case .lowDiskSpace(let details):
+            return "FluidAudio model installation failed because disk space is low: \(details)"
+        case .modelCompilationFailed(let details):
+            return "FluidAudio model compilation failed: \(details)"
+        case .modelCompilationTimeout(let details):
+            return "FluidAudio model compilation timed out: \(details)"
         case .inferenceFailed(let details):
             return "FluidAudio inference failed: \(details)"
         }
@@ -18,7 +30,8 @@ public enum FluidAudioSpeakerDiarizerError: Error, LocalizedError, Sendable {
 }
 
 @available(macOS 14.0, iOS 17.0, *)
-public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer {
+public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
+    CarbocationLocalSpeech.DiarizationModelLifecycle {
     private let modelsDirectory: URL?
     private let modelConfiguration: MLModelConfiguration?
     private let baseConfig: OfflineDiarizerConfig
@@ -34,14 +47,45 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer {
         self.modelConfiguration = modelConfiguration
     }
 
-    public func installModels() async throws {
+    public func installModels(
+        onProgress: @escaping @Sendable (FluidAudioModelInstallProgress) -> Void = { _ in }
+    ) async throws {
+        onProgress(FluidAudioModelInstallProgress(fractionCompleted: 0, phase: .starting(nil)))
         do {
             models = try await OfflineDiarizerModels.load(
                 from: modelsDirectory,
-                configuration: modelConfiguration
+                configuration: modelConfiguration,
+                progressHandler: { progress in
+                    onProgress(FluidAudioModelInstallDiagnostics.mapProgress(progress))
+                }
             )
+            onProgress(FluidAudioModelInstallProgress(fractionCompleted: 1, phase: .finished(nil)))
         } catch {
-            throw FluidAudioSpeakerDiarizerError.modelAssetsMissing(error.localizedDescription)
+            throw Self.installError(from: error)
+        }
+    }
+
+    public func unloadModels() async throws {
+        models = nil
+    }
+
+    internal nonisolated static func installError(from error: Error) -> FluidAudioSpeakerDiarizerError {
+        if let error = error as? FluidAudioSpeakerDiarizerError {
+            return error
+        }
+
+        let (kind, detail) = FluidAudioModelInstallDiagnostics.classify(error)
+        switch kind {
+        case .downloadFailed:
+            return .modelDownloadFailed(detail)
+        case .lowDiskSpace:
+            return .lowDiskSpace(detail)
+        case .compilationFailed:
+            return .modelCompilationFailed(detail)
+        case .compilationTimeout:
+            return .modelCompilationTimeout(detail)
+        case .modelAssetsMissing:
+            return .modelAssetsMissing(detail)
         }
     }
 

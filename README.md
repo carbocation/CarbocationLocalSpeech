@@ -327,6 +327,40 @@ audio file
   -> host-owned notes/export workflow
 ```
 
+Live meeting apps can stream transcription and diarization together through a `LocalSpeechAnalyzer`:
+
+```swift
+import CarbocationDiarizationRuntime
+import CarbocationLocalSpeech
+import CarbocationLocalSpeechRuntime
+
+let diarizer = FluidAudioStreamingSpeakerDiarizer()
+try await diarizer.installModels(backend: .sortformer) { progress in
+    // Surface download/compile progress in your UI.
+}
+await LocalSpeechEngine.shared.registerStreamingDiarizer(diarizer)
+
+let analyzer = await LocalSpeechEngine.shared.makeAnalyzer()
+let events = analyzer.stream(
+    audio: recordedAudio,
+    options: StreamingSpeechAnalysisOptions(
+        transcription: StreamingTranscriptionOptions(),
+        diarization: StreamingDiarizationRequest(
+            attributionLookbackWindow: 30,
+            attributionJitterBufferDelay: 0.75,
+            attributionCacheRetentionWindow: 600
+        ),
+        audioFanOutBufferLimit: 128
+    )
+)
+
+for try await event in events {
+    // Handle transcription, diarization, speaker-attributed snapshots, and final analysis.
+}
+
+try await diarizer.unloadModels()
+```
+
 ## Requirements
 
 **Build**
@@ -358,6 +392,7 @@ Apple Speech is exposed only when the SDK, OS, locale, permissions, and on-devic
 | --- | --- | --- |
 | `CarbocationLocalSpeech` | Core model library, provider selection, audio, transcript, streaming, VAD, diarization types. | App code imports core types directly, or you only need shared model storage. |
 | `CarbocationLocalSpeechRuntime` | Unified facade that routes selections to Whisper or Apple Speech. | Most apps. This is the entry point. |
+| `CarbocationDiarizationRuntime` | FluidAudio-backed offline and streaming speaker diarization. | You need speaker turns or live speaker attribution. |
 | `CarbocationLocalSpeechUI` | SwiftUI settings, provider picker, model picker, status, diagnostics. | You want the bundled UI surfaces. |
 | `CarbocationWhisperRuntime` | Lower-level whisper.cpp runtime. | You need provider-specific control the unified runtime does not expose. |
 | `CarbocationAppleSpeechRuntime` | Lower-level Apple Speech runtime. | Same as above, for Apple Speech. |

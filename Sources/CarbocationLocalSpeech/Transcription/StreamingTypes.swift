@@ -193,7 +193,7 @@ public struct StreamingTranscriptSnapshot: Hashable, Sendable {
     }
 }
 
-public struct TranscriptTimeRange: Hashable, Sendable {
+public struct TranscriptTimeRange: Codable, Hashable, Sendable {
     public var startTime: TimeInterval
     public var endTime: TimeInterval
 

@@ -201,6 +201,102 @@ public struct SpeechAnalysisOptions: Hashable, Sendable {
     }
 }
 
+public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
+    public var options: DiarizationOptions
+    public var backend: StreamingDiarizationBackend
+    public var emitsTentativeTurns: Bool
+    public var attributionPolicy: SpeakerAttributionPolicy
+    public var attributionLookbackWindow: TimeInterval
+    public var attributionJitterBufferDelay: TimeInterval
+    public var attributionCacheRetentionWindow: TimeInterval
+
+    public init(
+        options: DiarizationOptions = DiarizationOptions(),
+        backend: StreamingDiarizationBackend = .automatic,
+        emitsTentativeTurns: Bool = true,
+        attributionPolicy: SpeakerAttributionPolicy = .preferStandardWordLevel,
+        attributionLookbackWindow: TimeInterval = 30,
+        attributionJitterBufferDelay: TimeInterval = 0.75,
+        attributionCacheRetentionWindow: TimeInterval = 600
+    ) {
+        self.options = options
+        self.backend = backend
+        self.emitsTentativeTurns = emitsTentativeTurns
+        self.attributionPolicy = attributionPolicy
+        self.attributionLookbackWindow = attributionLookbackWindow
+        self.attributionJitterBufferDelay = attributionJitterBufferDelay
+        self.attributionCacheRetentionWindow = max(0, attributionCacheRetentionWindow)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case options
+        case backend
+        case emitsTentativeTurns
+        case attributionPolicy
+        case attributionLookbackWindow
+        case attributionJitterBufferDelay
+        case attributionCacheRetentionWindow
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        options = try container.decodeIfPresent(DiarizationOptions.self, forKey: .options) ?? DiarizationOptions()
+        backend = try container.decodeIfPresent(StreamingDiarizationBackend.self, forKey: .backend) ?? .automatic
+        emitsTentativeTurns = try container.decodeIfPresent(Bool.self, forKey: .emitsTentativeTurns) ?? true
+        attributionPolicy = try container.decodeIfPresent(
+            SpeakerAttributionPolicy.self,
+            forKey: .attributionPolicy
+        ) ?? .preferStandardWordLevel
+        attributionLookbackWindow = try container.decodeIfPresent(
+            TimeInterval.self,
+            forKey: .attributionLookbackWindow
+        ) ?? 30
+        attributionJitterBufferDelay = try container.decodeIfPresent(
+            TimeInterval.self,
+            forKey: .attributionJitterBufferDelay
+        ) ?? 0.75
+        attributionCacheRetentionWindow = max(0, try container.decodeIfPresent(
+            TimeInterval.self,
+            forKey: .attributionCacheRetentionWindow
+        ) ?? 600)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(options, forKey: .options)
+        try container.encode(backend, forKey: .backend)
+        try container.encode(emitsTentativeTurns, forKey: .emitsTentativeTurns)
+        try container.encode(attributionPolicy, forKey: .attributionPolicy)
+        try container.encode(attributionLookbackWindow, forKey: .attributionLookbackWindow)
+        try container.encode(attributionJitterBufferDelay, forKey: .attributionJitterBufferDelay)
+        try container.encode(attributionCacheRetentionWindow, forKey: .attributionCacheRetentionWindow)
+    }
+
+    public var streamingOptions: StreamingDiarizationOptions {
+        StreamingDiarizationOptions(
+            options: options,
+            backend: backend,
+            emitsTentativeTurns: emitsTentativeTurns
+        )
+    }
+}
+
+public struct StreamingSpeechAnalysisOptions: Hashable, Sendable {
+    public var transcription: StreamingTranscriptionOptions
+    public var diarization: StreamingDiarizationRequest?
+    public var audioFanOutBufferLimit: Int
+
+    public init(
+        transcription: StreamingTranscriptionOptions = StreamingTranscriptionOptions(),
+        diarization: StreamingDiarizationRequest? = nil,
+        audioFanOutBufferLimit: Int = 128
+    ) {
+        self.transcription = transcription
+        self.diarization = diarization
+        self.audioFanOutBufferLimit = max(1, audioFanOutBufferLimit)
+    }
+}
+
 public enum SpeechAnalysisError: Error, LocalizedError, Sendable {
     case unsupportedFeature(String)
 
@@ -229,6 +325,13 @@ public struct SpeechAnalysisResult: Codable, Hashable, Sendable {
         self.speakerAttributedTranscript = speakerAttributedTranscript
         self.diagnostics = diagnostics
     }
+}
+
+public enum StreamingSpeechAnalysisEvent: Hashable, Sendable {
+    case transcription(TranscriptEvent)
+    case diarization(StreamingDiarizationSnapshot)
+    case speakerAttributedSnapshot(StreamingTranscriptSnapshot)
+    case completed(SpeechAnalysisResult)
 }
 
 public protocol SpeechTranscriber: Sendable {
