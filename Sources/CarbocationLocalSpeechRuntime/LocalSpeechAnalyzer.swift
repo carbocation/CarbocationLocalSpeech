@@ -599,6 +599,11 @@ private actor StreamingSpeechAnalysisState {
             request: diarizationRequest
         )
         reconcileLockedSegments(with: transcriptSnapshot.stable.segments)
+        refreshLockedStableAttributions(
+            diarization: diarization,
+            horizon: horizon,
+            request: diarizationRequest
+        )
         if let lockBefore = lockBefore(
             transcriptSnapshot: transcriptSnapshot,
             diarizationSnapshot: diarizationSnapshot,
@@ -780,6 +785,40 @@ private actor StreamingSpeechAnalysisState {
         )
     }
 
+    private func refreshLockedStableAttributions(
+        diarization: DiarizationResult,
+        horizon: TimeInterval,
+        request: StreamingDiarizationRequest
+    ) {
+        let correctionWindow = max(0, request.lockedAttributionCorrectionWindow)
+        guard correctionWindow > 0 else { return }
+
+        let correctionStart = max(0, horizon - correctionWindow)
+        let refreshIDs = lockedStableAttributions.compactMap { segmentID, lockedAttribution in
+            lockedAttribution.sourceFingerprint.endTime >= correctionStart ? segmentID : nil
+        }
+
+        for segmentID in refreshIDs {
+            guard var lockedAttribution = lockedStableAttributions[segmentID] else { continue }
+            let currentFingerprint = DiarizationEvidenceFingerprint(
+                diarization: diarization,
+                segment: lockedAttribution.sourceSegment
+            )
+            guard currentFingerprint != lockedAttribution.diarizationFingerprint else { continue }
+
+            let attributedSegments = attributedSegmentsForLocking(
+                sourceSegment: lockedAttribution.sourceSegment,
+                diarization: diarization,
+                request: request
+            )
+            lockedAttribution.diarizationFingerprint = currentFingerprint
+            lockedAttribution.attributedSegments = attributedSegments.isEmpty
+                ? [lockedAttribution.sourceSegment]
+                : attributedSegments
+            lockedStableAttributions[segmentID] = lockedAttribution
+        }
+    }
+
     private func lockStableSegments(
         before lockBefore: TimeInterval,
         from transcript: Transcript,
@@ -820,10 +859,33 @@ private actor StreamingSpeechAnalysisState {
                 continue
             }
             lockedStableAttributions[candidate.id] = LockedStableAttribution(
+                sourceSegment: candidate,
                 sourceFingerprint: TranscriptSegmentFingerprint(segment: candidate),
+                diarizationFingerprint: DiarizationEvidenceFingerprint(
+                    diarization: diarization,
+                    segment: candidate
+                ),
                 attributedSegments: attributedSegments
             )
         }
+    }
+
+    private func attributedSegmentsForLocking(
+        sourceSegment: TranscriptSegment,
+        diarization: DiarizationResult,
+        request: StreamingDiarizationRequest
+    ) -> [TranscriptSegment] {
+        let relevantDiarization = windowedDiarization(diarization, for: [sourceSegment])
+        let partialTranscript = Transcript(segments: [sourceSegment])
+        let attributed = SpeakerAttributionMerger.merge(
+            transcript: partialTranscript,
+            diarization: relevantDiarization,
+            policy: request.attributionPolicy
+        ).transcript
+        return segmentsByRestoringSingleSegmentIdentities(
+            attributed.segments,
+            sources: [sourceSegment]
+        )
     }
 
     private func attributionHorizon(
@@ -1024,11 +1086,19 @@ private actor StreamingSpeechAnalysisState {
     }
 
     private func mergedTurns(_ previous: [SpeakerTurn], _ current: [SpeakerTurn]) -> [SpeakerTurn] {
-        var seen = Set<SpeakerTurnFingerprint>()
         var output: [SpeakerTurn] = []
-        for turn in previous + current {
+        for turn in previous {
             let fingerprint = SpeakerTurnFingerprint(turn: turn)
-            guard seen.insert(fingerprint).inserted else { continue }
+            guard !output.contains(where: { SpeakerTurnFingerprint(turn: $0) == fingerprint }) else { continue }
+            output.append(turn)
+        }
+
+        for turn in current {
+            output.removeAll { previousTurn in
+                shouldSupersedePreviousTurn(previousTurn, with: turn)
+            }
+            let fingerprint = SpeakerTurnFingerprint(turn: turn)
+            guard !output.contains(where: { SpeakerTurnFingerprint(turn: $0) == fingerprint }) else { continue }
             output.append(turn)
         }
         return output.sorted { lhs, rhs in
@@ -1037,6 +1107,22 @@ private actor StreamingSpeechAnalysisState {
             }
             return lhs.startTime < rhs.startTime
         }
+    }
+
+    private func shouldSupersedePreviousTurn(_ previous: SpeakerTurn, with current: SpeakerTurn) -> Bool {
+        guard !previous.isOverlap,
+              !current.isOverlap,
+              previous.isExclusive == current.isExclusive
+        else {
+            return false
+        }
+
+        let overlap = max(0, min(previous.endTime, current.endTime) - max(previous.startTime, current.startTime))
+        guard overlap > 0 else { return false }
+
+        let previousDuration = max(previous.endTime - previous.startTime, .ulpOfOne)
+        let currentDuration = max(current.endTime - current.startTime, .ulpOfOne)
+        return overlap / min(previousDuration, currentDuration) >= 0.8
     }
 
     private func prunedDiarization(_ diarization: DiarizationResult, before pruneBefore: TimeInterval) -> DiarizationResult {
@@ -1473,8 +1559,54 @@ private actor StreamingSpeechAnalysisState {
     }
 
     private struct LockedStableAttribution: Sendable {
+        var sourceSegment: TranscriptSegment
         var sourceFingerprint: TranscriptSegmentFingerprint
+        var diarizationFingerprint: DiarizationEvidenceFingerprint
         var attributedSegments: [TranscriptSegment]
+    }
+
+    private struct DiarizationEvidenceFingerprint: Hashable, Sendable {
+        var turns: [DiarizationTurnFingerprint]
+
+        init(diarization: DiarizationResult, segment: TranscriptSegment) {
+            let padding: TimeInterval = 0.25
+            let start = max(0, segment.startTime - padding)
+            let end = segment.endTime + padding
+            turns = (diarization.turns + diarization.exclusiveTurns)
+                .filter { turn in
+                    turn.startTime < end && start < turn.endTime
+                }
+                .sorted { lhs, rhs in
+                    if lhs.startTime == rhs.startTime {
+                        if lhs.endTime == rhs.endTime {
+                            return lhs.speaker.rawValue < rhs.speaker.rawValue
+                        }
+                        return lhs.endTime < rhs.endTime
+                    }
+                    return lhs.startTime < rhs.startTime
+                }
+                .map(DiarizationTurnFingerprint.init)
+        }
+    }
+
+    private struct DiarizationTurnFingerprint: Hashable, Sendable {
+        var speaker: SpeakerID
+        var startTime: TimeInterval
+        var endTime: TimeInterval
+        var confidence: Double?
+        var isOverlap: Bool
+        var isExclusive: Bool
+        var source: String?
+
+        init(turn: SpeakerTurn) {
+            speaker = turn.speaker
+            startTime = turn.startTime
+            endTime = turn.endTime
+            confidence = turn.confidence
+            isOverlap = turn.isOverlap
+            isExclusive = turn.isExclusive
+            source = turn.source
+        }
     }
 
     private struct TranscriptSegmentFingerprint: Hashable, Sendable {

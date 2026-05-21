@@ -145,24 +145,38 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
     private let sortformerConfig: SortformerConfig
     private let lseendVariant: LSEENDVariant
     private let lseendStepSize: LSEENDStepSize
+    private let memoryPressurePolicy: FluidAudioModelMemoryPressurePolicy
+    nonisolated(unsafe) private var memoryPressureMonitor: FluidAudioMemoryPressureMonitor?
 
     private var sortformerSessionFactory: (any StreamingDiarizerSessionFactory)?
     private var lseendSessionFactory: (any StreamingDiarizerSessionFactory)?
     private var activeInstallID: UUID?
     private var activeStreamIDs = Set<UUID>()
+    private var pendingMemoryPressureEviction = false
 
     public init(
         modelsDirectory: URL? = nil,
         computeUnits: MLComputeUnits = .all,
         sortformerConfig: SortformerConfig = .fastV2_1,
         lseendVariant: LSEENDVariant = .dihard3,
-        lseendStepSize: LSEENDStepSize = .step100ms
+        lseendStepSize: LSEENDStepSize = .step100ms,
+        memoryPressurePolicy: FluidAudioModelMemoryPressurePolicy = .evictWhenIdle
     ) {
         self.modelsDirectory = modelsDirectory
         self.computeUnits = .uniform(computeUnits)
         self.sortformerConfig = sortformerConfig
         self.lseendVariant = lseendVariant
         self.lseendStepSize = lseendStepSize
+        self.memoryPressurePolicy = memoryPressurePolicy
+        if memoryPressurePolicy != .disabled {
+            self.memoryPressureMonitor = FluidAudioMemoryPressureMonitor { [weak self] _ in
+                Task {
+                    await self?.handleMemoryPressure()
+                }
+            }
+        } else {
+            self.memoryPressureMonitor = nil
+        }
     }
 
     public init(
@@ -170,24 +184,37 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
         computeUnits: FluidAudioStreamingComputeUnits,
         sortformerConfig: SortformerConfig = .fastV2_1,
         lseendVariant: LSEENDVariant = .dihard3,
-        lseendStepSize: LSEENDStepSize = .step100ms
+        lseendStepSize: LSEENDStepSize = .step100ms,
+        memoryPressurePolicy: FluidAudioModelMemoryPressurePolicy = .evictWhenIdle
     ) {
         self.modelsDirectory = modelsDirectory
         self.computeUnits = computeUnits
         self.sortformerConfig = sortformerConfig
         self.lseendVariant = lseendVariant
         self.lseendStepSize = lseendStepSize
+        self.memoryPressurePolicy = memoryPressurePolicy
+        if memoryPressurePolicy != .disabled {
+            self.memoryPressureMonitor = FluidAudioMemoryPressureMonitor { [weak self] _ in
+                Task {
+                    await self?.handleMemoryPressure()
+                }
+            }
+        } else {
+            self.memoryPressureMonitor = nil
+        }
     }
 
     internal init(
         sortformerDiarizer: (any Diarizer)? = nil,
-        lseendDiarizer: (any Diarizer)? = nil
+        lseendDiarizer: (any Diarizer)? = nil,
+        memoryPressurePolicy: FluidAudioModelMemoryPressurePolicy = .disabled
     ) {
         self.modelsDirectory = nil
         self.computeUnits = .uniform(.all)
         self.sortformerConfig = .fastV2_1
         self.lseendVariant = .dihard3
         self.lseendStepSize = .step100ms
+        self.memoryPressurePolicy = memoryPressurePolicy
         if let sortformerDiarizer {
             self.sortformerSessionFactory = ClosureStreamingDiarizerSessionFactory(
                 makeHandler: { sortformerDiarizer },
@@ -200,20 +227,40 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
                 cleanupHandler: { lseendDiarizer.cleanup() }
             )
         }
+        if memoryPressurePolicy != .disabled {
+            self.memoryPressureMonitor = FluidAudioMemoryPressureMonitor { [weak self] _ in
+                Task {
+                    await self?.handleMemoryPressure()
+                }
+            }
+        } else {
+            self.memoryPressureMonitor = nil
+        }
     }
 
     internal init(
         sortformerSessionFactory: @escaping () throws -> any Diarizer,
-        lseendSessionFactory: (() throws -> any Diarizer)? = nil
+        lseendSessionFactory: (() throws -> any Diarizer)? = nil,
+        memoryPressurePolicy: FluidAudioModelMemoryPressurePolicy = .disabled
     ) {
         self.modelsDirectory = nil
         self.computeUnits = .uniform(.all)
         self.sortformerConfig = .fastV2_1
         self.lseendVariant = .dihard3
         self.lseendStepSize = .step100ms
+        self.memoryPressurePolicy = memoryPressurePolicy
         self.sortformerSessionFactory = ClosureStreamingDiarizerSessionFactory(makeHandler: sortformerSessionFactory)
         if let lseendSessionFactory {
             self.lseendSessionFactory = ClosureStreamingDiarizerSessionFactory(makeHandler: lseendSessionFactory)
+        }
+        if memoryPressurePolicy != .disabled {
+            self.memoryPressureMonitor = FluidAudioMemoryPressureMonitor { [weak self] _ in
+                Task {
+                    await self?.handleMemoryPressure()
+                }
+            }
+        } else {
+            self.memoryPressureMonitor = nil
         }
     }
 
@@ -290,10 +337,37 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
                 "Cannot unload models while \(activeStreamIDs.count) streaming session(s) are active."
             )
         }
+        pendingMemoryPressureEviction = false
+        evictInstalledModels()
+    }
+
+    private func evictInstalledModels() {
         sortformerSessionFactory?.cleanup()
         lseendSessionFactory?.cleanup()
         sortformerSessionFactory = nil
         lseendSessionFactory = nil
+    }
+
+    private func handleMemoryPressure() {
+        guard memoryPressurePolicy == .evictWhenIdle else { return }
+        pendingMemoryPressureEviction = true
+        evictModelsIfIdleForMemoryPressure()
+    }
+
+    private func evictModelsIfIdleForMemoryPressure() {
+        guard pendingMemoryPressureEviction,
+              activeInstallID == nil,
+              activeStreamIDs.isEmpty
+        else {
+            return
+        }
+
+        evictInstalledModels()
+        pendingMemoryPressureEviction = false
+    }
+
+    internal func simulateMemoryPressureForTesting() {
+        handleMemoryPressure()
     }
 
     private func installSortformer(
@@ -416,6 +490,7 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
     private func endInstall(_ id: UUID) {
         guard activeInstallID == id else { return }
         activeInstallID = nil
+        evictModelsIfIdleForMemoryPressure()
     }
 
     private func makeSession(
@@ -445,6 +520,7 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
 
     private func endStream(_ id: UUID) {
         activeStreamIDs.remove(id)
+        evictModelsIfIdleForMemoryPressure()
     }
 
     internal nonisolated static func installError(from error: Error) -> FluidAudioStreamingSpeakerDiarizerError {

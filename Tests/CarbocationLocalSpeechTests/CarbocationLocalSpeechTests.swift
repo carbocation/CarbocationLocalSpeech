@@ -1780,6 +1780,36 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertNil(result.transcript.segments[0].words[0].speaker)
     }
 
+    func testSpeakerAttributionMergerReportsCollapsedOverlappingSpeech() {
+        let speakerA = SpeakerID(rawValue: "A")
+        let speakerB = SpeakerID(rawValue: "B")
+        let transcript = Transcript(segments: [
+            TranscriptSegment(
+                text: "overlap",
+                startTime: 0,
+                endTime: 0.5,
+                words: [TranscriptWord(text: "overlap", startTime: 0, endTime: 0.5)]
+            )
+        ])
+        let diarization = DiarizationResult(
+            turns: [
+                SpeakerTurn(speaker: speakerA, startTime: 0, endTime: 0.5, isOverlap: true),
+                SpeakerTurn(speaker: speakerB, startTime: 0, endTime: 0.5, isOverlap: true)
+            ],
+            speakers: [Speaker(id: speakerA), Speaker(id: speakerB)],
+            duration: 0.5
+        )
+
+        let result = SpeakerAttributionMerger.merge(
+            transcript: transcript,
+            diarization: diarization,
+            policy: .preferStandardWordLevel
+        )
+
+        XCTAssertNotNil(result.transcript.segments.first?.speaker)
+        XCTAssertTrue(result.diagnostics.contains { $0.code == .overlappingSpeechCollapsed })
+    }
+
     func testAudioTemporaryFileWriterRoundTripsFloat32Samples() async throws {
         let sampleRate = 16_000.0
         let samples = (0..<1_600).map { index in

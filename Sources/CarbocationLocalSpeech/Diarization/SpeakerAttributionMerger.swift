@@ -46,12 +46,21 @@ public enum SpeakerAttributionMerger {
         let minSegOverlap = max(0, minimumSegmentOverlap)
         let minWordOverlap = max(0, minimumWordOverlap)
         var newSegments: [TranscriptSegment] = []
+        var reportedCollapsedOverlap = false
 
         for segment in transcript.segments {
             if !segment.words.isEmpty && policy != .segmentLargestOverlap {
                 var attributedWords = segment.words
                 for index in attributedWords.indices {
                     let word = attributedWords[index]
+                    reportCollapsedOverlapIfNeeded(
+                        start: word.startTime,
+                        end: word.endTime,
+                        turns: selectedTurns,
+                        minimumOverlap: minWordOverlap,
+                        diagnostics: &diagnostics,
+                        reported: &reportedCollapsedOverlap
+                    )
                     if let turn = bestSpeakerTurn(
                         start: word.startTime,
                         end: word.endTime,
@@ -90,6 +99,14 @@ public enum SpeakerAttributionMerger {
                 }
             } else {
                 var updatedSegment = segment
+                reportCollapsedOverlapIfNeeded(
+                    start: segment.startTime,
+                    end: segment.endTime,
+                    turns: selectedTurns,
+                    minimumOverlap: minSegOverlap,
+                    diagnostics: &diagnostics,
+                    reported: &reportedCollapsedOverlap
+                )
                 if let turn = bestSpeakerTurn(
                     start: segment.startTime,
                     end: segment.endTime,
@@ -146,6 +163,35 @@ public enum SpeakerAttributionMerger {
             .filter { minimumOverlap <= 0 ? $0.1 > 0 : $0.1 >= minimumOverlap }
             .max { lhs, rhs in lhs.1 < rhs.1 }?
             .0
+    }
+
+    private static func reportCollapsedOverlapIfNeeded(
+        start: TimeInterval,
+        end: TimeInterval,
+        turns: [SpeakerTurn],
+        minimumOverlap: TimeInterval,
+        diagnostics: inout [SpeechDiagnostic],
+        reported: inout Bool
+    ) {
+        guard !reported else { return }
+        let overlappingTurns = turns.filter { turn in
+            let overlap = max(0, min(end, turn.endTime) - max(start, turn.startTime))
+            return minimumOverlap <= 0 ? overlap > 0 : overlap >= minimumOverlap
+        }
+        let speakerIDs = Set(overlappingTurns.map(\.speaker))
+        guard speakerIDs.count > 1,
+              overlappingTurns.contains(where: \.isOverlap)
+        else {
+            return
+        }
+
+        reported = true
+        diagnostics.append(SpeechDiagnostic(
+            source: "merger",
+            message: "Overlapping diarization turns mapped to a single transcript speaker label.",
+            time: start,
+            code: .overlappingSpeechCollapsed
+        ))
     }
 
     private static func groupedBySpeaker(_ words: [TranscriptWord]) -> [[TranscriptWord]] {

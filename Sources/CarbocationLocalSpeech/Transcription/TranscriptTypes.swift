@@ -2,6 +2,7 @@ import Foundation
 
 public enum SpeechDiagnosticCode: String, Codable, Hashable, Sendable {
     case diarizationDropped
+    case overlappingSpeechCollapsed
 }
 
 public struct SpeechDiagnostic: Codable, Hashable, Sendable {
@@ -247,6 +248,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
     public var attributionJitterBufferDelay: TimeInterval
     public var maximumAttributionJitterBufferDelay: TimeInterval?
     public var attributionCacheRetentionWindow: TimeInterval
+    public var lockedAttributionCorrectionWindow: TimeInterval
     public var attributionRestorationOptions: SpeakerAttributionRestorationOptions
 
     public init(
@@ -258,6 +260,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         attributionJitterBufferDelay: TimeInterval = 0.75,
         maximumAttributionJitterBufferDelay: TimeInterval? = nil,
         attributionCacheRetentionWindow: TimeInterval = 600,
+        lockedAttributionCorrectionWindow: TimeInterval = 60,
         attributionRestorationOptions: SpeakerAttributionRestorationOptions = SpeakerAttributionRestorationOptions()
     ) {
         self.options = options
@@ -268,6 +271,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         self.attributionJitterBufferDelay = attributionJitterBufferDelay
         self.maximumAttributionJitterBufferDelay = maximumAttributionJitterBufferDelay.map { max(0, $0) }
         self.attributionCacheRetentionWindow = max(0, attributionCacheRetentionWindow)
+        self.lockedAttributionCorrectionWindow = max(0, lockedAttributionCorrectionWindow)
         self.attributionRestorationOptions = attributionRestorationOptions
     }
 
@@ -280,6 +284,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         case attributionJitterBufferDelay
         case maximumAttributionJitterBufferDelay
         case attributionCacheRetentionWindow
+        case lockedAttributionCorrectionWindow
         case attributionRestorationOptions
     }
 
@@ -308,6 +313,10 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
             TimeInterval.self,
             forKey: .attributionCacheRetentionWindow
         ) ?? 600)
+        lockedAttributionCorrectionWindow = max(0, try container.decodeIfPresent(
+            TimeInterval.self,
+            forKey: .lockedAttributionCorrectionWindow
+        ) ?? 60)
         attributionRestorationOptions = try container.decodeIfPresent(
             SpeakerAttributionRestorationOptions.self,
             forKey: .attributionRestorationOptions
@@ -324,6 +333,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         try container.encode(attributionJitterBufferDelay, forKey: .attributionJitterBufferDelay)
         try container.encodeIfPresent(maximumAttributionJitterBufferDelay, forKey: .maximumAttributionJitterBufferDelay)
         try container.encode(attributionCacheRetentionWindow, forKey: .attributionCacheRetentionWindow)
+        try container.encode(lockedAttributionCorrectionWindow, forKey: .lockedAttributionCorrectionWindow)
         try container.encode(attributionRestorationOptions, forKey: .attributionRestorationOptions)
     }
 

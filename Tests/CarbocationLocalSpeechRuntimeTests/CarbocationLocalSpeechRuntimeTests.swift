@@ -448,6 +448,86 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertEqual(attributedSegments.first { $0.text == "latest" }?.speaker, speakerC)
     }
 
+    func testStreamingAnalyzerCorrectsRecentLockedAttributionWhenDiarizationRevisesSpeaker() async throws {
+        let speakerA = SpeakerID(rawValue: "A")
+        let speakerB = SpeakerID(rawValue: "B")
+        let speakerC = SpeakerID(rawValue: "C")
+        let old = TranscriptSegment(
+            text: "old",
+            startTime: 0,
+            endTime: 0.2,
+            words: [TranscriptWord(text: "old", startTime: 0, endTime: 0.2)]
+        )
+        let latest = TranscriptSegment(
+            text: "latest",
+            startTime: 2.0,
+            endTime: 2.2,
+            words: [TranscriptWord(text: "latest", startTime: 2.0, endTime: 2.2)]
+        )
+        let middle = TranscriptSegment(
+            text: "middle",
+            startTime: 1.0,
+            endTime: 1.2,
+            words: [TranscriptWord(text: "middle", startTime: 1.0, endTime: 1.2)]
+        )
+        let firstTranscript = Transcript(segments: [old, middle])
+        let fullTranscript = Transcript(segments: [old, middle, latest])
+        let initialDiarization = DiarizationResult(
+            turns: [
+                SpeakerTurn(speaker: speakerA, startTime: 0, endTime: 0.2),
+                SpeakerTurn(speaker: speakerC, startTime: 1.0, endTime: 1.2)
+            ],
+            speakers: [Speaker(id: speakerA), Speaker(id: speakerC)],
+            duration: 1.2
+        )
+        let revisedDiarization = DiarizationResult(
+            turns: [
+                SpeakerTurn(speaker: speakerB, startTime: 0, endTime: 0.2),
+                SpeakerTurn(speaker: speakerC, startTime: 1.0, endTime: 1.2),
+                SpeakerTurn(speaker: speakerC, startTime: 2.0, endTime: 2.2)
+            ],
+            speakers: [Speaker(id: speakerB), Speaker(id: speakerC)],
+            duration: 2.2
+        )
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: DelayedChunkedStreamingTranscriber(
+                eventsByChunk: [
+                    [.snapshot(StreamingTranscriptSnapshot(stable: firstTranscript))],
+                    [.snapshot(StreamingTranscriptSnapshot(stable: fullTranscript)), .completed(fullTranscript)]
+                ],
+                nanosecondsBeforeEvents: 10_000_000
+            ),
+            streamingDiarizer: RecordingStreamingDiarizer(
+                recorder: AudioChunkRecorder(),
+                snapshots: [
+                    StreamingDiarizationSnapshot(stable: initialDiarization),
+                    StreamingDiarizationSnapshot(stable: revisedDiarization)
+                ]
+            )
+        )
+
+        let stream = analyzer.stream(
+            audio: testAudioChunks(startTimes: [0, 2.0]),
+            options: StreamingSpeechAnalysisOptions(diarization: StreamingDiarizationRequest(
+                attributionLookbackWindow: 0.5,
+                attributionJitterBufferDelay: 0,
+                lockedAttributionCorrectionWindow: 10
+            ))
+        )
+
+        var lastAttributedSnapshot: StreamingTranscriptSnapshot?
+        for try await event in stream {
+            if case .speakerAttributedSnapshot(let snapshot) = event {
+                lastAttributedSnapshot = snapshot
+            }
+        }
+
+        let attributedSegments = try XCTUnwrap(lastAttributedSnapshot?.stable.segments)
+        XCTAssertEqual(attributedSegments.first { $0.text == "old" }?.speaker, speakerB)
+        XCTAssertEqual(attributedSegments.first { $0.text == "middle" }?.speaker, speakerC)
+        XCTAssertEqual(attributedSegments.first { $0.text == "latest" }?.speaker, speakerC)
+    }
+
     func testStreamingAnalyzerRestoresHistoricRevisionAfterAttributionCachePruning() async throws {
         let speakerA = SpeakerID(rawValue: "A")
         let speakerB = SpeakerID(rawValue: "B")

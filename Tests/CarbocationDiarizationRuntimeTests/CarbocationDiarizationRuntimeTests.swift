@@ -274,6 +274,89 @@ final class CarbocationDiarizationRuntimeTests: XCTestCase {
         }
     }
 
+    func testStreamingDiarizerEvictsIdleModelsOnMemoryPressure() async throws {
+        let testDiarizer = TestFluidStreamingDiarizer()
+        let diarizer = FluidAudioStreamingSpeakerDiarizer(
+            sortformerDiarizer: testDiarizer,
+            memoryPressurePolicy: .evictWhenIdle
+        )
+
+        await diarizer.simulateMemoryPressureForTesting()
+
+        XCTAssertEqual(testDiarizer.cleanupCount, 1)
+        let stream = diarizer.stream(
+            audio: AsyncThrowingStream<AudioChunk, Error> { continuation in
+                continuation.finish()
+            },
+            options: StreamingDiarizationOptions(backend: .sortformer)
+        )
+
+        do {
+            for try await _ in stream {}
+            XCTFail("Expected streaming to require models after memory-pressure eviction.")
+        } catch let error as FluidAudioStreamingSpeakerDiarizerError {
+            guard case .modelAssetsMissing = error else {
+                return XCTFail("Unexpected FluidAudio streaming error: \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testStreamingDiarizerDefersMemoryPressureEvictionUntilActiveStreamEnds() async throws {
+        let chunkProcessed = expectation(description: "Streaming chunk was processed")
+        let testDiarizer = TestFluidStreamingDiarizer(processedExpectation: chunkProcessed)
+        let diarizer = FluidAudioStreamingSpeakerDiarizer(
+            sortformerDiarizer: testDiarizer,
+            memoryPressurePolicy: .evictWhenIdle
+        )
+        var continuation: AsyncThrowingStream<AudioChunk, Error>.Continuation!
+        let stream = diarizer.stream(
+            audio: AsyncThrowingStream<AudioChunk, Error> { audioContinuation in
+                continuation = audioContinuation
+                audioContinuation.yield(AudioChunk(
+                    samples: Array(repeating: 0.05, count: 1_600),
+                    sampleRate: 16_000,
+                    channelCount: 1,
+                    startTime: 0,
+                    duration: 0.1
+                ))
+            },
+            options: StreamingDiarizationOptions(
+                options: DiarizationOptions(minimumTurnDuration: 0),
+                backend: .sortformer
+            )
+        )
+        let task = Task {
+            for try await _ in stream {}
+        }
+
+        await fulfillment(of: [chunkProcessed], timeout: 1.0)
+        await diarizer.simulateMemoryPressureForTesting()
+        XCTAssertEqual(testDiarizer.cleanupCount, 0)
+
+        continuation.finish()
+        try await task.value
+        XCTAssertEqual(testDiarizer.cleanupCount, 2)
+
+        let nextStream = diarizer.stream(
+            audio: AsyncThrowingStream<AudioChunk, Error> { continuation in
+                continuation.finish()
+            },
+            options: StreamingDiarizationOptions(backend: .sortformer)
+        )
+        do {
+            for try await _ in nextStream {}
+            XCTFail("Expected deferred memory-pressure eviction to release models after the active stream.")
+        } catch let error as FluidAudioStreamingSpeakerDiarizerError {
+            guard case .modelAssetsMissing = error else {
+                return XCTFail("Unexpected FluidAudio streaming error: \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     func testStreamingDiarizerMapsModelInstallProgress() {
         let progress = FluidAudioModelInstallDiagnostics.mapProgress(DownloadUtils.DownloadProgress(
             fractionCompleted: 0.25,

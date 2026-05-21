@@ -353,7 +353,8 @@ let events = analyzer.stream(
             attributionLookbackWindow: 30,
             attributionJitterBufferDelay: 0.75,
             maximumAttributionJitterBufferDelay: 3,
-            attributionCacheRetentionWindow: 600
+            attributionCacheRetentionWindow: 600,
+            lockedAttributionCorrectionWindow: 60
         ),
         audioFanOutBufferLimit: 128,
         backlogPolicy: .dropDiarization
@@ -376,7 +377,11 @@ try await diarizer.unloadModels()
 
 For live attribution, keep `attributionCacheRetentionWindow` comfortably larger than the ASR revision horizon. A practical default is at least 3x the transcriber's rolling context window, and 10 minutes is a reasonable floor for long meetings. Setting it near zero minimizes memory but can only recover historic ASR revisions from the already-emitted stable transcript snapshot.
 
+`lockedAttributionCorrectionWindow` keeps recently locked speaker labels eligible for correction when a streaming diarizer revises the speaker evidence for that time range. Set it to `0` only when you want the lowest CPU overhead and accept that locked labels are final.
+
 Use `backlogPolicy: .fatal` when complete diarization is required. Use `.dropDiarization` for meeting capture UIs where transcription should continue if Core ML diarization falls behind during a CPU or ANE spike. Soft drops are exposed structurally through `SpeechDiagnostic.code == .diarizationDropped` during streaming and `SpeechAnalysisResult.diarizationStatus == .dropped` at completion.
+
+FluidAudio diarizers unload installed models automatically when the system reports memory pressure and no install or stream is active. Pass `memoryPressurePolicy: .disabled` to the FluidAudio diarizer initializer if your app manages model lifetime explicitly.
 
 ## Requirements
 

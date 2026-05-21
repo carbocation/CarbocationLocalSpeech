@@ -36,21 +36,39 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
     private let modelsDirectory: URL?
     private let modelConfiguration: MLModelConfiguration?
     private let baseConfig: OfflineDiarizerConfig
+    private let memoryPressurePolicy: FluidAudioModelMemoryPressurePolicy
+    nonisolated(unsafe) private var memoryPressureMonitor: FluidAudioMemoryPressureMonitor?
     private var models: OfflineDiarizerModels?
+    private var activeModelOperationCount = 0
+    private var pendingMemoryPressureEviction = false
 
     public init(
         config: OfflineDiarizerConfig = .default,
         modelsDirectory: URL? = nil,
-        modelConfiguration: MLModelConfiguration? = nil
+        modelConfiguration: MLModelConfiguration? = nil,
+        memoryPressurePolicy: FluidAudioModelMemoryPressurePolicy = .evictWhenIdle
     ) {
         self.baseConfig = config
         self.modelsDirectory = modelsDirectory
         self.modelConfiguration = modelConfiguration
+        self.memoryPressurePolicy = memoryPressurePolicy
+        if memoryPressurePolicy != .disabled {
+            self.memoryPressureMonitor = FluidAudioMemoryPressureMonitor { [weak self] _ in
+                Task {
+                    await self?.handleMemoryPressure()
+                }
+            }
+        } else {
+            self.memoryPressureMonitor = nil
+        }
     }
 
     public func installModels(
         onProgress: @escaping @Sendable (FluidAudioModelInstallProgress) -> Void = { _ in }
     ) async throws {
+        beginModelOperation()
+        defer { endModelOperation() }
+
         onProgress(FluidAudioModelInstallProgress(fractionCompleted: 0, phase: .starting(nil)))
         do {
             try Task.checkCancellation()
@@ -71,6 +89,7 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
     }
 
     public func unloadModels() async throws {
+        pendingMemoryPressureEviction = false
         models = nil
     }
 
@@ -114,6 +133,9 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
     ) async throws -> CarbocationLocalSpeech.DiarizationResult {
         try options.validate()
         try Task.checkCancellation()
+        beginModelOperation()
+        defer { endModelOperation() }
+
         guard let models else {
             throw FluidAudioSpeakerDiarizerError.modelAssetsMissing(
                 "Call FluidAudioSpeakerDiarizer.installModels() before diarize(audio:options:)."
@@ -154,6 +176,9 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
     ) async throws -> CarbocationLocalSpeech.DiarizationResult {
         try options.validate()
         try Task.checkCancellation()
+        beginModelOperation()
+        defer { endModelOperation() }
+
         guard let models else {
             throw FluidAudioSpeakerDiarizerError.modelAssetsMissing(
                 "Call FluidAudioSpeakerDiarizer.installModels() before diarize(file:options:)."
@@ -192,6 +217,36 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
         guard let duration = try? await asset.load(.duration) else { return nil }
         let seconds = CMTimeGetSeconds(duration)
         return seconds.isFinite && seconds > 0 ? seconds : nil
+    }
+
+    private func beginModelOperation() {
+        activeModelOperationCount += 1
+    }
+
+    private func endModelOperation() {
+        activeModelOperationCount = max(0, activeModelOperationCount - 1)
+        evictModelsIfIdleForMemoryPressure()
+    }
+
+    private func handleMemoryPressure() {
+        guard memoryPressurePolicy == .evictWhenIdle else { return }
+        pendingMemoryPressureEviction = true
+        evictModelsIfIdleForMemoryPressure()
+    }
+
+    private func evictModelsIfIdleForMemoryPressure() {
+        guard pendingMemoryPressureEviction,
+              activeModelOperationCount == 0
+        else {
+            return
+        }
+
+        models = nil
+        pendingMemoryPressureEviction = false
+    }
+
+    internal func simulateMemoryPressureForTesting() {
+        handleMemoryPressure()
     }
 
     private func resampledSamplesIfNeeded(
