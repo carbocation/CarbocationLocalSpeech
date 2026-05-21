@@ -165,18 +165,6 @@ public enum TranscriptEvent: Hashable, Sendable {
     case completed(Transcript)
 }
 
-public struct TranscriptionDiagnostic: Hashable, Sendable {
-    public var source: String
-    public var message: String
-    public var time: TimeInterval?
-
-    public init(source: String, message: String, time: TimeInterval? = nil) {
-        self.source = source
-        self.message = message
-        self.time = time
-    }
-}
-
 public struct StreamingTranscriptSnapshot: Hashable, Sendable {
     public var stable: Transcript
     public var volatile: Transcript?

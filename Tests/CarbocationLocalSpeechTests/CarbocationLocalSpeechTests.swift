@@ -1589,6 +1589,176 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(merged.segments[1].speaker, SpeakerID(rawValue: "B"))
     }
 
+    func testDiarizationOptionsValidationRejectsInvalidCountsAndBounds() {
+        XCTAssertThrowsError(try DiarizationOptions(minimumSpeakerCount: 0).validate()) { error in
+            guard case DiarizationValidationError.invalidValue = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertThrowsError(try DiarizationOptions(maximumSpeakerCount: -1).validate()) { error in
+            guard case DiarizationValidationError.invalidValue = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertThrowsError(try DiarizationOptions(exactSpeakerCount: 0).validate()) { error in
+            guard case DiarizationValidationError.invalidValue = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertThrowsError(try DiarizationOptions(minimumSpeakerCount: 3, maximumSpeakerCount: 2).validate()) { error in
+            guard case DiarizationValidationError.conflictingBounds = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertThrowsError(try DiarizationOptions(
+            minimumSpeakerCount: 2,
+            maximumSpeakerCount: 4,
+            exactSpeakerCount: 5
+        ).validate()) { error in
+            guard case DiarizationValidationError.conflictingBounds = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testSpeakerAttributionMergerSplitsWordsAndUsesExclusiveTurns() throws {
+        let speakerA = SpeakerID(rawValue: "A")
+        let speakerB = SpeakerID(rawValue: "B")
+        let transcript = Transcript(segments: [
+            TranscriptSegment(
+                text: "hello world",
+                startTime: 0,
+                endTime: 1,
+                words: [
+                    TranscriptWord(text: "hello", startTime: 0.0, endTime: 0.45, confidence: 0.8),
+                    TranscriptWord(text: "world", startTime: 0.45, endTime: 1.0, confidence: 0.6)
+                ],
+                confidence: 0.7
+            )
+        ])
+        let diarization = DiarizationResult(
+            turns: [
+                SpeakerTurn(speaker: SpeakerID(rawValue: "wrong"), startTime: 0.0, endTime: 1.0)
+            ],
+            exclusiveTurns: [
+                SpeakerTurn(speaker: speakerA, startTime: 0.0, endTime: 0.45, isExclusive: true),
+                SpeakerTurn(speaker: speakerB, startTime: 0.45, endTime: 1.0, isExclusive: true)
+            ],
+            speakers: [Speaker(id: speakerA), Speaker(id: speakerB)],
+            duration: 1.0
+        )
+
+        let result = SpeakerAttributionMerger.merge(
+            transcript: transcript,
+            diarization: diarization,
+            policy: .preferExclusiveWordLevel
+        )
+
+        XCTAssertEqual(result.transcript.segments.map(\.speaker), [speakerA, speakerB])
+        XCTAssertEqual(result.transcript.segments.map(\.text), ["hello", "world"])
+        XCTAssertEqual(try XCTUnwrap(result.transcript.segments[0].confidence), 0.8, accuracy: 0.000_1)
+        XCTAssertEqual(try XCTUnwrap(result.transcript.segments[1].confidence), 0.6, accuracy: 0.000_1)
+        XCTAssertTrue(result.diagnostics.contains { $0.message.contains("Using exclusive turns") })
+        XCTAssertTrue(result.diagnostics.contains { $0.message.contains("Split segment") })
+    }
+
+    func testSpeakerAttributionMergerUsesSeparateWordAndSegmentOverlapThresholds() {
+        let speaker = SpeakerID(rawValue: "A")
+        let wordLevelTranscript = Transcript(segments: [
+            TranscriptSegment(
+                text: "a b",
+                startTime: 0,
+                endTime: 1,
+                words: [
+                    TranscriptWord(text: "a", startTime: 0.10, endTime: 0.11),
+                    TranscriptWord(text: "b", startTime: 0.20, endTime: 0.21)
+                ]
+            )
+        ])
+        let wordLevelDiarization = DiarizationResult(
+            turns: [
+                SpeakerTurn(speaker: speaker, startTime: 0.105, endTime: 0.115)
+            ],
+            speakers: [Speaker(id: speaker)],
+            duration: 1
+        )
+
+        let wordResult = SpeakerAttributionMerger.merge(
+            transcript: wordLevelTranscript,
+            diarization: wordLevelDiarization,
+            policy: .preferStandardWordLevel,
+            minimumSegmentOverlap: 0.05,
+            minimumWordOverlap: 0.0
+        )
+
+        XCTAssertEqual(wordResult.transcript.segments[0].words[0].speaker, speaker)
+        XCTAssertNil(wordResult.transcript.segments[1].words[0].speaker)
+
+        let segmentResult = SpeakerAttributionMerger.merge(
+            transcript: Transcript(segments: [
+                TranscriptSegment(text: "short overlap", startTime: 0.0, endTime: 1.0)
+            ]),
+            diarization: DiarizationResult(
+                turns: [SpeakerTurn(speaker: speaker, startTime: 0.96, endTime: 1.0)],
+                speakers: [Speaker(id: speaker)],
+                duration: 1
+            ),
+            policy: .segmentLargestOverlap,
+            minimumSegmentOverlap: 0.05
+        )
+
+        XCTAssertNil(segmentResult.transcript.segments[0].speaker)
+    }
+
+    func testSpeakerAttributionMergerClampsNegativeThresholdsWithoutAttributingZeroOverlap() {
+        let speaker = SpeakerID(rawValue: "A")
+        let transcript = Transcript(segments: [
+            TranscriptSegment(
+                text: "touching",
+                startTime: 0,
+                endTime: 1,
+                words: [
+                    TranscriptWord(text: "touching", startTime: 0.0, endTime: 0.5)
+                ]
+            )
+        ])
+        let diarization = DiarizationResult(
+            turns: [SpeakerTurn(speaker: speaker, startTime: 0.5, endTime: 1.0)],
+            speakers: [Speaker(id: speaker)],
+            duration: 1
+        )
+
+        let result = SpeakerAttributionMerger.merge(
+            transcript: transcript,
+            diarization: diarization,
+            policy: .preferStandardWordLevel,
+            minimumSegmentOverlap: -1,
+            minimumWordOverlap: -1
+        )
+
+        XCTAssertNil(result.transcript.segments[0].words[0].speaker)
+    }
+
+    func testAudioTemporaryFileWriterRoundTripsFloat32Samples() async throws {
+        let sampleRate = 16_000.0
+        let samples = (0..<1_600).map { index in
+            Float(sin(2.0 * Double.pi * 440.0 * Double(index) / sampleRate) * 0.4)
+        }
+        let audio = PreparedAudio(samples: samples, sampleRate: sampleRate)
+        let url = try AudioTemporaryFileWriter().write(audio: audio)
+        defer {
+            try? FileManager.default.removeItem(at: url)
+        }
+
+        let roundTripped = try await AudioResampler16kMono().prepareFile(at: url)
+        XCTAssertFalse(roundTripped.samples.allSatisfy { abs($0) < 0.000_001 })
+        XCTAssertEqual(roundTripped.samples.count, samples.count, accuracy: 2)
+
+        let originalPeak = samples.map { abs($0) }.max() ?? 0
+        let roundTripPeak = roundTripped.samples.map { abs($0) }.max() ?? 0
+        XCTAssertEqual(roundTripPeak, originalPeak, accuracy: 0.01)
+    }
+
     func testMockTranscriberEmitsConfiguredEventsAndCompletion() async throws {
         let volatile = Transcript(segments: [TranscriptSegment(text: "hel", startTime: 0, endTime: 0.2)])
         let transcriber = MockSpeechTranscriber(

@@ -1,5 +1,19 @@
 import Foundation
 
+public struct SpeechDiagnostic: Codable, Hashable, Sendable {
+    public var source: String
+    public var message: String
+    public var time: TimeInterval?
+
+    public init(source: String, message: String, time: TimeInterval? = nil) {
+        self.source = source
+        self.message = message
+        self.time = time
+    }
+}
+
+public typealias TranscriptionDiagnostic = SpeechDiagnostic
+
 public struct Transcript: Codable, Hashable, Sendable {
     public var segments: [TranscriptSegment]
     public var language: SpeechLanguage?
@@ -57,19 +71,22 @@ public struct TranscriptWord: Identifiable, Codable, Hashable, Sendable {
     public var startTime: TimeInterval
     public var endTime: TimeInterval
     public var confidence: Double?
+    public var speaker: SpeakerID?
 
     public init(
         id: UUID = UUID(),
         text: String,
         startTime: TimeInterval,
         endTime: TimeInterval,
-        confidence: Double? = nil
+        confidence: Double? = nil,
+        speaker: SpeakerID? = nil
     ) {
         self.id = id
         self.text = text
         self.startTime = startTime
         self.endTime = endTime
         self.confidence = confidence
+        self.speaker = speaker
     }
 }
 
@@ -149,6 +166,68 @@ public struct TranscriptionOptions: Hashable, Sendable {
         self.suppressBlankAudio = suppressBlankAudio
         self.temperature = temperature
         self.voiceActivityDetection = voiceActivityDetection
+    }
+}
+
+public enum SpeakerAttributionPolicy: String, Codable, Hashable, Sendable {
+    case preferExclusiveWordLevel
+    case preferStandardWordLevel
+    case segmentLargestOverlap
+}
+
+public struct DiarizationRequest: Codable, Hashable, Sendable {
+    public var options: DiarizationOptions
+    public var policy: SpeakerAttributionPolicy
+
+    public init(
+        options: DiarizationOptions = DiarizationOptions(),
+        policy: SpeakerAttributionPolicy = .preferExclusiveWordLevel
+    ) {
+        self.options = options
+        self.policy = policy
+    }
+}
+
+public struct SpeechAnalysisOptions: Hashable, Sendable {
+    public var transcription: TranscriptionOptions
+    public var diarization: DiarizationRequest?
+
+    public init(
+        transcription: TranscriptionOptions = TranscriptionOptions(),
+        diarization: DiarizationRequest? = nil
+    ) {
+        self.transcription = transcription
+        self.diarization = diarization
+    }
+}
+
+public enum SpeechAnalysisError: Error, LocalizedError, Sendable {
+    case unsupportedFeature(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedFeature(let details):
+            return "Unsupported speech analysis feature: \(details)"
+        }
+    }
+}
+
+public struct SpeechAnalysisResult: Codable, Hashable, Sendable {
+    public var transcript: Transcript?
+    public var diarization: DiarizationResult?
+    public var speakerAttributedTranscript: Transcript?
+    public var diagnostics: [SpeechDiagnostic]
+
+    public init(
+        transcript: Transcript? = nil,
+        diarization: DiarizationResult? = nil,
+        speakerAttributedTranscript: Transcript? = nil,
+        diagnostics: [SpeechDiagnostic] = []
+    ) {
+        self.transcript = transcript
+        self.diarization = diarization
+        self.speakerAttributedTranscript = speakerAttributedTranscript
+        self.diagnostics = diagnostics
     }
 }
 

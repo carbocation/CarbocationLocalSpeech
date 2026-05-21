@@ -284,8 +284,15 @@ let package = Package(
         .library(name: "CarbocationWhisperRuntime", targets: ["CarbocationWhisperRuntime"]),
         .library(name: "CarbocationAppleSpeechRuntime", targets: ["CarbocationAppleSpeechRuntime"]),
         .library(name: "CarbocationLocalSpeechRuntime", targets: ["CarbocationLocalSpeechRuntime"]),
+        .library(name: "CarbocationDiarizationRuntime", targets: ["CarbocationDiarizationRuntime"]),
         .library(name: "CarbocationLocalSpeechUI", targets: ["CarbocationLocalSpeechUI"]),
         .executable(name: "clss-benchmark", targets: ["CLSSBenchmark"])
+    ],
+    dependencies: [
+        .package(
+            url: "https://github.com/FluidInference/FluidAudio.git",
+            .upToNextMinor(from: "0.14.7")
+        )
     ],
     targets: [
         .target(
@@ -334,6 +341,13 @@ let package = Package(
             ]
         ),
         .target(
+            name: "CarbocationDiarizationRuntime",
+            dependencies: [
+                "CarbocationLocalSpeech",
+                .product(name: "FluidAudio", package: "FluidAudio")
+            ]
+        ),
+        .target(
             name: "CarbocationLocalSpeechUI",
             dependencies: ["CarbocationLocalSpeech"],
             linkerSettings: [
@@ -371,6 +385,10 @@ let package = Package(
         .testTarget(
             name: "CarbocationLocalSpeechRuntimeTests",
             dependencies: ["CarbocationLocalSpeechRuntime"]
+        ),
+        .testTarget(
+            name: "CarbocationDiarizationRuntimeTests",
+            dependencies: ["CarbocationDiarizationRuntime"]
         ),
         .testTarget(
             name: "CarbocationLocalSpeechUITests",

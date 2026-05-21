@@ -25,6 +25,77 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         }
     }
 
+    func testAnalyzerASROnlyReturnsNilDiarization() async throws {
+        let transcript = Transcript(segments: [
+            TranscriptSegment(text: "hello", startTime: 0, endTime: 0.5)
+        ])
+        let analyzer = LocalSpeechAnalyzer(transcriber: MockSpeechTranscriber(transcript: transcript))
+
+        let result = try await analyzer.analyze(
+            audio: PreparedAudio(samples: Array(repeating: 0, count: 1_600), sampleRate: 16_000),
+            options: SpeechAnalysisOptions()
+        )
+
+        XCTAssertEqual(result.transcript, transcript)
+        XCTAssertNil(result.diarization)
+        XCTAssertNil(result.speakerAttributedTranscript)
+    }
+
+    func testAnalyzerDiarizationRequestRequiresRegisteredDiarizer() async {
+        let analyzer = LocalSpeechAnalyzer(transcriber: MockSpeechTranscriber())
+
+        do {
+            _ = try await analyzer.analyze(
+                audio: PreparedAudio(samples: [], sampleRate: 16_000),
+                options: SpeechAnalysisOptions(diarization: DiarizationRequest())
+            )
+            XCTFail("Expected unsupported feature error.")
+        } catch let error as SpeechAnalysisError {
+            XCTAssertEqual(
+                error.errorDescription,
+                SpeechAnalysisError.unsupportedFeature(
+                    "Diarization was requested, but no speaker diarizer is registered."
+                ).errorDescription
+            )
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testAnalyzerCombinesTranscriptDiarizationAndSpeakerAttribution() async throws {
+        let speaker = SpeakerID(rawValue: "A")
+        let transcript = Transcript(segments: [
+            TranscriptSegment(
+                text: "hello",
+                startTime: 0,
+                endTime: 0.5,
+                words: [TranscriptWord(text: "hello", startTime: 0, endTime: 0.5)]
+            )
+        ])
+        let diarization = DiarizationResult(
+            turns: [SpeakerTurn(speaker: speaker, startTime: 0, endTime: 0.5, isExclusive: true)],
+            exclusiveTurns: [SpeakerTurn(speaker: speaker, startTime: 0, endTime: 0.5, isExclusive: true)],
+            speakers: [Speaker(id: speaker)],
+            duration: 0.5,
+            diagnostics: [SpeechDiagnostic(source: "test", message: "diarized")]
+        )
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: MockSpeechTranscriber(transcript: transcript),
+            diarizer: MockSpeakerDiarizer(result: diarization)
+        )
+
+        let result = try await analyzer.analyze(
+            audio: PreparedAudio(samples: Array(repeating: 0, count: 8_000), sampleRate: 16_000),
+            options: SpeechAnalysisOptions(diarization: DiarizationRequest())
+        )
+
+        XCTAssertEqual(result.diarization, diarization)
+        XCTAssertEqual(result.speakerAttributedTranscript?.segments.first?.speaker, speaker)
+        XCTAssertEqual(result.speakerAttributedTranscript?.segments.first?.words.first?.speaker, speaker)
+        XCTAssertTrue(result.diagnostics.contains { $0.source == "test" })
+        XCTAssertTrue(result.diagnostics.contains { $0.source == "merger" })
+    }
+
     func testInstalledSelectionRoutesToWhisperProvider() async throws {
         let root = try makeTemporaryDirectory()
         let source = root.appendingPathComponent("ggml-base.en.bin")

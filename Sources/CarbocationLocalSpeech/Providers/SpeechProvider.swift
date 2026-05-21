@@ -50,6 +50,7 @@ public enum SpeechProviderKind: String, Codable, Hashable, Sendable {
     case whisperCpp
     case appleSpeech
     case whisperKit
+    case fluidAudio
     case mock
 }
 
