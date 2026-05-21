@@ -356,6 +356,7 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
     private var latestStableText: String?
     private var latestStableDisplayText: String?
     private var latestStableTimeRange: String?
+    private var stableDisplayLastSpeaker: SpeakerID?
     private var volatileTimeRange: String?
 
     private static let stableDisplayCharacterLimit = 1_500
@@ -368,6 +369,7 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         var lastSegmentText = ""
         var lastSegmentStartTime: TimeInterval = 0
         var lastSegmentEndTime: TimeInterval = 0
+        var speakerSignature: [SpeakerID?] = []
     }
 
     public init(events: [TranscriptEvent] = []) {
@@ -423,11 +425,7 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
     public mutating func apply(_ event: TranscriptEvent) {
         switch event {
         case .snapshot(let snapshot):
-            let signature = Self.stableSnapshotSignature(for: snapshot.stable.segments)
-            if signature != stableSnapshotSignature {
-                applyStableSegments(snapshot.stable.segments, signature: signature)
-            }
-            applyVolatileTranscript(snapshot.volatile)
+            apply(snapshot)
         case .progress(let progress):
             processedDuration = progress.processedDuration
         case .stats(let stats):
@@ -446,6 +444,14 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         }
     }
 
+    public mutating func apply(_ snapshot: StreamingTranscriptSnapshot) {
+        let signature = Self.stableSnapshotSignature(for: snapshot.stable.segments)
+        if signature != stableSnapshotSignature {
+            applyStableSegments(snapshot.stable.segments, signature: signature)
+        }
+        applyVolatileTranscript(snapshot.volatile)
+    }
+
     private mutating func applyStableSegments(_ segments: [TranscriptSegment], signature: StableSnapshotSignature) {
         guard !appendStableSegmentsIfPossible(segments, signature: signature) else { return }
 
@@ -456,9 +462,10 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         }
 
         stableText = nonEmptySegments.map(\.text).joined(separator: " ")
-        stableDisplayText = Self.displayText(stableText, characterLimit: Self.stableDisplayCharacterLimit)
+        stableDisplayText = Self.displayText(for: nonEmptySegments, characterLimit: Self.stableDisplayCharacterLimit)
         segmentCount = nonEmptySegments.count
         stableSnapshotSignature = signature
+        stableDisplayLastSpeaker = nonEmptySegments.last?.segment.speaker
 
         if let latest = nonEmptySegments.last {
             applyLatestStableSegment(latest.segment, text: latest.text)
@@ -482,6 +489,10 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
                   Self.segment(segments[previousLastIndex], matches: stableSnapshotSignature) else {
                 return false
             }
+            let currentSpeakerPrefix = Array(signature.speakerSignature.prefix(previousSourceSegmentCount))
+            guard currentSpeakerPrefix == stableSnapshotSignature.speakerSignature else {
+                return false
+            }
         }
 
         var appendedNonEmptyCount = 0
@@ -489,7 +500,7 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
             let text = Self.trim(segment.text)
             guard !text.isEmpty else { continue }
 
-            appendStableText(text)
+            appendStableText(text, speaker: segment.speaker)
             appendedNonEmptyCount += 1
             applyLatestStableSegment(segment, text: text)
         }
@@ -499,22 +510,27 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         return true
     }
 
-    private mutating func appendStableText(_ text: String) {
+    private mutating func appendStableText(_ text: String, speaker: SpeakerID?) {
         if stableText.isEmpty {
             stableText = text
-            stableDisplayText = Self.displayText(text, characterLimit: Self.stableDisplayCharacterLimit)
         } else {
             stableText += " " + text
-            stableDisplayText = Self.displayText(
-                stableDisplayText + " " + text,
-                characterLimit: Self.stableDisplayCharacterLimit
-            )
         }
+
+        let displayAppend = Self.labeledText(text, speaker: speaker, previousSpeaker: stableDisplayLastSpeaker)
+        stableDisplayText = Self.displayText(
+            stableDisplayText.isEmpty ? displayAppend : stableDisplayText + " " + displayAppend,
+            characterLimit: Self.stableDisplayCharacterLimit
+        )
+        stableDisplayLastSpeaker = speaker
     }
 
     private mutating func applyLatestStableSegment(_ segment: TranscriptSegment, text: String) {
         latestStableText = text
-        latestStableDisplayText = Self.displayText(text, characterLimit: Self.latestDisplayCharacterLimit)
+        latestStableDisplayText = Self.displayText(
+            Self.labeledText(text, speaker: segment.speaker, previousSpeaker: nil),
+            characterLimit: Self.latestDisplayCharacterLimit
+        )
         latestStableTimeRange = Self.formatTimeRange(
             start: segment.startTime,
             end: segment.endTime
@@ -538,8 +554,9 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
             return
         }
 
-        volatileText = segments.map { Self.trim($0.text) }.joined(separator: " ")
-        volatileDisplayText = Self.displayText(volatileText, characterLimit: Self.volatileDisplayCharacterLimit)
+        let displaySegments = segments.map { (segment: $0, text: Self.trim($0.text)) }
+        volatileText = displaySegments.map(\.text).joined(separator: " ")
+        volatileDisplayText = Self.displayText(for: displaySegments, characterLimit: Self.volatileDisplayCharacterLimit)
         volatileTimeRange = Self.formatTimeRange(start: first.startTime, end: last.endTime)
     }
 
@@ -555,6 +572,49 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         return "... " + text.suffix(characterLimit).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private static func displayText(
+        for segments: [(segment: TranscriptSegment, text: String)],
+        characterLimit: Int
+    ) -> String {
+        var previousSpeaker: SpeakerID?
+        let text = segments.map { item in
+            let labeled = labeledText(item.text, speaker: item.segment.speaker, previousSpeaker: previousSpeaker)
+            previousSpeaker = item.segment.speaker
+            return labeled
+        }
+        .joined(separator: " ")
+        return displayText(text, characterLimit: characterLimit)
+    }
+
+    private static func labeledText(
+        _ text: String,
+        speaker: SpeakerID?,
+        previousSpeaker: SpeakerID?
+    ) -> String {
+        guard speaker != previousSpeaker,
+              let speaker
+        else {
+            return text
+        }
+        return "[\(displayName(for: speaker))] \(text)"
+    }
+
+    private static func displayName(for speaker: SpeakerID) -> String {
+        let parts = speaker.rawValue.split(separator: "_")
+        if parts.count >= 4,
+           parts[0] == "recovery",
+           parts[2] == "speaker",
+           let index = parts.last {
+            return "Speaker \(index) (recovery \(parts[1]))"
+        }
+        if parts.count >= 2,
+           parts[0] == "speaker",
+           let index = parts.last {
+            return "Speaker \(index)"
+        }
+        return speaker.rawValue
+    }
+
     private static func stableSnapshotSignature(for segments: [TranscriptSegment]) -> StableSnapshotSignature {
         guard let last = segments.last else {
             return StableSnapshotSignature()
@@ -565,7 +625,8 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
             lastSegmentID: last.id,
             lastSegmentText: trim(last.text),
             lastSegmentStartTime: last.startTime,
-            lastSegmentEndTime: last.endTime
+            lastSegmentEndTime: last.endTime,
+            speakerSignature: segments.map(\.speaker)
         )
     }
 
@@ -573,7 +634,8 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         signature.lastSegmentID == segment.id &&
             signature.lastSegmentText == trim(segment.text) &&
             signature.lastSegmentStartTime == segment.startTime &&
-            signature.lastSegmentEndTime == segment.endTime
+            signature.lastSegmentEndTime == segment.endTime &&
+            signature.speakerSignature.last == segment.speaker
     }
 
     private static func formatTimeRange(start: TimeInterval, end: TimeInterval) -> String {

@@ -220,4 +220,40 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
         XCTAssertTrue(snapshot.hasVolatileText)
         XCTAssertEqual(snapshot.segmentCount, 1)
     }
+
+    func testLiveTranscriptDebugSnapshotLabelsSpeakerAttributedDisplayText() {
+        let firstID = UUID()
+        let secondID = UUID()
+        var snapshot = LiveTranscriptDebugSnapshot(events: [
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(id: firstID, text: "hello", startTime: 0.0, endTime: 0.4),
+                TranscriptSegment(id: secondID, text: "world", startTime: 0.4, endTime: 0.8)
+            ])))
+        ])
+
+        XCTAssertEqual(snapshot.stableText, "hello world")
+        XCTAssertEqual(snapshot.stableDisplayText, "hello world")
+
+        snapshot.apply(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+            TranscriptSegment(
+                id: firstID,
+                text: "hello",
+                startTime: 0.0,
+                endTime: 0.4,
+                speaker: SpeakerID(rawValue: "speaker_0")
+            ),
+            TranscriptSegment(
+                id: secondID,
+                text: "world",
+                startTime: 0.4,
+                endTime: 0.8,
+                speaker: SpeakerID(rawValue: "speaker_1")
+            )
+        ])))
+
+        XCTAssertEqual(snapshot.transcriptText, "hello world")
+        XCTAssertEqual(snapshot.stableText, "hello world")
+        XCTAssertEqual(snapshot.stableDisplayText, "[Speaker 0] hello [Speaker 1] world")
+        XCTAssertEqual(snapshot.latestDisplayText, "[Speaker 1] world")
+    }
 }

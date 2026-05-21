@@ -1,4 +1,5 @@
 import CarbocationLocalSpeech
+import CarbocationDiarizationRuntime
 import CarbocationLocalSpeechRuntime
 import CarbocationLocalSpeechUI
 import CarbocationWhisperRuntime
@@ -290,6 +291,7 @@ private struct CLSSmokeRootView: View {
     @State private var selectedFileURL: URL?
     @State private var scopedFileAccessURL: URL?
     @State private var fileTranscript: Transcript?
+    @State private var fileAnalysisResult: SpeechAnalysisResult?
     @State private var fileProcessingDuration: TimeInterval?
     @State private var fileStatusMessage = "Pick or drop an audio or movie file."
     @State private var fileStatusTone = CLSSmokeStatusTone.secondary
@@ -325,6 +327,9 @@ private struct CLSSmokeRootView: View {
 
     private let library = SpeechModelLibrary(
         root: SpeechModelStorage.modelsDirectory(appSupportFolderName: "CLSSmoke")
+    )
+    private let diarizationModelManager = FluidAudioDiarizationModelManager(
+        modelsDirectory: SpeechModelStorage.diarizationModelsDirectory(appSupportFolderName: "CLSSmoke")
     )
 
     var body: some View {
@@ -385,9 +390,10 @@ private struct CLSSmokeRootView: View {
                 .padding(.horizontal, 20)
                 .padding(.vertical, 16)
             Divider()
-            SpeechModelLibraryPickerView(
+            SpeechPipelinePickerView(
                 library: library,
                 selectionStorageValue: $selectionStorageValue,
+                title: "Choose a Speech Pipeline",
                 confirmTitle: confirmTitle,
                 confirmDisabled: isConfirmDisabled,
                 showsConfirmationFooter: false,
@@ -429,8 +435,12 @@ private struct CLSSmokeRootView: View {
         isStarting || isFileTranscribing || isForcedVADUnavailable || isSelectedLiveInputUnavailable
     }
 
+    private var selectedPipelineSelection: SpeechPipelineSelection? {
+        SpeechPipelineSelection(storageValue: selectionStorageValue)
+    }
+
     private var selectedSelection: SpeechModelSelection? {
-        SpeechModelSelection(storageValue: selectionStorageValue)
+        selectedPipelineSelection?.transcription
     }
 
     private var selectedVADMode: CLSSmokeVADMode {
@@ -587,8 +597,8 @@ private struct CLSSmokeRootView: View {
 
             HStack(spacing: 10) {
                 Button {
-                    if let selectedSelection {
-                        startListening(with: selectedSelection)
+                    if let selectedPipelineSelection {
+                        startListening(with: selectedPipelineSelection)
                     }
                 } label: {
                     Label(confirmTitle, systemImage: isListening ? "arrow.clockwise" : "play.fill")
@@ -764,7 +774,7 @@ private struct CLSSmokeRootView: View {
                 .lineLimit(2)
 
             if let fileTranscript {
-                fileTranscriptResult(fileTranscript)
+                fileTranscriptResult(fileTranscript, analysisResult: fileAnalysisResult)
             }
         }
         .padding(.horizontal, 20)
@@ -887,12 +897,21 @@ private struct CLSSmokeRootView: View {
         )
     }
 
-    private func fileTranscriptResult(_ transcript: Transcript) -> some View {
+    private func fileTranscriptResult(
+        _ transcript: Transcript,
+        analysisResult: SpeechAnalysisResult?
+    ) -> some View {
         let transcriptText = transcript.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let diarization = analysisResult?.diarization
+        let diagnostics = analysisResult?.diagnostics ?? []
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 14) {
                 fileMetric("Segments", "\(transcript.segments.count)")
+                if let diarization {
+                    fileMetric("Speakers", "\(diarization.speakers.count)")
+                    fileMetric("Turns", "\(diarization.turns.count)")
+                }
                 if let duration = transcript.duration {
                     fileMetric("Audio", Self.formatDuration(duration))
                 }
@@ -917,6 +936,21 @@ private struct CLSSmokeRootView: View {
             .frame(minHeight: 72, maxHeight: 130)
             .background(CLSSmokePlatformColor.textBackground)
             .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            if !diagnostics.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("Analysis Diagnostics", systemImage: "list.bullet.rectangle")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    Text(diagnostics.map(Self.describeDiagnostic).joined(separator: "\n"))
+                        .font(.system(.caption, design: .monospaced))
+                        .lineLimit(5)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
     }
 
@@ -931,11 +965,12 @@ private struct CLSSmokeRootView: View {
         }
     }
 
-    private func startListening(with selection: SpeechModelSelection) {
-        let storedSelectionValue = selectionStorageValue
+    private func startListening(with selection: SpeechPipelineSelection) {
+        let storedSelectionValue = selection.storageValue
+        selectionStorageValue = storedSelectionValue
         let vadMode = selectedVADMode
         let vadSensitivity = selectedVADSensitivity
-        let vadAvailability = vadAvailability(for: selection)
+        let vadAvailability = vadAvailability(for: selection.transcription)
         let liveInput = selectedLiveInput
         guard liveInput != .systemAudio || systemAudioInputIsAvailable else {
             statusTone = .error
@@ -1014,28 +1049,29 @@ private struct CLSSmokeRootView: View {
             }
 
             guard activeSessionID == id else { return }
-            guard let plan = await LocalSpeechEngine.loadPlan(
+            guard let plan = await LocalSpeechEngine.pipelineLoadPlan(
                 from: selectionStorageValue,
                 in: library,
-                locale: .current
+                locale: .current,
+                diarizationPlanner: diarizationModelManager
             ) else {
-                finishSession(id: id, message: "Selected speech provider is no longer available.", tone: .error)
+                finishSession(id: id, message: "Selected speech pipeline is no longer available.", tone: .error)
                 return
             }
             librarySnapshot = await library.snapshot()
 
-            guard whisperRuntimeIsAvailableIfNeeded(for: plan.selection) else {
+            guard whisperRuntimeIsAvailableIfNeeded(for: plan.transcription.selection) else {
                 finishSession(id: id, message: WhisperRuntimeSmoke.linkStatus().displayDescription, tone: .error)
                 return
             }
 
-            let vadAvailability = vadAvailability(for: plan.selection)
+            let vadAvailability = vadAvailability(for: plan.transcription.selection)
             guard vadMode != .enabled || vadAvailability.isAvailable else {
                 finishSession(id: id, message: "Model VAD is not available for the selected provider.", tone: .error)
                 return
             }
 
-            switch plan.selection {
+            switch plan.transcription.selection {
             case .installed:
                 statusMessage = "Loading Whisper model. First run can take a few seconds..."
             case .system:
@@ -1043,7 +1079,7 @@ private struct CLSSmokeRootView: View {
             }
 
             let loaded = try await LocalSpeechEngine.shared.load(
-                selection: plan.selection,
+                selection: plan.transcription.selection,
                 from: library,
                 options: SpeechLoadOptions(
                     locale: .current,
@@ -1062,12 +1098,35 @@ private struct CLSSmokeRootView: View {
                 message: "input=\(liveInput.diagnosticValue)"
             )))
 
+            if let streamingPlan = plan.streamingDiarization,
+               let streamingSelection = plan.selection.diarization.streaming {
+                statusMessage = "Installing \(streamingPlan.displayName)..."
+                let streamingDiarizer = try await diarizationModelManager.installStreamingDiarizer(
+                    selection: streamingSelection,
+                    onProgress: { progress in
+                        Task { @MainActor in
+                            guard activeSessionID == id else { return }
+                            statusMessage = "Installing \(streamingPlan.displayName): \(Self.formatDiarizationInstallProgress(progress))"
+                        }
+                    }
+                )
+                await LocalSpeechEngine.shared.registerStreamingDiarizer(streamingDiarizer)
+                appendEvent(.diagnostic(TranscriptionDiagnostic(
+                    source: "smoke.diarization",
+                    message: "live=\(streamingPlan.displayName) selection=\(streamingSelection.storageValue)"
+                )))
+            }
+
             let capture = try makeCaptureSession(for: liveInput)
             captureSession = capture
             isStarting = false
             isListening = true
             statusTone = .listening
-            statusMessage = "Listening to \(liveInput.statusDisplayName) with \(loaded.displayName)."
+            statusMessage = Self.liveStatusMessage(
+                input: liveInput,
+                transcriptionDisplayName: loaded.displayName,
+                diarizationDisplayName: plan.streamingDiarization?.displayName
+            )
 
             let audio = capture.start(configuration: AudioCaptureConfiguration(
                 preferredSampleRate: 16_000,
@@ -1083,26 +1142,32 @@ private struct CLSSmokeRootView: View {
             let transcriptionAudio = recordingContext.map {
                 AudioChunkStreams.recording(audio, recorder: $0.recorder)
             } ?? audio
-            let stream = LocalSpeechEngine.shared.stream(
+            let analyzer = await LocalSpeechEngine.shared.makeAnalyzer()
+            let stream = analyzer.stream(
                 audio: transcriptionAudio,
-                options: StreamingTranscriptionOptions(
-                    transcription: TranscriptionOptions(
-                        useCase: .dictation,
-                        language: Locale.current.language.languageCode?.identifier,
-                        voiceActivityDetection: VoiceActivityDetectionOptions(
-                            mode: vadMode.runtimeMode,
-                            sensitivity: vadSensitivity.runtimeSensitivity
-                        )
+                options: StreamingSpeechAnalysisOptions(
+                    transcription: StreamingTranscriptionOptions(
+                        transcription: TranscriptionOptions(
+                            useCase: .dictation,
+                            language: Locale.current.language.languageCode?.identifier,
+                            voiceActivityDetection: VoiceActivityDetectionOptions(
+                                mode: vadMode.runtimeMode,
+                                sensitivity: vadSensitivity.runtimeSensitivity
+                            )
+                        ),
+                        strategy: .balanced
                     ),
-                    strategy: .balanced
+                    diarization: streamingDiarizationRequest(for: plan.selection.diarization.streaming),
+                    backlogPolicy: .dropDiarization
                 )
             )
 
             for try await event in stream {
                 try Task.checkCancellation()
                 guard activeSessionID == id else { return }
-                appendEvent(event)
-                if case .completed(let transcript) = event {
+                appendAnalysisEvent(event)
+                if case .completed(let result) = event,
+                   let transcript = result.speakerAttributedTranscript ?? result.transcript {
                     recordWER(
                         approach: liveWERApproach(for: vadMode),
                         hypothesisText: transcript.text
@@ -1304,6 +1369,7 @@ private struct CLSSmokeRootView: View {
         guard Self.isSupportedAudioFile(url) else {
             selectedFileURL = url
             fileTranscript = nil
+            fileAnalysisResult = nil
             fileProcessingDuration = nil
             fileStatusTone = .error
             fileStatusMessage = "Unsupported file extension: \(url.lastPathComponent)"
@@ -1312,6 +1378,7 @@ private struct CLSSmokeRootView: View {
 
         selectedFileURL = url
         fileTranscript = nil
+        fileAnalysisResult = nil
         fileProcessingDuration = nil
         fileStatusTone = .secondary
         fileStatusMessage = "Selected \(url.lastPathComponent)."
@@ -1338,13 +1405,14 @@ private struct CLSSmokeRootView: View {
             fileStatusMessage = "Choose an audio or movie file first."
             return
         }
-        guard selectedSelection != nil else {
+        guard let selectedPipelineSelection else {
             fileStatusTone = .error
-            fileStatusMessage = "Choose a speech provider first."
+            fileStatusMessage = "Choose a speech pipeline first."
             return
         }
 
-        let storedSelectionValue = selectionStorageValue
+        let storedSelectionValue = selectedPipelineSelection.storageValue
+        selectionStorageValue = storedSelectionValue
         let vadMode = selectedVADMode
         let vadSensitivity = selectedVADSensitivity
 
@@ -1356,6 +1424,7 @@ private struct CLSSmokeRootView: View {
         let sessionID = UUID()
         activeFileTranscriptionID = sessionID
         fileTranscript = nil
+        fileAnalysisResult = nil
         fileProcessingDuration = nil
         resetTranscriptDiagnostics()
         isFileTranscribing = true
@@ -1401,21 +1470,22 @@ private struct CLSSmokeRootView: View {
             guard activeFileTranscriptionID == id else { return }
             fileStatusMessage = "Loading selected provider..."
 
-            guard let plan = await LocalSpeechEngine.loadPlan(
+            guard let plan = await LocalSpeechEngine.pipelineLoadPlan(
                 from: selectionStorageValue,
                 in: library,
-                locale: .current
+                locale: .current,
+                diarizationPlanner: diarizationModelManager
             ) else {
                 finishFileTranscription(
                     id: id,
-                    message: "Selected speech provider is no longer available.",
+                    message: "Selected speech pipeline is no longer available.",
                     tone: .error
                 )
                 return
             }
             librarySnapshot = await library.snapshot()
 
-            guard whisperRuntimeIsAvailableIfNeeded(for: plan.selection) else {
+            guard whisperRuntimeIsAvailableIfNeeded(for: plan.transcription.selection) else {
                 finishFileTranscription(
                     id: id,
                     message: WhisperRuntimeSmoke.linkStatus().displayDescription,
@@ -1424,7 +1494,7 @@ private struct CLSSmokeRootView: View {
                 return
             }
 
-            let vadAvailability = vadAvailability(for: plan.selection)
+            let vadAvailability = vadAvailability(for: plan.transcription.selection)
             guard vadMode != .enabled || vadAvailability.isAvailable else {
                 finishFileTranscription(
                     id: id,
@@ -1435,7 +1505,7 @@ private struct CLSSmokeRootView: View {
             }
 
             let loaded = try await LocalSpeechEngine.shared.load(
-                selection: plan.selection,
+                selection: plan.transcription.selection,
                 from: library,
                 options: SpeechLoadOptions(
                     locale: .current,
@@ -1451,26 +1521,59 @@ private struct CLSSmokeRootView: View {
                 message: "file=\(fileURL.lastPathComponent) provider=\(loaded.backend.displayName) vad=\(vadMode.diagnosticValue) sensitivity=\(vadSensitivity.diagnosticValue) availability=\(vadAvailability.diagnosticValue)"
             )))
 
-            fileStatusMessage = "Transcribing \(fileURL.lastPathComponent) with \(loaded.displayName)..."
+            if let filePlan = plan.fileDiarization,
+               let fileSelection = plan.selection.diarization.file {
+                fileStatusMessage = "Installing \(filePlan.displayName)..."
+                let diarizer = try await diarizationModelManager.installFileDiarizer(
+                    selection: fileSelection,
+                    onProgress: { progress in
+                        Task { @MainActor in
+                            guard activeFileTranscriptionID == id else { return }
+                            fileStatusMessage = "Installing \(filePlan.displayName): \(Self.formatDiarizationInstallProgress(progress))"
+                        }
+                    }
+                )
+                await LocalSpeechEngine.shared.registerDiarizer(diarizer)
+                appendEvent(.diagnostic(TranscriptionDiagnostic(
+                    source: "smoke.diarization",
+                    message: "file=\(filePlan.displayName) selection=\(fileSelection.storageValue)"
+                )))
+            }
+
+            fileStatusMessage = Self.fileStatusMessage(
+                fileURL: fileURL,
+                transcriptionDisplayName: loaded.displayName,
+                diarizationDisplayName: plan.fileDiarization?.displayName
+            )
             let startedAt = Date()
-            let transcript = try await LocalSpeechEngine.shared.transcribe(
+            let analyzer = await LocalSpeechEngine.shared.makeAnalyzer()
+            let result = try await analyzer.analyze(
                 file: fileURL,
-                options: TranscriptionOptions(
-                    useCase: .general,
-                    language: Locale.current.language.languageCode?.identifier,
-                    voiceActivityDetection: VoiceActivityDetectionOptions(
-                        mode: vadMode.runtimeMode,
-                        sensitivity: vadSensitivity.runtimeSensitivity
-                    )
+                options: SpeechAnalysisOptions(
+                    transcription: TranscriptionOptions(
+                        useCase: .general,
+                        language: Locale.current.language.languageCode?.identifier,
+                        voiceActivityDetection: VoiceActivityDetectionOptions(
+                            mode: vadMode.runtimeMode,
+                            sensitivity: vadSensitivity.runtimeSensitivity
+                        )
+                    ),
+                    diarization: fileDiarizationRequest(for: plan.selection.diarization.file)
                 )
             )
             let processingDuration = Date().timeIntervalSince(startedAt)
+            let transcript = result.speakerAttributedTranscript ?? result.transcript ?? Transcript()
 
             guard activeFileTranscriptionID == id else { return }
             fileTranscript = transcript
+            fileAnalysisResult = result
             fileProcessingDuration = processingDuration
 
-            let audioDuration = transcript.duration ?? transcript.segments.last?.endTime ?? 0
+            for diagnostic in result.diagnostics {
+                appendEvent(.diagnostic(diagnostic))
+            }
+
+            let audioDuration = Self.analysisAudioDuration(result: result, transcript: transcript)
             appendEvent(.progress(TranscriptionProgress(
                 processedDuration: audioDuration,
                 totalDuration: audioDuration > 0 ? audioDuration : nil,
@@ -1487,7 +1590,11 @@ private struct CLSSmokeRootView: View {
 
             finishFileTranscription(
                 id: id,
-                message: "Transcribed \(fileURL.lastPathComponent) with \(loaded.displayName).",
+                message: Self.finishedFileStatusMessage(
+                    fileURL: fileURL,
+                    transcriptionDisplayName: loaded.displayName,
+                    diarizationDisplayName: plan.fileDiarization?.displayName
+                ),
                 tone: .secondary
             )
         } catch is CancellationError {
@@ -1566,6 +1673,137 @@ private struct CLSSmokeRootView: View {
                 diagnosticValue: "available:apple-speechdetector"
             )
         }
+    }
+
+    private func fileDiarizationRequest(for selection: DiarizationModelSelection?) -> DiarizationRequest? {
+        guard selection != nil else { return nil }
+        return DiarizationRequest()
+    }
+
+    private func streamingDiarizationRequest(
+        for selection: DiarizationModelSelection?
+    ) -> StreamingDiarizationRequest? {
+        guard let selection,
+              let backend = Self.streamingDiarizationBackend(for: selection)
+        else {
+            return nil
+        }
+        return StreamingDiarizationRequest(backend: backend)
+    }
+
+    private static func streamingDiarizationBackend(
+        for selection: DiarizationModelSelection
+    ) -> StreamingDiarizationBackend? {
+        switch selection.fluidAudioID {
+        case .streamingSortformer:
+            return .sortformer
+        case .streamingLSEEND:
+            return .lsEEND
+        case .offline, nil:
+            return nil
+        }
+    }
+
+    private static func liveStatusMessage(
+        input: CLSSmokeLiveInput,
+        transcriptionDisplayName: String,
+        diarizationDisplayName: String?
+    ) -> String {
+        guard let diarizationDisplayName else {
+            return "Listening to \(input.statusDisplayName) with \(transcriptionDisplayName)."
+        }
+        return "Listening to \(input.statusDisplayName) with \(transcriptionDisplayName) and \(diarizationDisplayName)."
+    }
+
+    private static func fileStatusMessage(
+        fileURL: URL,
+        transcriptionDisplayName: String,
+        diarizationDisplayName: String?
+    ) -> String {
+        guard let diarizationDisplayName else {
+            return "Transcribing \(fileURL.lastPathComponent) with \(transcriptionDisplayName)..."
+        }
+        return "Analyzing \(fileURL.lastPathComponent) with \(transcriptionDisplayName) and \(diarizationDisplayName)..."
+    }
+
+    private static func finishedFileStatusMessage(
+        fileURL: URL,
+        transcriptionDisplayName: String,
+        diarizationDisplayName: String?
+    ) -> String {
+        guard let diarizationDisplayName else {
+            return "Transcribed \(fileURL.lastPathComponent) with \(transcriptionDisplayName)."
+        }
+        return "Analyzed \(fileURL.lastPathComponent) with \(transcriptionDisplayName) and \(diarizationDisplayName)."
+    }
+
+    private static func analysisAudioDuration(
+        result: SpeechAnalysisResult,
+        transcript: Transcript
+    ) -> TimeInterval {
+        result.diarization?.duration
+            ?? transcript.duration
+            ?? transcript.segments.last?.endTime
+            ?? 0
+    }
+
+    private static func formatDiarizationInstallProgress(_ progress: FluidAudioModelInstallProgress) -> String {
+        let percentage = Int((progress.fractionCompleted * 100).rounded())
+        switch progress.phase {
+        case .starting(let backend):
+            return "\(percentage)% starting\(backend.map { " \($0.rawValue)" } ?? "")"
+        case .listing:
+            return "\(percentage)% listing model files"
+        case .downloading(let completedFiles, let totalFiles):
+            return "\(percentage)% downloading \(completedFiles)/\(totalFiles)"
+        case .compiling(let modelName):
+            return "\(percentage)% compiling \(modelName)"
+        case .finished:
+            return "ready"
+        }
+    }
+
+    private static func describeDiagnostic(_ diagnostic: SpeechDiagnostic) -> String {
+        let time = diagnostic.time.map { " \(formatDuration($0))" } ?? ""
+        return "\(diagnostic.source)\(time): \(diagnostic.message)"
+    }
+
+    private func appendAnalysisEvent(_ event: StreamingSpeechAnalysisEvent) {
+        switch event {
+        case .transcription(let transcriptEvent):
+            appendEvent(transcriptEvent)
+        case .diarization(let snapshot):
+            appendEvent(.diagnostic(TranscriptionDiagnostic(
+                source: "smoke.diarization",
+                message: Self.diarizationSnapshotDescription(snapshot)
+            )))
+        case .speakerAttributedSnapshot(let snapshot):
+            appendEvent(.snapshot(snapshot))
+        case .completed(let result):
+            appendEvent(.diagnostic(TranscriptionDiagnostic(
+                source: "smoke.analysis",
+                message: Self.analysisCompletionDescription(result)
+            )))
+            if let speakerAttributedTranscript = result.speakerAttributedTranscript {
+                appendEvent(.completed(speakerAttributedTranscript))
+            }
+        }
+    }
+
+    private static func diarizationSnapshotDescription(_ snapshot: StreamingDiarizationSnapshot) -> String {
+        let stableTurns = snapshot.stable.turns.count
+        let stableSpeakers = snapshot.stable.speakers.count
+        let volatileTurns = snapshot.volatile?.turns.count ?? 0
+        let volatileSpeakers = snapshot.volatile?.speakers.count ?? 0
+        return "stableTurns=\(stableTurns) stableSpeakers=\(stableSpeakers) volatileTurns=\(volatileTurns) volatileSpeakers=\(volatileSpeakers)"
+    }
+
+    private static func analysisCompletionDescription(_ result: SpeechAnalysisResult) -> String {
+        let transcriptSegments = result.transcript?.segments.count ?? 0
+        let attributedSegments = result.speakerAttributedTranscript?.segments.count ?? 0
+        let diarizationTurns = result.diarization?.turns.count ?? 0
+        let speakers = result.diarization?.speakers.count ?? 0
+        return "diarizationStatus=\(result.diarizationStatus.rawValue) transcriptSegments=\(transcriptSegments) attributedSegments=\(attributedSegments) turns=\(diarizationTurns) speakers=\(speakers)"
     }
 
     private func appendEvent(_ event: TranscriptEvent) {
