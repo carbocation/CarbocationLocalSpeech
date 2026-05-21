@@ -96,6 +96,27 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertTrue(result.diagnostics.contains { $0.source == "merger" })
     }
 
+    func testEngineRegistersDiarizerForAnalyzerConstruction() async {
+        let engine = LocalSpeechEngine()
+        let speaker = SpeakerID(rawValue: "A")
+        let diarization = DiarizationResult(
+            turns: [SpeakerTurn(speaker: speaker, startTime: 0, endTime: 0.5)],
+            speakers: [Speaker(id: speaker)],
+            duration: 0.5,
+            backend: SpeechBackendDescriptor(kind: .mock, displayName: "Mock Diarizer")
+        )
+
+        let initialDiarizer = await engine.activeDiarizer()
+        XCTAssertNil(initialDiarizer)
+
+        await engine.registerDiarizer(MockSpeakerDiarizer(result: diarization))
+
+        let activeDiarizer = await engine.activeDiarizer()
+        XCTAssertNotNil(activeDiarizer)
+        let analyzer = await engine.makeAnalyzer()
+        XCTAssertNotNil(analyzer as LocalSpeechAnalyzer?)
+    }
+
     func testInstalledSelectionRoutesToWhisperProvider() async throws {
         let root = try makeTemporaryDirectory()
         let source = root.appendingPathComponent("ggml-base.en.bin")

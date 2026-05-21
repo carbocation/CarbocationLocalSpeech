@@ -89,6 +89,7 @@ public actor LocalSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
     private let whisperEngine: WhisperEngine
     private let appleSpeechEngine: AppleSpeechEngine
     private var loadedInfo: LocalSpeechLoadedModelInfo?
+    private var registeredDiarizer: (any SpeakerDiarizer)?
 
     public init(
         whisperEngine: WhisperEngine = WhisperEngine(),
@@ -96,6 +97,18 @@ public actor LocalSpeechEngine: CarbocationLocalSpeech.SpeechTranscriber {
     ) {
         self.whisperEngine = whisperEngine
         self.appleSpeechEngine = appleSpeechEngine
+    }
+
+    public func registerDiarizer(_ diarizer: any SpeakerDiarizer) {
+        registeredDiarizer = diarizer
+    }
+
+    public func activeDiarizer() -> (any SpeakerDiarizer)? {
+        registeredDiarizer
+    }
+
+    public func makeAnalyzer() -> LocalSpeechAnalyzer {
+        LocalSpeechAnalyzer(transcriber: self, diarizer: registeredDiarizer)
     }
 
     public nonisolated static func systemModelOptions(locale: Locale) async -> [SpeechSystemModelOption] {

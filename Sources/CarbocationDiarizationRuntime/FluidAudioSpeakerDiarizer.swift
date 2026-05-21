@@ -45,6 +45,20 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer {
         }
     }
 
+    internal func buildConfig(for options: CarbocationLocalSpeech.DiarizationOptions) -> OfflineDiarizerConfig {
+        var config = baseConfig
+        if let exactSpeakerCount = options.exactSpeakerCount {
+            config.clustering.numSpeakers = exactSpeakerCount
+            config.clustering.minSpeakers = nil
+            config.clustering.maxSpeakers = nil
+        } else if options.minimumSpeakerCount != nil || options.maximumSpeakerCount != nil {
+            config.clustering.minSpeakers = options.minimumSpeakerCount
+            config.clustering.maxSpeakers = options.maximumSpeakerCount
+            config.clustering.numSpeakers = nil
+        }
+        return config
+    }
+
     public func diarize(
         audio: CarbocationLocalSpeech.PreparedAudio,
         options: CarbocationLocalSpeech.DiarizationOptions
@@ -56,11 +70,7 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer {
             )
         }
 
-        var config = baseConfig
-        config.clustering.minSpeakers = options.minimumSpeakerCount
-        config.clustering.maxSpeakers = options.maximumSpeakerCount
-        config.clustering.numSpeakers = options.exactSpeakerCount
-
+        let config = buildConfig(for: options)
         let manager = OfflineDiarizerManager(config: config)
         manager.initialize(models: models)
 
