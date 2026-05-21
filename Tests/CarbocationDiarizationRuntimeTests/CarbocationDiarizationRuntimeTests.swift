@@ -174,10 +174,16 @@ final class CarbocationDiarizationRuntimeTests: XCTestCase {
         XCTAssertEqual(snapshot.stable.speakers.first?.displayName, "Speaker 0 (recovery 1)")
     }
 
-    func testStreamingDiarizerRejectsConcurrentStreamsAndInstallWhileStreaming() async throws {
+    func testStreamingDiarizerAllowsConcurrentStreamsAndRejectsInstallWhileStreaming() async throws {
         let firstChunkProcessed = expectation(description: "First streaming chunk was processed")
-        let testDiarizer = TestFluidStreamingDiarizer(processedExpectation: firstChunkProcessed)
-        let diarizer = FluidAudioStreamingSpeakerDiarizer(sortformerDiarizer: testDiarizer)
+        let secondChunkProcessed = expectation(description: "Second streaming chunk was processed")
+        let factory = TestFluidStreamingDiarizerFactory(diarizers: [
+            TestFluidStreamingDiarizer(processedExpectation: firstChunkProcessed),
+            TestFluidStreamingDiarizer(processedExpectation: secondChunkProcessed)
+        ])
+        let diarizer = FluidAudioStreamingSpeakerDiarizer(sortformerSessionFactory: {
+            try factory.makeDiarizer()
+        })
         var firstContinuation: AsyncThrowingStream<AudioChunk, Error>.Continuation!
         let firstAudio = AsyncThrowingStream<AudioChunk, Error> { continuation in
             firstContinuation = continuation
@@ -201,8 +207,17 @@ final class CarbocationDiarizationRuntimeTests: XCTestCase {
         }
         await fulfillment(of: [firstChunkProcessed], timeout: 1.0)
 
+        var secondContinuation: AsyncThrowingStream<AudioChunk, Error>.Continuation!
         let secondStream = diarizer.stream(
             audio: AsyncThrowingStream<AudioChunk, Error> { continuation in
+                secondContinuation = continuation
+                continuation.yield(AudioChunk(
+                    samples: Array(repeating: 0.05, count: 1_600),
+                    sampleRate: 16_000,
+                    channelCount: 1,
+                    startTime: 0.1,
+                    duration: 0.1
+                ))
                 continuation.finish()
             },
             options: StreamingDiarizationOptions(
@@ -210,16 +225,12 @@ final class CarbocationDiarizationRuntimeTests: XCTestCase {
                 backend: .sortformer
             )
         )
-        do {
+        let secondTask = Task {
             for try await _ in secondStream {}
-            XCTFail("Expected concurrent streaming session to be rejected.")
-        } catch let error as FluidAudioStreamingSpeakerDiarizerError {
-            guard case .operationInProgress = error else {
-                return XCTFail("Unexpected FluidAudio streaming error: \(error)")
-            }
-        } catch {
-            XCTFail("Unexpected error: \(error)")
         }
+        await fulfillment(of: [secondChunkProcessed], timeout: 1.0)
+        secondContinuation.finish()
+        try await secondTask.value
 
         do {
             try await diarizer.installModels(backend: .sortformer)
@@ -234,6 +245,7 @@ final class CarbocationDiarizationRuntimeTests: XCTestCase {
 
         firstContinuation.finish()
         try await firstTask.value
+        XCTAssertEqual(factory.makeCount, 2)
     }
 
     func testStreamingDiarizerUnloadModelsCleansUpAndReleasesDiarizers() async throws {
@@ -410,6 +422,27 @@ final class CarbocationDiarizationRuntimeTests: XCTestCase {
 
         XCTAssertFalse(snapshots.isEmpty)
         XCTAssertTrue(snapshots.contains { !$0.diarization.turns.isEmpty })
+    }
+}
+
+private final class TestFluidStreamingDiarizerFactory: @unchecked Sendable {
+    private let lock = NSLock()
+    private var diarizers: [TestFluidStreamingDiarizer]
+    private(set) var makeCount = 0
+
+    init(diarizers: [TestFluidStreamingDiarizer]) {
+        self.diarizers = diarizers
+    }
+
+    func makeDiarizer() throws -> any Diarizer {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !diarizers.isEmpty else {
+            throw NSError(domain: "TestFluidStreamingDiarizerFactory", code: 1)
+        }
+        makeCount += 1
+        return diarizers.removeFirst()
     }
 }
 

@@ -228,6 +228,7 @@ public struct DiarizationOptions: Codable, Hashable, Sendable {
 }
 
 public protocol SpeakerDiarizer: Sendable {
+    func diarize(file url: URL, options: DiarizationOptions) async throws -> DiarizationResult
     func diarize(audio: PreparedAudio, options: DiarizationOptions) async throws -> DiarizationResult
 }
 
@@ -254,6 +255,10 @@ public final class FileSpeakerDiarizerAdapter: SpeakerDiarizer, Sendable {
 
     public init(urlDiarizer: @escaping @Sendable (URL, DiarizationOptions) async throws -> DiarizationResult) {
         self.urlDiarizer = urlDiarizer
+    }
+
+    public func diarize(file url: URL, options: DiarizationOptions) async throws -> DiarizationResult {
+        try await urlDiarizer(url, options)
     }
 
     public func diarize(audio: PreparedAudio, options: DiarizationOptions) async throws -> DiarizationResult {

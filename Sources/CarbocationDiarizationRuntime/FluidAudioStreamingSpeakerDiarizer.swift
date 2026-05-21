@@ -47,31 +47,109 @@ public struct FluidAudioStreamingComputeUnits: Sendable {
 }
 
 @available(macOS 14.0, iOS 17.0, *)
-public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.StreamingSpeakerDiarizer,
-    CarbocationLocalSpeech.DiarizationModelLifecycle {
-    private enum ActiveOperation: Sendable, Equatable {
-        case installing(UUID)
-        case streaming(UUID)
+private protocol StreamingDiarizerSessionFactory: Sendable {
+    func makeDiarizer() throws -> any Diarizer
+    func cleanup()
+}
 
-        var description: String {
-            switch self {
-            case .installing:
-                return "model installation"
-            case .streaming:
-                return "streaming session"
-            }
-        }
+@available(macOS 14.0, iOS 17.0, *)
+private final class SortformerStreamingDiarizerSessionFactory: StreamingDiarizerSessionFactory, @unchecked Sendable {
+    private let config: SortformerConfig
+    private let mainModel: MLModel
+    private let compilationDuration: TimeInterval
+
+    init(models: SortformerModels, config: SortformerConfig) {
+        self.config = config
+        self.mainModel = models.mainModel
+        self.compilationDuration = models.compilationDuration
     }
 
+    func makeDiarizer() throws -> any Diarizer {
+        let sessionModels = try SortformerModels(
+            config: config,
+            main: mainModel,
+            compilationDuration: compilationDuration
+        )
+        let diarizer = SortformerDiarizer(config: config)
+        diarizer.initialize(models: sessionModels)
+        return diarizer
+    }
+
+    func cleanup() {}
+}
+
+@available(macOS 14.0, iOS 17.0, *)
+private final class LSEENDStreamingDiarizerSessionFactory: StreamingDiarizerSessionFactory, @unchecked Sendable {
+    private let model: LSEENDModel
+
+    init(model: LSEENDModel) {
+        self.model = model
+    }
+
+    func makeDiarizer() throws -> any Diarizer {
+        let diarizer = LSEENDDiarizer()
+        try diarizer.initialize(model: model)
+        return diarizer
+    }
+
+    func cleanup() {}
+}
+
+@available(macOS 14.0, iOS 17.0, *)
+private final class ClosureStreamingDiarizerSessionFactory: StreamingDiarizerSessionFactory, @unchecked Sendable {
+    private let makeHandler: () throws -> any Diarizer
+    private let cleanupHandler: () -> Void
+
+    init(
+        makeHandler: @escaping () throws -> any Diarizer,
+        cleanupHandler: @escaping () -> Void = {}
+    ) {
+        self.makeHandler = makeHandler
+        self.cleanupHandler = cleanupHandler
+    }
+
+    func makeDiarizer() throws -> any Diarizer {
+        try makeHandler()
+    }
+
+    func cleanup() {
+        cleanupHandler()
+    }
+}
+
+@available(macOS 14.0, iOS 17.0, *)
+private final class FluidAudioStreamingDiarizerSession: @unchecked Sendable {
+    let id: UUID
+    let diarizer: any Diarizer
+    let backend: StreamingDiarizationBackend
+    let displayName: String
+
+    init(
+        id: UUID,
+        diarizer: any Diarizer,
+        backend: StreamingDiarizationBackend,
+        displayName: String
+    ) {
+        self.id = id
+        self.diarizer = diarizer
+        self.backend = backend
+        self.displayName = displayName
+    }
+}
+
+@available(macOS 14.0, iOS 17.0, *)
+public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.StreamingSpeakerDiarizer,
+    CarbocationLocalSpeech.DiarizationModelLifecycle {
     private let modelsDirectory: URL?
     private let computeUnits: FluidAudioStreamingComputeUnits
     private let sortformerConfig: SortformerConfig
     private let lseendVariant: LSEENDVariant
     private let lseendStepSize: LSEENDStepSize
 
-    private var sortformerDiarizer: (any Diarizer)?
-    private var lseendDiarizer: (any Diarizer)?
-    private var activeOperation: ActiveOperation?
+    private var sortformerSessionFactory: (any StreamingDiarizerSessionFactory)?
+    private var lseendSessionFactory: (any StreamingDiarizerSessionFactory)?
+    private var activeInstallID: UUID?
+    private var activeStreamIDs = Set<UUID>()
 
     public init(
         modelsDirectory: URL? = nil,
@@ -110,28 +188,57 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
         self.sortformerConfig = .fastV2_1
         self.lseendVariant = .dihard3
         self.lseendStepSize = .step100ms
-        self.sortformerDiarizer = sortformerDiarizer
-        self.lseendDiarizer = lseendDiarizer
+        if let sortformerDiarizer {
+            self.sortformerSessionFactory = ClosureStreamingDiarizerSessionFactory(
+                makeHandler: { sortformerDiarizer },
+                cleanupHandler: { sortformerDiarizer.cleanup() }
+            )
+        }
+        if let lseendDiarizer {
+            self.lseendSessionFactory = ClosureStreamingDiarizerSessionFactory(
+                makeHandler: { lseendDiarizer },
+                cleanupHandler: { lseendDiarizer.cleanup() }
+            )
+        }
+    }
+
+    internal init(
+        sortformerSessionFactory: @escaping () throws -> any Diarizer,
+        lseendSessionFactory: (() throws -> any Diarizer)? = nil
+    ) {
+        self.modelsDirectory = nil
+        self.computeUnits = .uniform(.all)
+        self.sortformerConfig = .fastV2_1
+        self.lseendVariant = .dihard3
+        self.lseendStepSize = .step100ms
+        self.sortformerSessionFactory = ClosureStreamingDiarizerSessionFactory(makeHandler: sortformerSessionFactory)
+        if let lseendSessionFactory {
+            self.lseendSessionFactory = ClosureStreamingDiarizerSessionFactory(makeHandler: lseendSessionFactory)
+        }
     }
 
     public func installModels(
         backend: StreamingDiarizationBackend = .automatic,
         onProgress: @escaping @Sendable (FluidAudioModelInstallProgress) -> Void = { _ in }
     ) async throws {
-        let operationID = try beginOperation(.installing(UUID()))
-        defer { endOperation(operationID) }
+        let operationID = try beginInstall()
+        defer { endInstall(operationID) }
 
         onProgress(FluidAudioModelInstallProgress(fractionCompleted: 0, phase: .starting(backend)))
         do {
+            try Task.checkCancellation()
             switch backend {
             case .automatic, .sortformer:
                 try await installSortformer(onProgress: onProgress)
             case .lsEEND:
                 try await installLSEEND(onProgress: onProgress)
             }
+            try Task.checkCancellation()
             onProgress(FluidAudioModelInstallProgress(fractionCompleted: 1, phase: .finished(backend)))
         } catch let error as FluidAudioStreamingSpeakerDiarizerError {
             throw error
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw Self.installError(from: error)
         }
@@ -144,11 +251,23 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await self.runStream(
-                        audio: audio,
-                        options: options,
-                        continuation: continuation
-                    )
+                    try options.options.validate()
+                    try Task.checkCancellation()
+                    let session = try await self.makeSession(for: options.backend)
+                    do {
+                        try await Self.runStreamSession(
+                            audio: audio,
+                            options: options,
+                            continuation: continuation,
+                            session: session
+                        )
+                        session.diarizer.cleanup()
+                        await self.endStream(session.id)
+                    } catch {
+                        session.diarizer.cleanup()
+                        await self.endStream(session.id)
+                        throw error
+                    }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -161,20 +280,26 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
     }
 
     public func unloadModels() async throws {
-        if let activeOperation {
+        if let activeInstallID {
             throw FluidAudioStreamingSpeakerDiarizerError.operationInProgress(
-                "Cannot unload models while \(activeOperation.description) is active."
+                "Cannot unload models while model installation \(activeInstallID) is active."
             )
         }
-        sortformerDiarizer?.cleanup()
-        lseendDiarizer?.cleanup()
-        sortformerDiarizer = nil
-        lseendDiarizer = nil
+        if !activeStreamIDs.isEmpty {
+            throw FluidAudioStreamingSpeakerDiarizerError.operationInProgress(
+                "Cannot unload models while \(activeStreamIDs.count) streaming session(s) are active."
+            )
+        }
+        sortformerSessionFactory?.cleanup()
+        lseendSessionFactory?.cleanup()
+        sortformerSessionFactory = nil
+        lseendSessionFactory = nil
     }
 
     private func installSortformer(
         onProgress: @escaping @Sendable (FluidAudioModelInstallProgress) -> Void
     ) async throws {
+        try Task.checkCancellation()
         let models = try await SortformerModels.loadFromHuggingFace(
             config: sortformerConfig,
             cacheDirectory: modelsDirectory,
@@ -183,16 +308,18 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
                 onProgress(FluidAudioModelInstallDiagnostics.mapProgress(progress))
             }
         )
-        let diarizer = SortformerDiarizer(config: sortformerConfig)
-        diarizer.initialize(models: models)
-        sortformerDiarizer = diarizer
+        try Task.checkCancellation()
+        sortformerSessionFactory = SortformerStreamingDiarizerSessionFactory(
+            models: models,
+            config: sortformerConfig
+        )
     }
 
     private func installLSEEND(
         onProgress: @escaping @Sendable (FluidAudioModelInstallProgress) -> Void
     ) async throws {
-        let diarizer = LSEENDDiarizer()
-        try await diarizer.initialize(
+        try Task.checkCancellation()
+        let model = try await LSEENDModel.loadFromHuggingFace(
             variant: lseendVariant,
             stepSize: lseendStepSize,
             cacheDirectory: modelsDirectory,
@@ -201,25 +328,22 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
                 onProgress(FluidAudioModelInstallDiagnostics.mapProgress(progress))
             }
         )
-        lseendDiarizer = diarizer
+        try Task.checkCancellation()
+        lseendSessionFactory = LSEENDStreamingDiarizerSessionFactory(model: model)
     }
 
-    private func runStream(
+    private nonisolated static func runStreamSession(
         audio: AsyncThrowingStream<AudioChunk, Error>,
         options: StreamingDiarizationOptions,
-        continuation: AsyncThrowingStream<StreamingDiarizationSnapshot, Error>.Continuation
+        continuation: AsyncThrowingStream<StreamingDiarizationSnapshot, Error>.Continuation,
+        session: FluidAudioStreamingDiarizerSession
     ) async throws {
-        try options.options.validate()
-        let operationID = try beginOperation(.streaming(UUID()))
-        defer { endOperation(operationID) }
-
-        let (diarizer, backend, displayName) = try resolveDiarizer(for: options.backend)
-        diarizer.reset()
-
+        let diarizer = session.diarizer
         var baseTime: TimeInterval?
         var recoveryGeneration = 0
 
         do {
+            diarizer.reset()
             for try await chunk in audio {
                 try Task.checkCancellation()
 
@@ -238,8 +362,8 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
                         tentativeSegments: Self.tentativeSegments(from: diarizer.timeline),
                         baseTime: currentBaseTime,
                         options: options,
-                        backend: backend,
-                        displayName: displayName,
+                        backend: session.backend,
+                        displayName: session.displayName,
                         speakerNamespace: Self.speakerNamespace(forRecoveryGeneration: recoveryGeneration)
                     )
                     if snapshot.hasTurns {
@@ -255,8 +379,8 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
                     tentativeSegments: [],
                     baseTime: currentBaseTime,
                     options: options,
-                    backend: backend,
-                    displayName: displayName,
+                    backend: session.backend,
+                    displayName: session.displayName,
                     speakerNamespace: Self.speakerNamespace(forRecoveryGeneration: recoveryGeneration)
                 )
                 if snapshot.hasTurns {
@@ -265,33 +389,62 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
             }
         } catch let error as FluidAudioStreamingSpeakerDiarizerError {
             throw error
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw FluidAudioStreamingSpeakerDiarizerError.inferenceFailed(error.localizedDescription)
         }
     }
 
     @discardableResult
-    private func beginOperation(_ operation: ActiveOperation) throws -> UUID {
-        if let activeOperation {
+    private func beginInstall() throws -> UUID {
+        if let activeInstallID {
             throw FluidAudioStreamingSpeakerDiarizerError.operationInProgress(
-                "Cannot start \(operation.description) while \(activeOperation.description) is active."
+                "Cannot start model installation while model installation \(activeInstallID) is active."
             )
         }
+        if !activeStreamIDs.isEmpty {
+            throw FluidAudioStreamingSpeakerDiarizerError.operationInProgress(
+                "Cannot start model installation while \(activeStreamIDs.count) streaming session(s) are active."
+            )
+        }
+        let id = UUID()
+        activeInstallID = id
+        return id
+    }
 
-        activeOperation = operation
-        switch operation {
-        case .installing(let id), .streaming(let id):
-            return id
+    private func endInstall(_ id: UUID) {
+        guard activeInstallID == id else { return }
+        activeInstallID = nil
+    }
+
+    private func makeSession(
+        for backend: StreamingDiarizationBackend
+    ) throws -> FluidAudioStreamingDiarizerSession {
+        if let activeInstallID {
+            throw FluidAudioStreamingSpeakerDiarizerError.operationInProgress(
+                "Cannot start streaming session while model installation \(activeInstallID) is active."
+            )
+        }
+        let (factory, resolvedBackend, displayName) = try resolveSessionFactory(for: backend)
+        let id = UUID()
+        activeStreamIDs.insert(id)
+        do {
+            let diarizer = try factory.makeDiarizer()
+            return FluidAudioStreamingDiarizerSession(
+                id: id,
+                diarizer: diarizer,
+                backend: resolvedBackend,
+                displayName: displayName
+            )
+        } catch {
+            activeStreamIDs.remove(id)
+            throw error
         }
     }
 
-    private func endOperation(_ id: UUID) {
-        switch activeOperation {
-        case .installing(id), .streaming(id):
-            activeOperation = nil
-        case .installing, .streaming, nil:
-            break
-        }
+    private func endStream(_ id: UUID) {
+        activeStreamIDs.remove(id)
     }
 
     internal nonisolated static func installError(from error: Error) -> FluidAudioStreamingSpeakerDiarizerError {
@@ -314,34 +467,50 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
         }
     }
 
-    private func resolveDiarizer(
+    private func resolveSessionFactory(
         for backend: StreamingDiarizationBackend
-    ) throws -> (any Diarizer, StreamingDiarizationBackend, String) {
+    ) throws -> (any StreamingDiarizerSessionFactory, StreamingDiarizationBackend, String) {
         switch backend {
         case .automatic:
-            if let sortformerDiarizer {
-                return (sortformerDiarizer, StreamingDiarizationBackend.sortformer, "FluidAudio Streaming Sortformer")
+            if let sortformerSessionFactory {
+                return (
+                    sortformerSessionFactory,
+                    StreamingDiarizationBackend.sortformer,
+                    "FluidAudio Streaming Sortformer"
+                )
             }
-            if let lseendDiarizer {
-                return (lseendDiarizer, StreamingDiarizationBackend.lsEEND, "FluidAudio Streaming LS-EEND")
+            if let lseendSessionFactory {
+                return (
+                    lseendSessionFactory,
+                    StreamingDiarizationBackend.lsEEND,
+                    "FluidAudio Streaming LS-EEND"
+                )
             }
             throw FluidAudioStreamingSpeakerDiarizerError.modelAssetsMissing(
                 "Call FluidAudioStreamingSpeakerDiarizer.installModels() before stream(audio:options:)."
             )
         case .sortformer:
-            guard let sortformerDiarizer else {
+            guard let sortformerSessionFactory else {
                 throw FluidAudioStreamingSpeakerDiarizerError.modelAssetsMissing(
                     "Call FluidAudioStreamingSpeakerDiarizer.installModels(backend: .sortformer) before streaming Sortformer diarization."
                 )
             }
-            return (sortformerDiarizer, StreamingDiarizationBackend.sortformer, "FluidAudio Streaming Sortformer")
+            return (
+                sortformerSessionFactory,
+                StreamingDiarizationBackend.sortformer,
+                "FluidAudio Streaming Sortformer"
+            )
         case .lsEEND:
-            guard let lseendDiarizer else {
+            guard let lseendSessionFactory else {
                 throw FluidAudioStreamingSpeakerDiarizerError.modelAssetsMissing(
                     "Call FluidAudioStreamingSpeakerDiarizer.installModels(backend: .lsEEND) before streaming LS-EEND diarization."
                 )
             }
-            return (lseendDiarizer, StreamingDiarizationBackend.lsEEND, "FluidAudio Streaming LS-EEND")
+            return (
+                lseendSessionFactory,
+                StreamingDiarizationBackend.lsEEND,
+                "FluidAudio Streaming LS-EEND"
+            )
         }
     }
 

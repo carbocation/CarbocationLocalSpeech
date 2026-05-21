@@ -212,6 +212,32 @@ public struct SpeechAnalysisOptions: Hashable, Sendable {
     }
 }
 
+public struct SpeakerAttributionRestorationOptions: Codable, Hashable, Sendable {
+    public var timeBucketWidth: TimeInterval
+    public var minimumOverlapDuration: TimeInterval
+    public var minimumWordCoverage: Double
+    public var minimumSegmentCoverage: Double
+    public var ambiguityRatio: Double
+
+    public init(
+        timeBucketWidth: TimeInterval = 5,
+        minimumOverlapDuration: TimeInterval = 0.02,
+        minimumWordCoverage: Double = 0.45,
+        minimumSegmentCoverage: Double = 0.45,
+        ambiguityRatio: Double = 0.85
+    ) {
+        self.timeBucketWidth = max(0.001, timeBucketWidth)
+        self.minimumOverlapDuration = max(0, minimumOverlapDuration)
+        self.minimumWordCoverage = Self.clampedUnit(minimumWordCoverage)
+        self.minimumSegmentCoverage = Self.clampedUnit(minimumSegmentCoverage)
+        self.ambiguityRatio = Self.clampedUnit(ambiguityRatio)
+    }
+
+    private static func clampedUnit(_ value: Double) -> Double {
+        min(1, max(0, value))
+    }
+}
+
 public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
     public var options: DiarizationOptions
     public var backend: StreamingDiarizationBackend
@@ -221,6 +247,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
     public var attributionJitterBufferDelay: TimeInterval
     public var maximumAttributionJitterBufferDelay: TimeInterval?
     public var attributionCacheRetentionWindow: TimeInterval
+    public var attributionRestorationOptions: SpeakerAttributionRestorationOptions
 
     public init(
         options: DiarizationOptions = DiarizationOptions(),
@@ -230,7 +257,8 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         attributionLookbackWindow: TimeInterval = 30,
         attributionJitterBufferDelay: TimeInterval = 0.75,
         maximumAttributionJitterBufferDelay: TimeInterval? = nil,
-        attributionCacheRetentionWindow: TimeInterval = 600
+        attributionCacheRetentionWindow: TimeInterval = 600,
+        attributionRestorationOptions: SpeakerAttributionRestorationOptions = SpeakerAttributionRestorationOptions()
     ) {
         self.options = options
         self.backend = backend
@@ -240,6 +268,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         self.attributionJitterBufferDelay = attributionJitterBufferDelay
         self.maximumAttributionJitterBufferDelay = maximumAttributionJitterBufferDelay.map { max(0, $0) }
         self.attributionCacheRetentionWindow = max(0, attributionCacheRetentionWindow)
+        self.attributionRestorationOptions = attributionRestorationOptions
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -251,6 +280,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         case attributionJitterBufferDelay
         case maximumAttributionJitterBufferDelay
         case attributionCacheRetentionWindow
+        case attributionRestorationOptions
     }
 
     public init(from decoder: Decoder) throws {
@@ -278,6 +308,10 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
             TimeInterval.self,
             forKey: .attributionCacheRetentionWindow
         ) ?? 600)
+        attributionRestorationOptions = try container.decodeIfPresent(
+            SpeakerAttributionRestorationOptions.self,
+            forKey: .attributionRestorationOptions
+        ) ?? SpeakerAttributionRestorationOptions()
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -290,6 +324,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         try container.encode(attributionJitterBufferDelay, forKey: .attributionJitterBufferDelay)
         try container.encodeIfPresent(maximumAttributionJitterBufferDelay, forKey: .maximumAttributionJitterBufferDelay)
         try container.encode(attributionCacheRetentionWindow, forKey: .attributionCacheRetentionWindow)
+        try container.encode(attributionRestorationOptions, forKey: .attributionRestorationOptions)
     }
 
     public var streamingOptions: StreamingDiarizationOptions {

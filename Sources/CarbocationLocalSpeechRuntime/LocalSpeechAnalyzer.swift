@@ -24,8 +24,47 @@ public actor LocalSpeechAnalyzer: Sendable {
             )
         }
 
-        let audio = try await AudioResampler16kMono().prepareFile(at: url)
-        return try await analyze(audio: audio, options: options)
+        let activeTranscriber = transcriber
+        let activeDiarizer = diarizer
+
+        return try await withThrowingTaskGroup(of: SpeechAnalysisSubResult.self) { group in
+            group.addTask {
+                let transcript = try await activeTranscriber.transcribe(
+                    file: url,
+                    options: options.transcription
+                )
+                return .transcript(transcript)
+            }
+
+            if let diarizationRequest = options.diarization,
+               let registeredDiarizer = activeDiarizer {
+                group.addTask {
+                    let diarization = try await registeredDiarizer.diarize(
+                        file: url,
+                        options: diarizationRequest.options
+                    )
+                    return .diarization(diarization)
+                }
+            }
+
+            var transcript: Transcript?
+            var diarization: DiarizationResult?
+
+            while let subResult = try await group.next() {
+                switch subResult {
+                case .transcript(let value):
+                    transcript = value
+                case .diarization(let value):
+                    diarization = value
+                }
+            }
+
+            return makeSpeechAnalysisResult(
+                transcript: transcript,
+                diarization: diarization,
+                diarizationRequest: options.diarization
+            )
+        }
     }
 
     public func analyze(audio: PreparedAudio, options: SpeechAnalysisOptions) async throws -> SpeechAnalysisResult {
@@ -71,27 +110,10 @@ public actor LocalSpeechAnalyzer: Sendable {
                 }
             }
 
-            var attributedResult: SpeakerAttributionMergeResult?
-            if let transcript,
-               let diarization,
-               let diarizationRequest = options.diarization {
-                attributedResult = SpeakerAttributionMerger.merge(
-                    transcript: transcript,
-                    diarization: diarization,
-                    policy: diarizationRequest.policy
-                )
-            }
-
-            let diagnostics = (transcript?.backend != nil
-                ? [SpeechDiagnostic(source: "analyzer", message: "Cooperative ASR finished")]
-                : []
-            ) + (diarization?.diagnostics ?? []) + (attributedResult?.diagnostics ?? [])
-            return SpeechAnalysisResult(
+            return makeSpeechAnalysisResult(
                 transcript: transcript,
                 diarization: diarization,
-                speakerAttributedTranscript: attributedResult?.transcript,
-                diagnostics: diagnostics,
-                diarizationStatus: options.diarization == nil ? .notRequested : .completed
+                diarizationRequest: options.diarization
             )
         }
     }
@@ -143,6 +165,36 @@ public actor LocalSpeechAnalyzer: Sendable {
 private enum SpeechAnalysisSubResult: Sendable {
     case transcript(Transcript)
     case diarization(DiarizationResult)
+}
+
+private func makeSpeechAnalysisResult(
+    transcript: Transcript?,
+    diarization: DiarizationResult?,
+    diarizationRequest: DiarizationRequest?
+) -> SpeechAnalysisResult {
+    var attributedResult: SpeakerAttributionMergeResult?
+    if let transcript,
+       let diarization,
+       let diarizationRequest {
+        attributedResult = SpeakerAttributionMerger.merge(
+            transcript: transcript,
+            diarization: diarization,
+            policy: diarizationRequest.policy
+        )
+    }
+
+    let diagnostics = (transcript?.backend != nil
+        ? [SpeechDiagnostic(source: "analyzer", message: "Cooperative ASR finished")]
+        : []
+    ) + (diarization?.diagnostics ?? []) + (attributedResult?.diagnostics ?? [])
+
+    return SpeechAnalysisResult(
+        transcript: transcript,
+        diarization: diarization,
+        speakerAttributedTranscript: attributedResult?.transcript,
+        diagnostics: diagnostics,
+        diarizationStatus: diarizationRequest == nil ? .notRequested : .completed
+    )
 }
 
 private func streamTranscriptionOnly(
@@ -1020,6 +1072,8 @@ private actor StreamingSpeechAnalysisState {
             return transcript
         }
         let previousSegmentsByID = Dictionary(uniqueKeysWithValues: previousStable.segments.map { ($0.id, $0) })
+        let restorationOptions = diarizationRequest?.attributionRestorationOptions
+            ?? SpeakerAttributionRestorationOptions()
         var restorationIndex: SpeakerAttributionRestorationIndex?
         var segments: [TranscriptSegment] = []
         segments.reserveCapacity(transcript.segments.count)
@@ -1030,11 +1084,17 @@ private actor StreamingSpeechAnalysisState {
                 segments.append(segmentByRestoringSpeakerAttribution(segment, from: previous))
             } else {
                 if restorationIndex == nil {
-                    restorationIndex = SpeakerAttributionRestorationIndex(previousSegments: previousStable.segments)
+                    restorationIndex = SpeakerAttributionRestorationIndex(
+                        previousSegments: previousStable.segments,
+                        options: restorationOptions
+                    )
                 }
                 segments.append(segmentByRestoringOverlappingSpeakerAttribution(
                     segment,
-                    using: restorationIndex ?? SpeakerAttributionRestorationIndex(previousSegments: [])
+                    using: restorationIndex ?? SpeakerAttributionRestorationIndex(
+                        previousSegments: [],
+                        options: restorationOptions
+                    )
                 ))
             }
         }
@@ -1088,18 +1148,15 @@ private actor StreamingSpeechAnalysisState {
     }
 
     private struct SpeakerAttributionRestorationIndex: Sendable {
-        private static let bucketWidth: TimeInterval = 5
-        private static let minimumOverlapDuration: TimeInterval = 0.02
-        private static let minimumWordCoverage = 0.45
-        private static let minimumSegmentCoverage = 0.45
-        private static let ambiguityRatio = 0.85
-
+        private let options: SpeakerAttributionRestorationOptions
         private var segmentReferences: [SegmentReference] = []
         private var wordReferences: [WordReference] = []
         private var segmentBuckets: [Int: [Int]] = [:]
         private var wordBuckets: [Int: [Int]] = [:]
 
-        init(previousSegments: [TranscriptSegment]) {
+        init(previousSegments: [TranscriptSegment], options: SpeakerAttributionRestorationOptions) {
+            self.options = options
+
             for segment in previousSegments where Self.hasSpeakerAttribution(segment) {
                 if let speaker = segment.speaker ?? Self.dominantSpeaker(in: segment.words) {
                     let reference = SegmentReference(
@@ -1109,7 +1166,7 @@ private actor StreamingSpeechAnalysisState {
                     )
                     let index = segmentReferences.count
                     segmentReferences.append(reference)
-                    Self.insert(
+                    insert(
                         index: index,
                         startTime: reference.startTime,
                         endTime: reference.endTime,
@@ -1126,7 +1183,7 @@ private actor StreamingSpeechAnalysisState {
                     )
                     let index = wordReferences.count
                     wordReferences.append(reference)
-                    Self.insert(
+                    insert(
                         index: index,
                         startTime: reference.startTime,
                         endTime: reference.endTime,
@@ -1154,7 +1211,7 @@ private actor StreamingSpeechAnalysisState {
                 ) else {
                     continue
                 }
-                guard metrics.currentCoverage >= Self.minimumSegmentCoverage else { continue }
+                guard metrics.currentCoverage >= options.minimumSegmentCoverage else { continue }
                 let score = SpeakerScore(
                     speaker: candidate.speaker,
                     score: metrics.currentCoverage * 0.7 + min(metrics.previousCoverage, 1) * 0.3,
@@ -1200,20 +1257,20 @@ private actor StreamingSpeechAnalysisState {
                     previousCoverage: 1
                 )
             }.filter { score in
-                score.score >= Self.minimumWordCoverage
-                    && score.overlap >= min(Self.minimumOverlapDuration, duration * Self.minimumWordCoverage)
+                score.score >= options.minimumWordCoverage
+                    && score.overlap >= min(options.minimumOverlapDuration, duration * options.minimumWordCoverage)
             }
 
             return unambiguousSpeaker(from: scores)
         }
 
-        private static func insert(
+        private func insert(
             index: Int,
             startTime: TimeInterval,
             endTime: TimeInterval,
             into buckets: inout [Int: [Int]]
         ) {
-            for bucket in Self.bucketRange(startTime: startTime, endTime: endTime) {
+            for bucket in bucketRange(startTime: startTime, endTime: endTime) {
                 buckets[bucket, default: []].append(index)
             }
         }
@@ -1257,7 +1314,7 @@ private actor StreamingSpeechAnalysisState {
         ) -> [Int] {
             var seen = Set<Int>()
             var output: [Int] = []
-            for bucket in Self.bucketRange(startTime: startTime, endTime: endTime) {
+            for bucket in bucketRange(startTime: startTime, endTime: endTime) {
                 for index in buckets[bucket] ?? [] where seen.insert(index).inserted {
                     output.append(index)
                 }
@@ -1297,18 +1354,18 @@ private actor StreamingSpeechAnalysisState {
             }
             guard let best = sorted.first else { return nil }
             if let competitor = sorted.dropFirst().first(where: { $0.speaker != best.speaker }),
-               competitor.score >= best.score * Self.ambiguityRatio {
+               competitor.score >= best.score * options.ambiguityRatio {
                 return nil
             }
             return best.speaker
         }
 
-        private static func bucketRange(startTime: TimeInterval, endTime: TimeInterval) -> ClosedRange<Int> {
+        private func bucketRange(startTime: TimeInterval, endTime: TimeInterval) -> ClosedRange<Int> {
             let start = min(startTime, endTime)
             let end = max(startTime, endTime)
-            let first = Int(floor(start / bucketWidth))
+            let first = Int(floor(start / options.timeBucketWidth))
             let adjustedEnd = end == start ? end : max(start, end - .ulpOfOne)
-            let last = max(first, Int(floor(adjustedEnd / bucketWidth)))
+            let last = max(first, Int(floor(adjustedEnd / options.timeBucketWidth)))
             return first...last
         }
 

@@ -98,6 +98,31 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertTrue(result.diagnostics.contains { $0.source == "merger" })
     }
 
+    func testAnalyzerFilePathUsesFileBasedDiarizationWithoutPreloadingAudio() async throws {
+        let speaker = SpeakerID(rawValue: "speaker_0")
+        let transcript = Transcript(segments: [
+            TranscriptSegment(text: "file path", startTime: 0, endTime: 0.5)
+        ])
+        let diarization = DiarizationResult(
+            turns: [SpeakerTurn(speaker: speaker, startTime: 0, endTime: 0.5)],
+            speakers: [Speaker(id: speaker)],
+            duration: 0.5
+        )
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: FileOnlyTranscriber(transcript: transcript),
+            diarizer: FileOnlySpeakerDiarizer(result: diarization)
+        )
+
+        let result = try await analyzer.analyze(
+            file: URL(fileURLWithPath: "/tmp/nonexistent-\(UUID().uuidString).wav"),
+            options: SpeechAnalysisOptions(diarization: DiarizationRequest())
+        )
+
+        XCTAssertEqual(result.transcript, transcript)
+        XCTAssertEqual(result.diarization, diarization)
+        XCTAssertEqual(result.speakerAttributedTranscript?.segments.first?.speaker, speaker)
+    }
+
     func testStreamingAnalyzerDiarizationRequestRequiresRegisteredStreamingDiarizer() async {
         let analyzer = LocalSpeechAnalyzer(transcriber: MockSpeechTranscriber())
         let audio = AsyncThrowingStream<AudioChunk, Error> { continuation in
@@ -571,6 +596,70 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertEqual(segment.speaker, speakerB)
         XCTAssertEqual(segment.words.first?.speaker, speakerB)
         XCTAssertEqual(completed?.diarizationStatus, .notRequested)
+    }
+
+    func testStreamingAnalyzerUsesRestorationOptionsForHistoricRevisionOverlap() async throws {
+        let speaker = SpeakerID(rawValue: "A")
+        let previousTranscript = Transcript(segments: [
+            TranscriptSegment(
+                text: "prior",
+                startTime: 0,
+                endTime: 0.1,
+                words: [TranscriptWord(text: "prior", startTime: 0, endTime: 0.1, speaker: speaker)],
+                speaker: speaker
+            )
+        ])
+        let revisedTranscript = Transcript(segments: [
+            TranscriptSegment(
+                text: "revised",
+                startTime: 0.06,
+                endTime: 0.16,
+                words: [TranscriptWord(text: "revised", startTime: 0.06, endTime: 0.16)]
+            )
+        ])
+
+        func completedTranscript(
+            restorationOptions: SpeakerAttributionRestorationOptions
+        ) async throws -> Transcript? {
+            let analyzer = LocalSpeechAnalyzer(
+                transcriber: ChunkedStreamingTranscriber(eventsByChunk: [
+                    [.snapshot(StreamingTranscriptSnapshot(stable: previousTranscript))],
+                    [.completed(revisedTranscript)]
+                ]),
+                streamingDiarizer: RecordingStreamingDiarizer(
+                    recorder: AudioChunkRecorder(),
+                    snapshots: [
+                        StreamingDiarizationSnapshot(),
+                        StreamingDiarizationSnapshot()
+                    ]
+                )
+            )
+            let stream = analyzer.stream(
+                audio: testAudioChunks(startTimes: [0, 0.1]),
+                options: StreamingSpeechAnalysisOptions(diarization: StreamingDiarizationRequest(
+                    attributionJitterBufferDelay: 0,
+                    attributionRestorationOptions: restorationOptions
+                ))
+            )
+
+            var completed: SpeechAnalysisResult?
+            for try await event in stream {
+                if case .completed(let result) = event {
+                    completed = result
+                }
+            }
+            return completed?.transcript
+        }
+
+        let defaultTranscript = try await completedTranscript(restorationOptions: SpeakerAttributionRestorationOptions())
+        XCTAssertNil(defaultTranscript?.segments.first?.speaker)
+
+        let tunedTranscript = try await completedTranscript(restorationOptions: SpeakerAttributionRestorationOptions(
+            minimumWordCoverage: 0.3,
+            minimumSegmentCoverage: 0.3
+        ))
+        XCTAssertEqual(tunedTranscript?.segments.first?.speaker, speaker)
+        XCTAssertEqual(tunedTranscript?.segments.first?.words.first?.speaker, speaker)
     }
 
     func testStreamingAnalyzerJitterBufferDefersTailAttribution() async throws {
@@ -1129,6 +1218,53 @@ private actor AudioChunkRecorder {
 
 private enum StreamingFanOutTestError: Error {
     case input
+}
+
+private enum FileRoutingTestError: Error {
+    case unexpectedAudioPath
+}
+
+private struct FileOnlyTranscriber: SpeechTranscriber {
+    var transcript: Transcript
+
+    func transcribe(file url: URL, options: TranscriptionOptions) async throws -> Transcript {
+        _ = url
+        _ = options
+        return transcript
+    }
+
+    func transcribe(audio: PreparedAudio, options: TranscriptionOptions) async throws -> Transcript {
+        _ = audio
+        _ = options
+        throw FileRoutingTestError.unexpectedAudioPath
+    }
+
+    func stream(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        options: StreamingTranscriptionOptions
+    ) -> AsyncThrowingStream<TranscriptEvent, Error> {
+        _ = audio
+        _ = options
+        return AsyncThrowingStream { continuation in
+            continuation.finish()
+        }
+    }
+}
+
+private struct FileOnlySpeakerDiarizer: SpeakerDiarizer {
+    var result: DiarizationResult
+
+    func diarize(file url: URL, options: DiarizationOptions) async throws -> DiarizationResult {
+        _ = url
+        try options.validate()
+        return result
+    }
+
+    func diarize(audio: PreparedAudio, options: DiarizationOptions) async throws -> DiarizationResult {
+        _ = audio
+        _ = options
+        throw FileRoutingTestError.unexpectedAudioPath
+    }
 }
 
 private struct RecordingStreamingTranscriber: SpeechTranscriber {

@@ -1,4 +1,5 @@
 import CarbocationLocalSpeech
+import AVFoundation
 @preconcurrency import CoreML
 import FluidAudio
 import Foundation
@@ -52,6 +53,7 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
     ) async throws {
         onProgress(FluidAudioModelInstallProgress(fractionCompleted: 0, phase: .starting(nil)))
         do {
+            try Task.checkCancellation()
             models = try await OfflineDiarizerModels.load(
                 from: modelsDirectory,
                 configuration: modelConfiguration,
@@ -59,7 +61,10 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
                     onProgress(FluidAudioModelInstallDiagnostics.mapProgress(progress))
                 }
             )
+            try Task.checkCancellation()
             onProgress(FluidAudioModelInstallProgress(fractionCompleted: 1, phase: .finished(nil)))
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw Self.installError(from: error)
         }
@@ -108,6 +113,7 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
         options: CarbocationLocalSpeech.DiarizationOptions
     ) async throws -> CarbocationLocalSpeech.DiarizationResult {
         try options.validate()
+        try Task.checkCancellation()
         guard let models else {
             throw FluidAudioSpeakerDiarizerError.modelAssetsMissing(
                 "Call FluidAudioSpeakerDiarizer.installModels() before diarize(audio:options:)."
@@ -119,11 +125,13 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
         manager.initialize(models: models)
 
         do {
+            try Task.checkCancellation()
             let samples = try resampledSamplesIfNeeded(
                 audio: audio,
                 targetSampleRate: Double(config.segmentation.sampleRate)
             )
             let fluidResult = try await manager.process(audio: samples)
+            try Task.checkCancellation()
             return map(
                 segments: fluidResult.segments,
                 timings: fluidResult.timings,
@@ -133,9 +141,57 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
             )
         } catch let error as FluidAudioSpeakerDiarizerError {
             throw error
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw FluidAudioSpeakerDiarizerError.inferenceFailed(error.localizedDescription)
         }
+    }
+
+    public func diarize(
+        file url: URL,
+        options: CarbocationLocalSpeech.DiarizationOptions
+    ) async throws -> CarbocationLocalSpeech.DiarizationResult {
+        try options.validate()
+        try Task.checkCancellation()
+        guard let models else {
+            throw FluidAudioSpeakerDiarizerError.modelAssetsMissing(
+                "Call FluidAudioSpeakerDiarizer.installModels() before diarize(file:options:)."
+            )
+        }
+
+        let config = buildConfig(for: options)
+        let manager = OfflineDiarizerManager(config: config)
+        manager.initialize(models: models)
+
+        do {
+            try Task.checkCancellation()
+            let fluidResult = try await manager.process(url)
+            try Task.checkCancellation()
+            let duration = await audioDuration(forFile: url)
+                ?? fluidResult.segments.map { TimeInterval($0.endTimeSeconds) }.max()
+                ?? 0
+            return map(
+                segments: fluidResult.segments,
+                timings: fluidResult.timings,
+                audioDuration: duration,
+                minimumTurnDuration: options.minimumTurnDuration,
+                exclusiveOutput: config.postProcessing.exclusiveSegments
+            )
+        } catch let error as FluidAudioSpeakerDiarizerError {
+            throw error
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw FluidAudioSpeakerDiarizerError.inferenceFailed(error.localizedDescription)
+        }
+    }
+
+    private nonisolated func audioDuration(forFile url: URL) async -> TimeInterval? {
+        let asset = AVURLAsset(url: url)
+        guard let duration = try? await asset.load(.duration) else { return nil }
+        let seconds = CMTimeGetSeconds(duration)
+        return seconds.isFinite && seconds > 0 ? seconds : nil
     }
 
     private func resampledSamplesIfNeeded(
