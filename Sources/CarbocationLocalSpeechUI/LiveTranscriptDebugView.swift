@@ -356,7 +356,7 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
     private var latestStableText: String?
     private var latestStableDisplayText: String?
     private var latestStableTimeRange: String?
-    private var stableDisplayLastSpeaker: SpeakerID?
+    private var stableDisplayLastIdentity: DisplaySpeakerIdentity?
     private var volatileTimeRange: String?
 
     private static let stableDisplayCharacterLimit = 1_500
@@ -370,6 +370,11 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         var lastSegmentStartTime: TimeInterval = 0
         var lastSegmentEndTime: TimeInterval = 0
         var speakerSignature: [SpeakerID?] = []
+    }
+
+    private enum DisplaySpeakerIdentity: Equatable {
+        case speaker(SpeakerID)
+        case unattributed
     }
 
     public init(events: [TranscriptEvent] = []) {
@@ -465,7 +470,7 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         stableDisplayText = Self.displayText(for: nonEmptySegments, characterLimit: Self.stableDisplayCharacterLimit)
         segmentCount = nonEmptySegments.count
         stableSnapshotSignature = signature
-        stableDisplayLastSpeaker = nonEmptySegments.last?.segment.speaker
+        stableDisplayLastIdentity = nonEmptySegments.last.map { Self.displayIdentity(for: $0.segment.speaker) }
 
         if let latest = nonEmptySegments.last {
             applyLatestStableSegment(latest.segment, text: latest.text)
@@ -517,18 +522,19 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
             stableText += " " + text
         }
 
-        let displayAppend = Self.labeledText(text, speaker: speaker, previousSpeaker: stableDisplayLastSpeaker)
+        let identity = Self.displayIdentity(for: speaker)
+        let displayAppend = Self.labeledText(text, identity: identity, previousIdentity: stableDisplayLastIdentity)
         stableDisplayText = Self.displayText(
             stableDisplayText.isEmpty ? displayAppend : stableDisplayText + " " + displayAppend,
             characterLimit: Self.stableDisplayCharacterLimit
         )
-        stableDisplayLastSpeaker = speaker
+        stableDisplayLastIdentity = identity
     }
 
     private mutating func applyLatestStableSegment(_ segment: TranscriptSegment, text: String) {
         latestStableText = text
         latestStableDisplayText = Self.displayText(
-            Self.labeledText(text, speaker: segment.speaker, previousSpeaker: nil),
+            Self.labeledText(text, identity: Self.displayIdentity(for: segment.speaker), previousIdentity: nil),
             characterLimit: Self.latestDisplayCharacterLimit
         )
         latestStableTimeRange = Self.formatTimeRange(
@@ -576,10 +582,11 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
         for segments: [(segment: TranscriptSegment, text: String)],
         characterLimit: Int
     ) -> String {
-        var previousSpeaker: SpeakerID?
+        var previousIdentity: DisplaySpeakerIdentity?
         let text = segments.map { item in
-            let labeled = labeledText(item.text, speaker: item.segment.speaker, previousSpeaker: previousSpeaker)
-            previousSpeaker = item.segment.speaker
+            let identity = displayIdentity(for: item.segment.speaker)
+            let labeled = labeledText(item.text, identity: identity, previousIdentity: previousIdentity)
+            previousIdentity = identity
             return labeled
         }
         .joined(separator: " ")
@@ -588,15 +595,26 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
 
     private static func labeledText(
         _ text: String,
-        speaker: SpeakerID?,
-        previousSpeaker: SpeakerID?
+        identity: DisplaySpeakerIdentity,
+        previousIdentity: DisplaySpeakerIdentity?
     ) -> String {
-        guard speaker != previousSpeaker,
-              let speaker
-        else {
+        guard identity != previousIdentity else {
             return text
         }
-        return "[\(displayName(for: speaker))] \(text)"
+        return "[\(displayName(for: identity))] \(text)"
+    }
+
+    private static func displayIdentity(for speaker: SpeakerID?) -> DisplaySpeakerIdentity {
+        speaker.map(DisplaySpeakerIdentity.speaker) ?? .unattributed
+    }
+
+    private static func displayName(for identity: DisplaySpeakerIdentity) -> String {
+        switch identity {
+        case .speaker(let speaker):
+            return displayName(for: speaker)
+        case .unattributed:
+            return "?"
+        }
     }
 
     private static func displayName(for speaker: SpeakerID) -> String {

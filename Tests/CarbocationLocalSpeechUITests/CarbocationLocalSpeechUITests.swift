@@ -209,7 +209,9 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
 
         XCTAssertEqual(snapshot.transcriptText, "hello world")
         XCTAssertEqual(snapshot.stableText, "hello world")
+        XCTAssertEqual(snapshot.stableDisplayText, "[?] hello world")
         XCTAssertEqual(snapshot.volatileText, "")
+        XCTAssertEqual(snapshot.latestDisplayText, "[?] world")
         XCTAssertEqual(snapshot.latestText, "world")
         XCTAssertEqual(snapshot.latestTimeRange, "0.40-0.80")
         XCTAssertEqual(snapshot.segmentCount, 2)
@@ -232,6 +234,8 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
         XCTAssertEqual(partialSnapshot.transcriptText, "hello wor")
         XCTAssertEqual(partialSnapshot.stableText, "")
         XCTAssertEqual(partialSnapshot.volatileText, "hello wor")
+        XCTAssertEqual(partialSnapshot.volatileDisplayText, "[?] hello wor")
+        XCTAssertEqual(partialSnapshot.latestDisplayText, "[?] hello wor")
         XCTAssertEqual(partialSnapshot.latestText, "hello wor")
         XCTAssertEqual(partialSnapshot.latestTimeRange, "0.00-0.60")
         XCTAssertTrue(partialSnapshot.hasVolatileText)
@@ -245,6 +249,7 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
 
         XCTAssertEqual(committedSnapshot.transcriptText, "hello world")
         XCTAssertEqual(committedSnapshot.stableText, "hello world")
+        XCTAssertEqual(committedSnapshot.stableDisplayText, "[?] hello world")
         XCTAssertEqual(committedSnapshot.volatileText, "")
         XCTAssertEqual(committedSnapshot.latestText, "hello world")
         XCTAssertFalse(committedSnapshot.hasVolatileText)
@@ -265,7 +270,10 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
 
         XCTAssertEqual(snapshot.transcriptText, "hello world")
         XCTAssertEqual(snapshot.stableText, "hello")
+        XCTAssertEqual(snapshot.stableDisplayText, "[?] hello")
         XCTAssertEqual(snapshot.volatileText, "world")
+        XCTAssertEqual(snapshot.volatileDisplayText, "[?] world")
+        XCTAssertEqual(snapshot.latestDisplayText, "[?] world")
         XCTAssertEqual(snapshot.latestText, "world")
         XCTAssertTrue(snapshot.hasVolatileText)
         XCTAssertEqual(snapshot.segmentCount, 1)
@@ -282,7 +290,7 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
         ])
 
         XCTAssertEqual(snapshot.stableText, "hello world")
-        XCTAssertEqual(snapshot.stableDisplayText, "hello world")
+        XCTAssertEqual(snapshot.stableDisplayText, "[?] hello world")
 
         snapshot.apply(StreamingTranscriptSnapshot(stable: Transcript(segments: [
             TranscriptSegment(
@@ -305,5 +313,80 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
         XCTAssertEqual(snapshot.stableText, "hello world")
         XCTAssertEqual(snapshot.stableDisplayText, "[Speaker 0] hello [Speaker 1] world")
         XCTAssertEqual(snapshot.latestDisplayText, "[Speaker 1] world")
+    }
+
+    func testLiveTranscriptDebugSnapshotMarksUnattributedGapsBetweenSameSpeaker() {
+        let speaker = SpeakerID(rawValue: "speaker_0")
+        let snapshot = LiveTranscriptDebugSnapshot(events: [
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(text: "hello", startTime: 0.0, endTime: 0.4, speaker: speaker),
+                TranscriptSegment(text: "gap", startTime: 0.4, endTime: 0.8),
+                TranscriptSegment(text: "again", startTime: 0.8, endTime: 1.2, speaker: speaker)
+            ])))
+        ])
+
+        XCTAssertEqual(snapshot.stableText, "hello gap again")
+        XCTAssertEqual(snapshot.stableDisplayText, "[Speaker 0] hello [?] gap [Speaker 0] again")
+        XCTAssertEqual(snapshot.latestDisplayText, "[Speaker 0] again")
+    }
+
+    func testLiveTranscriptDebugSnapshotCoalescesConsecutiveUnattributedLabels() {
+        let speaker = SpeakerID(rawValue: "speaker_0")
+
+        let leadingUnattributed = LiveTranscriptDebugSnapshot(events: [
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(text: "first", startTime: 0.0, endTime: 0.4),
+                TranscriptSegment(text: "second", startTime: 0.4, endTime: 0.8),
+                TranscriptSegment(text: "hello", startTime: 0.8, endTime: 1.2, speaker: speaker)
+            ])))
+        ])
+
+        XCTAssertEqual(leadingUnattributed.stableDisplayText, "[?] first second [Speaker 0] hello")
+
+        let trailingUnattributed = LiveTranscriptDebugSnapshot(events: [
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(text: "hello", startTime: 0.0, endTime: 0.4, speaker: speaker),
+                TranscriptSegment(text: "gap", startTime: 0.4, endTime: 0.8),
+                TranscriptSegment(text: "more", startTime: 0.8, endTime: 1.2)
+            ])))
+        ])
+
+        XCTAssertEqual(trailingUnattributed.stableDisplayText, "[Speaker 0] hello [?] gap more")
+        XCTAssertEqual(trailingUnattributed.latestDisplayText, "[?] more")
+    }
+
+    func testLiveTranscriptDebugSnapshotUnattributedLabelsMatchIncrementalAppendAndRebuild() {
+        let speaker = SpeakerID(rawValue: "speaker_0")
+        let firstID = UUID()
+        let secondID = UUID()
+        let thirdID = UUID()
+
+        var incremental = LiveTranscriptDebugSnapshot()
+        incremental.apply(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+            TranscriptSegment(id: firstID, text: "hello", startTime: 0.0, endTime: 0.4, speaker: speaker)
+        ])))
+        incremental.apply(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+            TranscriptSegment(id: firstID, text: "hello", startTime: 0.0, endTime: 0.4, speaker: speaker),
+            TranscriptSegment(id: secondID, text: "gap", startTime: 0.4, endTime: 0.8)
+        ])))
+        incremental.apply(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+            TranscriptSegment(id: firstID, text: "hello", startTime: 0.0, endTime: 0.4, speaker: speaker),
+            TranscriptSegment(id: secondID, text: "gap", startTime: 0.4, endTime: 0.8),
+            TranscriptSegment(id: thirdID, text: "again", startTime: 0.8, endTime: 1.2, speaker: speaker)
+        ])))
+
+        var rebuilt = LiveTranscriptDebugSnapshot(events: [
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(text: "stale", startTime: 0.0, endTime: 0.1)
+            ])))
+        ])
+        rebuilt.apply(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+            TranscriptSegment(id: firstID, text: "hello", startTime: 0.0, endTime: 0.4, speaker: speaker),
+            TranscriptSegment(id: secondID, text: "gap", startTime: 0.4, endTime: 0.8),
+            TranscriptSegment(id: thirdID, text: "again", startTime: 0.8, endTime: 1.2, speaker: speaker)
+        ])))
+
+        XCTAssertEqual(incremental.stableDisplayText, "[Speaker 0] hello [?] gap [Speaker 0] again")
+        XCTAssertEqual(rebuilt.stableDisplayText, incremental.stableDisplayText)
     }
 }
