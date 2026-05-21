@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		100000000000000000000001 /* CLSSmokeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000000A /* CLSSmokeApp.swift */; };
 		100000000000000000000002 /* CLSSmokeWER.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000000B /* CLSSmokeWER.swift */; };
+		100000000000000000000057 /* CLSSmokeTranscriptionExport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000059 /* CLSSmokeTranscriptionExport.swift */; };
 		100000000000000000000003 /* CarbocationLocalSpeech in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000030 /* CarbocationLocalSpeech */; };
 		100000000000000000000004 /* CarbocationLocalSpeechRuntime in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000031 /* CarbocationLocalSpeechRuntime */; };
 		100000000000000000000005 /* CarbocationLocalSpeechUI in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000032 /* CarbocationLocalSpeechUI */; };
@@ -16,6 +17,7 @@
 		100000000000000000000054 /* CarbocationDiarizationRuntime in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000055 /* CarbocationDiarizationRuntime */; };
 		100000000000000000000041 /* CLSSmokeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000000A /* CLSSmokeApp.swift */; };
 		100000000000000000000042 /* CLSSmokeWER.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000000B /* CLSSmokeWER.swift */; };
+		100000000000000000000058 /* CLSSmokeTranscriptionExport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000059 /* CLSSmokeTranscriptionExport.swift */; };
 		100000000000000000000043 /* CarbocationLocalSpeech in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000030 /* CarbocationLocalSpeech */; };
 		100000000000000000000044 /* CarbocationLocalSpeechRuntime in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000031 /* CarbocationLocalSpeechRuntime */; };
 		100000000000000000000045 /* CarbocationLocalSpeechUI in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000032 /* CarbocationLocalSpeechUI */; };
@@ -27,6 +29,7 @@
 		100000000000000000000007 /* CLSSmoke-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CLSSmoke.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		10000000000000000000000A /* CLSSmokeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CLSSmokeApp.swift; sourceTree = "<group>"; };
 		10000000000000000000000B /* CLSSmokeWER.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CLSSmokeWER.swift; sourceTree = "<group>"; };
+		100000000000000000000059 /* CLSSmokeTranscriptionExport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CLSSmokeTranscriptionExport.swift; sourceTree = "<group>"; };
 		10000000000000000000000C /* Info-iOS.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-iOS.plist"; sourceTree = "<group>"; };
 		100000000000000000000047 /* CLSSmoke-macOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CLSSmoke.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		100000000000000000000048 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -107,6 +110,7 @@
 			isa = PBXGroup;
 			children = (
 				10000000000000000000000A /* CLSSmokeApp.swift */,
+				100000000000000000000059 /* CLSSmokeTranscriptionExport.swift */,
 				10000000000000000000000B /* CLSSmokeWER.swift */,
 			);
 			path = CLSSmoke;
@@ -209,6 +213,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				100000000000000000000001 /* CLSSmokeApp.swift in Sources */,
+				100000000000000000000057 /* CLSSmokeTranscriptionExport.swift in Sources */,
 				100000000000000000000002 /* CLSSmokeWER.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -218,6 +223,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				100000000000000000000041 /* CLSSmokeApp.swift in Sources */,
+				100000000000000000000058 /* CLSSmokeTranscriptionExport.swift in Sources */,
 				100000000000000000000042 /* CLSSmokeWER.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

@@ -299,6 +299,9 @@ private struct CLSSmokeRootView: View {
     @State private var fileTranscript: Transcript?
     @State private var fileAnalysisResult: SpeechAnalysisResult?
     @State private var fileProcessingDuration: TimeInterval?
+    @State private var fileTranscriptionExportDocument: CLSSmokeTranscriptionExportDocument?
+    @State private var fileTranscriptionExportDefaultFilename = "transcription-export.zip"
+    @State private var showFileTranscriptionExporter = false
     @State private var fileStatusMessage = "Pick or drop an audio or movie file."
     @State private var fileStatusTone = CLSSmokeStatusTone.secondary
     @State private var isFileDropTargeted = false
@@ -360,6 +363,14 @@ private struct CLSSmokeRootView: View {
                 allowedContentTypes: Self.supportedAudioFileTypes
             ) { result in
                 handleFileImportResult(result)
+            }
+            .fileExporter(
+                isPresented: $showFileTranscriptionExporter,
+                document: fileTranscriptionExportDocument,
+                contentType: CLSSmokeTranscriptionExportDocument.contentType,
+                defaultFilename: fileTranscriptionExportDefaultFilename
+            ) { result in
+                handleFileTranscriptionExportResult(result)
             }
     }
 
@@ -1091,6 +1102,18 @@ private struct CLSSmokeRootView: View {
                     }
                 }
                 Spacer()
+
+                if analysisResult != nil {
+                    Button {
+                        prepareFileTranscriptionExport(
+                            transcript: transcript,
+                            analysisResult: analysisResult
+                        )
+                    } label: {
+                        Label("Export ZIP", systemImage: "square.and.arrow.up")
+                    }
+                    .controlSize(.small)
+                }
             }
 
             ScrollView {
@@ -1543,6 +1566,7 @@ private struct CLSSmokeRootView: View {
             fileTranscript = nil
             fileAnalysisResult = nil
             fileProcessingDuration = nil
+            clearFileTranscriptionExport()
             fileStatusTone = .error
             fileStatusMessage = "Unsupported file extension: \(url.lastPathComponent)"
             return
@@ -1552,6 +1576,7 @@ private struct CLSSmokeRootView: View {
         fileTranscript = nil
         fileAnalysisResult = nil
         fileProcessingDuration = nil
+        clearFileTranscriptionExport()
         fileStatusTone = .secondary
         fileStatusMessage = "Selected \(url.lastPathComponent)."
 
@@ -1602,6 +1627,7 @@ private struct CLSSmokeRootView: View {
         fileTranscript = nil
         fileAnalysisResult = nil
         fileProcessingDuration = nil
+        clearFileTranscriptionExport()
         resetTranscriptDiagnostics()
         isFileTranscribing = true
         fileStatusTone = .listening
@@ -1804,6 +1830,55 @@ private struct CLSSmokeRootView: View {
         isFileTranscribing = false
         fileStatusMessage = message
         fileStatusTone = tone
+    }
+
+    private func prepareFileTranscriptionExport(
+        transcript: Transcript,
+        analysisResult: SpeechAnalysisResult?
+    ) {
+        guard let analysisResult else {
+            fileStatusTone = .error
+            fileStatusMessage = "No completed analysis result is available to export."
+            return
+        }
+
+        do {
+            let sourceFileName = selectedFileURL?.lastPathComponent
+            fileTranscriptionExportDocument = try CLSSmokeTranscriptionExportBuilder.makeDocument(
+                sourceFileName: sourceFileName,
+                transcript: transcript,
+                analysisResult: analysisResult,
+                processingDuration: fileProcessingDuration
+            )
+            fileTranscriptionExportDefaultFilename = CLSSmokeTranscriptionExportBuilder.defaultArchiveFileName(
+                sourceFileName: sourceFileName
+            )
+            showFileTranscriptionExporter = true
+        } catch {
+            fileStatusTone = .error
+            fileStatusMessage = error.localizedDescription
+        }
+    }
+
+    private func handleFileTranscriptionExportResult(_ result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            fileStatusTone = .secondary
+            fileStatusMessage = "Exported \(url.lastPathComponent)."
+        case .failure(let error):
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError {
+                return
+            }
+            fileStatusTone = .error
+            fileStatusMessage = error.localizedDescription
+        }
+    }
+
+    private func clearFileTranscriptionExport() {
+        fileTranscriptionExportDocument = nil
+        showFileTranscriptionExporter = false
+        fileTranscriptionExportDefaultFilename = "transcription-export.zip"
     }
 
     private func ensureMicrophoneAccess() async -> Bool {
