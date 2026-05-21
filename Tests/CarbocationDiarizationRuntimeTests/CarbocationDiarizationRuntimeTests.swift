@@ -272,6 +272,15 @@ final class CarbocationDiarizationRuntimeTests: XCTestCase {
         XCTAssertEqual(progress.phase, .downloading(completedFiles: 1, totalFiles: 4))
     }
 
+    func testStreamingDiarizerAcceptsBackendSpecificComputeUnits() {
+        let diarizer = FluidAudioStreamingSpeakerDiarizer(computeUnits: FluidAudioStreamingComputeUnits(
+            sortformer: .cpuOnly,
+            lsEEND: .cpuAndGPU
+        ))
+
+        XCTAssertNotNil(diarizer)
+    }
+
     func testStreamingDiarizerClassifiesInstallFailures() {
         let download = FluidAudioStreamingSpeakerDiarizer.installError(
             from: NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut, userInfo: [

@@ -333,8 +333,12 @@ Live meeting apps can stream transcription and diarization together through a `L
 import CarbocationDiarizationRuntime
 import CarbocationLocalSpeech
 import CarbocationLocalSpeechRuntime
+import CoreML
 
-let diarizer = FluidAudioStreamingSpeakerDiarizer()
+let diarizer = FluidAudioStreamingSpeakerDiarizer(computeUnits: FluidAudioStreamingComputeUnits(
+    sortformer: .all,
+    lsEEND: .cpuAndGPU
+))
 try await diarizer.installModels(backend: .sortformer) { progress in
     // Surface download/compile progress in your UI.
 }
@@ -348,9 +352,11 @@ let events = analyzer.stream(
         diarization: StreamingDiarizationRequest(
             attributionLookbackWindow: 30,
             attributionJitterBufferDelay: 0.75,
+            maximumAttributionJitterBufferDelay: 3,
             attributionCacheRetentionWindow: 600
         ),
-        audioFanOutBufferLimit: 128
+        audioFanOutBufferLimit: 128,
+        backlogPolicy: .dropDiarization
     )
 )
 
@@ -360,6 +366,10 @@ for try await event in events {
 
 try await diarizer.unloadModels()
 ```
+
+For live attribution, keep `attributionCacheRetentionWindow` comfortably larger than the ASR revision horizon. A practical default is at least 3x the transcriber's rolling context window, and 10 minutes is a reasonable floor for long meetings. Setting it near zero minimizes memory but can only recover historic ASR revisions from the already-emitted stable transcript snapshot.
+
+Use `backlogPolicy: .fatal` when complete diarization is required. Use `.dropDiarization` for meeting capture UIs where transcription should continue if Core ML diarization falls behind during a CPU or ANE spike.
 
 ## Requirements
 

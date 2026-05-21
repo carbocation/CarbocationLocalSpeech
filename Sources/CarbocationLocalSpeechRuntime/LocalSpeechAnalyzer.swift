@@ -170,22 +170,48 @@ private func streamWithDiarization(
     streamingDiarizer: any StreamingSpeakerDiarizer,
     continuation: AsyncThrowingStream<StreamingSpeechAnalysisEvent, Error>.Continuation
 ) async throws {
-    let audioBroadcast = AudioStreamBroadcast.makeConsumerPair(bufferLimit: options.audioFanOutBufferLimit)
+    let audioBroadcast = AudioStreamBroadcast.makeConsumerPair(
+        bufferLimit: options.audioFanOutBufferLimit,
+        backlogPolicy: options.backlogPolicy
+    )
     let state = StreamingSpeechAnalysisState(diarizationRequest: diarizationRequest)
+    let degradationState = StreamingBacklogDegradationState()
 
     do {
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
+                var reportedDroppedConsumers = Set<AudioStreamConsumer>()
+                var broadcastError: Error?
                 do {
                     for try await chunk in audio {
                         try Task.checkCancellation()
-                        let hasActiveConsumers = try await audioBroadcast.broadcaster.broadcast(chunk)
-                        guard hasActiveConsumers else { break }
+                        let result: AudioStreamBroadcastResult
+                        do {
+                            result = try await audioBroadcast.broadcaster.broadcast(chunk)
+                        } catch {
+                            broadcastError = error
+                            throw error
+                        }
+                        for consumer in result.droppedConsumers where reportedDroppedConsumers.insert(consumer).inserted {
+                            if consumer == .diarization {
+                                await degradationState.recordDroppedDiarization()
+                            }
+                            continuation.yield(.transcription(.diagnostic(SpeechDiagnostic(
+                                source: "analyzer",
+                                message: "Dropped \(consumer.displayName) stream after it exceeded the real-time fan-out buffer limit; transcription will continue."
+                            ))))
+                        }
+                        guard result.hasActiveConsumers else { break }
                     }
                     await audioBroadcast.broadcaster.finish()
+                } catch is CancellationError {
+                    await audioBroadcast.broadcaster.finish(throwing: CancellationError())
+                    throw CancellationError()
                 } catch {
                     await audioBroadcast.broadcaster.finish(throwing: error)
-                    throw error
+                    if broadcastError != nil {
+                        throw error
+                    }
                 }
             }
 
@@ -202,14 +228,26 @@ private func streamWithDiarization(
             }
 
             group.addTask {
-                let diarizationStream = streamingDiarizer.stream(
-                    audio: audioBroadcast.diarization,
-                    options: diarizationRequest.streamingOptions
-                )
-                for try await snapshot in diarizationStream {
-                    for output in await state.recordDiarization(snapshot) {
-                        continuation.yield(output)
+                do {
+                    let diarizationStream = streamingDiarizer.stream(
+                        audio: audioBroadcast.diarization,
+                        options: diarizationRequest.streamingOptions
+                    )
+                    for try await snapshot in diarizationStream {
+                        if options.backlogPolicy == .dropDiarization,
+                           await degradationState.diarizationWasDropped() {
+                            return
+                        }
+                        for output in await state.recordDiarization(snapshot) {
+                            continuation.yield(output)
+                        }
                     }
+                } catch is CancellationError {
+                    if options.backlogPolicy == .dropDiarization,
+                       await degradationState.diarizationWasDropped() {
+                        return
+                    }
+                    throw CancellationError()
                 }
             }
 
@@ -234,29 +272,29 @@ private struct AudioStreamBroadcast: Sendable {
     var asr: AsyncThrowingStream<AudioChunk, Error>
     var diarization: AsyncThrowingStream<AudioChunk, Error>
 
-    static func makeConsumerPair(bufferLimit: Int) -> AudioStreamBroadcast {
+    static func makeConsumerPair(
+        bufferLimit: Int,
+        backlogPolicy: StreamingAudioBacklogPolicy
+    ) -> AudioStreamBroadcast {
         let bufferLimit = max(1, bufferLimit)
         let asrSink = AudioStreamSink.make(bufferLimit: bufferLimit)
         let diarizationSink = AudioStreamSink.make(bufferLimit: bufferLimit)
-        let broadcaster = AudioStreamBroadcaster(bufferLimit: bufferLimit, sinks: [
-            AudioStreamBroadcaster.Sink(
-                id: asrSink.id,
-                name: "transcription",
-                continuation: asrSink.continuation
-            ),
-            AudioStreamBroadcaster.Sink(
-                id: diarizationSink.id,
-                name: "diarization",
-                continuation: diarizationSink.continuation
-            )
-        ])
-
-        asrSink.continuation.onTermination = { _ in
-            Task { await broadcaster.removeSink(id: asrSink.id) }
-        }
-        diarizationSink.continuation.onTermination = { _ in
-            Task { await broadcaster.removeSink(id: diarizationSink.id) }
-        }
+        let broadcaster = AudioStreamBroadcaster(
+            bufferLimit: bufferLimit,
+            backlogPolicy: backlogPolicy,
+            sinks: [
+                AudioStreamBroadcaster.Sink(
+                    id: asrSink.id,
+                    consumer: .transcription,
+                    continuation: asrSink.continuation
+                ),
+                AudioStreamBroadcaster.Sink(
+                    id: diarizationSink.id,
+                    consumer: .diarization,
+                    continuation: diarizationSink.continuation
+                )
+            ]
+        )
 
         return AudioStreamBroadcast(
             broadcaster: broadcaster,
@@ -294,41 +332,77 @@ private enum AudioStreamBroadcastError: Error, LocalizedError, Sendable {
     }
 }
 
+private enum AudioStreamConsumer: String, Sendable {
+    case transcription
+    case diarization
+
+    var displayName: String { rawValue }
+}
+
+private struct AudioStreamBroadcastResult: Sendable {
+    var hasActiveConsumers: Bool
+    var droppedConsumers: [AudioStreamConsumer]
+}
+
+private actor StreamingBacklogDegradationState {
+    private var droppedDiarization = false
+
+    func recordDroppedDiarization() {
+        droppedDiarization = true
+    }
+
+    func diarizationWasDropped() -> Bool {
+        droppedDiarization
+    }
+}
+
 private actor AudioStreamBroadcaster {
     struct Sink: Sendable {
         var id: UUID
-        var name: String
+        var consumer: AudioStreamConsumer
         var continuation: AsyncThrowingStream<AudioChunk, Error>.Continuation
     }
 
     private var sinks: [Sink]
     private let bufferLimit: Int
+    private let backlogPolicy: StreamingAudioBacklogPolicy
     private var isFinished = false
 
-    init(bufferLimit: Int, sinks: [Sink]) {
+    init(
+        bufferLimit: Int,
+        backlogPolicy: StreamingAudioBacklogPolicy,
+        sinks: [Sink]
+    ) {
         self.sinks = sinks
         self.bufferLimit = max(1, bufferLimit)
+        self.backlogPolicy = backlogPolicy
     }
 
     @discardableResult
-    func broadcast(_ chunk: AudioChunk) throws -> Bool {
+    func broadcast(_ chunk: AudioChunk) throws -> AudioStreamBroadcastResult {
         guard !isFinished, !sinks.isEmpty else {
             isFinished = true
-            return false
+            return AudioStreamBroadcastResult(hasActiveConsumers: false, droppedConsumers: [])
         }
 
         var activeSinks: [Sink] = []
+        var droppedConsumers: [AudioStreamConsumer] = []
         for sink in sinks {
             switch sink.continuation.yield(chunk) {
             case .enqueued:
                 activeSinks.append(sink)
             case .dropped:
                 let error = AudioStreamBroadcastError.consumerBacklogExceeded(
-                    consumer: sink.name,
+                    consumer: sink.consumer.displayName,
                     bufferLimit: bufferLimit
                 )
-                finishLocked(throwing: error)
-                throw error
+                if backlogPolicy == .dropDiarization, sink.consumer == .diarization {
+                    sink.continuation.finish()
+                    droppedConsumers.append(sink.consumer)
+                } else {
+                    finishLocked(throwing: error)
+                    throw error
+                }
             case .terminated:
                 break
             @unknown default:
@@ -339,9 +413,15 @@ private actor AudioStreamBroadcaster {
         sinks = activeSinks
         if sinks.isEmpty {
             isFinished = true
-            return false
+            return AudioStreamBroadcastResult(
+                hasActiveConsumers: false,
+                droppedConsumers: droppedConsumers
+            )
         }
-        return true
+        return AudioStreamBroadcastResult(
+            hasActiveConsumers: true,
+            droppedConsumers: droppedConsumers
+        )
     }
 
     func finish() {
@@ -367,12 +447,6 @@ private actor AudioStreamBroadcaster {
         }
     }
 
-    func removeSink(id: UUID) {
-        sinks.removeAll { $0.id == id }
-        if sinks.isEmpty {
-            isFinished = true
-        }
-    }
 }
 
 private actor StreamingSpeechAnalysisState {
@@ -744,8 +818,7 @@ private actor StreamingSpeechAnalysisState {
         syncedEnd: TimeInterval
     ) -> TimeInterval {
         let requestedDelay = max(0, request.attributionJitterBufferDelay)
-        let lookbackWindow = max(0, request.attributionLookbackWindow)
-        let configuredMaximum = lookbackWindow > 0 ? min(lookbackWindow, 5) : 5
+        let configuredMaximum = request.maximumAttributionJitterBufferDelay.map { max(0, $0) } ?? requestedDelay
         let streamRelativeMaximum = max(0, syncedEnd / 2)
         return min(requestedDelay, configuredMaximum, streamRelativeMaximum)
     }
@@ -938,7 +1011,10 @@ private actor StreamingSpeechAnalysisState {
             guard let previous = previousSegmentsByID[segment.id],
                   TranscriptSegmentFingerprint(segment: previous) == TranscriptSegmentFingerprint(segment: segment)
             else {
-                return segment
+                return segmentByRestoringOverlappingSpeakerAttribution(
+                    segment,
+                    from: previousStable.segments
+                )
             }
             return segmentByRestoringSpeakerAttribution(segment, from: previous)
         }
@@ -968,6 +1044,69 @@ private actor StreamingSpeechAnalysisState {
             }
         }
         return restored
+    }
+
+    private func segmentByRestoringOverlappingSpeakerAttribution(
+        _ segment: TranscriptSegment,
+        from previousSegments: [TranscriptSegment]
+    ) -> TranscriptSegment {
+        guard !hasSpeakerAttribution(segment) else { return segment }
+        let attributedPreviousSegments = previousSegments.filter(hasSpeakerAttribution)
+        guard let bestSegment = bestOverlappingSegment(for: segment, in: attributedPreviousSegments) else {
+            return segment
+        }
+
+        var restored = segment
+        if !restored.words.isEmpty {
+            restored.words = restored.words.map { word in
+                var restoredWord = word
+                restoredWord.speaker = bestOverlappingWordSpeaker(
+                    for: word,
+                    in: attributedPreviousSegments
+                ) ?? bestSegment.speaker ?? dominantSpeaker(in: bestSegment.words)
+                return restoredWord
+            }
+        }
+        restored.speaker = bestSegment.speaker
+            ?? dominantSpeaker(in: restored.words)
+            ?? dominantSpeaker(in: bestSegment.words)
+        return restored
+    }
+
+    private func bestOverlappingSegment(
+        for segment: TranscriptSegment,
+        in previousSegments: [TranscriptSegment]
+    ) -> TranscriptSegment? {
+        previousSegments
+            .map { previous in
+                (previous, max(0, min(segment.endTime, previous.endTime) - max(segment.startTime, previous.startTime)))
+            }
+            .filter { $0.1 > 0 }
+            .max { lhs, rhs in lhs.1 < rhs.1 }?
+            .0
+    }
+
+    private func bestOverlappingWordSpeaker(
+        for word: TranscriptWord,
+        in previousSegments: [TranscriptSegment]
+    ) -> SpeakerID? {
+        previousSegments
+            .flatMap(\.words)
+            .compactMap { previousWord -> (SpeakerID, TimeInterval)? in
+                guard let speaker = previousWord.speaker else { return nil }
+                let overlap = max(0, min(word.endTime, previousWord.endTime) - max(word.startTime, previousWord.startTime))
+                return overlap > 0 ? (speaker, overlap) : nil
+            }
+            .max { lhs, rhs in lhs.1 < rhs.1 }?
+            .0
+    }
+
+    private func dominantSpeaker(in words: [TranscriptWord]) -> SpeakerID? {
+        let durationsBySpeaker = words.reduce(into: [SpeakerID: TimeInterval]()) { durations, word in
+            guard let speaker = word.speaker else { return }
+            durations[speaker, default: 0] += max(0, word.endTime - word.startTime)
+        }
+        return durationsBySpeaker.max { lhs, rhs in lhs.value < rhs.value }?.key
     }
 
     private func latestEnd(_ snapshot: StreamingTranscriptSnapshot) -> TimeInterval? {

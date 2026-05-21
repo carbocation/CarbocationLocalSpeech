@@ -420,6 +420,104 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertEqual(attributedSegments.first { $0.text == "latest" }?.speaker, speakerC)
     }
 
+    func testStreamingAnalyzerRestoresHistoricRevisionAfterAttributionCachePruning() async throws {
+        let speakerA = SpeakerID(rawValue: "A")
+        let speakerB = SpeakerID(rawValue: "B")
+        let speakerC = SpeakerID(rawValue: "C")
+        let old = TranscriptSegment(
+            text: "old",
+            startTime: 0,
+            endTime: 0.2,
+            words: [TranscriptWord(text: "old", startTime: 0, endTime: 0.2)]
+        )
+        let revisedOld = TranscriptSegment(
+            text: "revised old",
+            startTime: 0,
+            endTime: 0.25,
+            words: [
+                TranscriptWord(text: "revised", startTime: 0, endTime: 0.12),
+                TranscriptWord(text: "old", startTime: 0.12, endTime: 0.25)
+            ]
+        )
+        let middle = TranscriptSegment(
+            text: "middle",
+            startTime: 1.0,
+            endTime: 1.2,
+            words: [TranscriptWord(text: "middle", startTime: 1.0, endTime: 1.2)]
+        )
+        let latest = TranscriptSegment(
+            text: "latest",
+            startTime: 2.0,
+            endTime: 2.2,
+            words: [TranscriptWord(text: "latest", startTime: 2.0, endTime: 2.2)]
+        )
+        let firstTranscript = Transcript(segments: [old, middle])
+        let fullTranscript = Transcript(segments: [old, middle, latest])
+        let revisedTranscript = Transcript(segments: [revisedOld, middle, latest])
+        let initialDiarization = DiarizationResult(
+            turns: [
+                SpeakerTurn(speaker: speakerA, startTime: 0, endTime: 0.2),
+                SpeakerTurn(speaker: speakerB, startTime: 1.0, endTime: 1.2)
+            ],
+            speakers: [Speaker(id: speakerA), Speaker(id: speakerB)],
+            duration: 1.2
+        )
+        let middleAndLatestDiarization = DiarizationResult(
+            turns: [
+                SpeakerTurn(speaker: speakerB, startTime: 1.0, endTime: 1.2),
+                SpeakerTurn(speaker: speakerC, startTime: 2.0, endTime: 2.2)
+            ],
+            speakers: [Speaker(id: speakerB), Speaker(id: speakerC)],
+            duration: 2.2
+        )
+        let latestOnlyDiarization = DiarizationResult(
+            turns: [SpeakerTurn(speaker: speakerC, startTime: 2.0, endTime: 2.2)],
+            speakers: [Speaker(id: speakerC)],
+            duration: 2.2
+        )
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: DelayedChunkedStreamingTranscriber(
+                eventsByChunk: [
+                    [.snapshot(StreamingTranscriptSnapshot(stable: firstTranscript))],
+                    [.snapshot(StreamingTranscriptSnapshot(stable: fullTranscript))],
+                    [.snapshot(StreamingTranscriptSnapshot(stable: revisedTranscript)), .completed(revisedTranscript)]
+                ],
+                nanosecondsBeforeEvents: 10_000_000
+            ),
+            streamingDiarizer: RecordingStreamingDiarizer(
+                recorder: AudioChunkRecorder(),
+                snapshots: [
+                    StreamingDiarizationSnapshot(stable: initialDiarization),
+                    StreamingDiarizationSnapshot(stable: middleAndLatestDiarization),
+                    StreamingDiarizationSnapshot(stable: latestOnlyDiarization)
+                ]
+            )
+        )
+
+        let stream = analyzer.stream(
+            audio: testAudioChunks(startTimes: [0, 1.0, 2.0]),
+            options: StreamingSpeechAnalysisOptions(diarization: StreamingDiarizationRequest(
+                attributionLookbackWindow: 0.5,
+                attributionJitterBufferDelay: 0,
+                attributionCacheRetentionWindow: 0
+            ))
+        )
+
+        var lastAttributedSnapshot: StreamingTranscriptSnapshot?
+        for try await event in stream {
+            if case .speakerAttributedSnapshot(let snapshot) = event {
+                lastAttributedSnapshot = snapshot
+            }
+        }
+
+        let attributedSegments = try XCTUnwrap(lastAttributedSnapshot?.stable.segments)
+        let revised = try XCTUnwrap(attributedSegments.first { $0.text == "revised old" })
+        XCTAssertEqual(revised.speaker, speakerA)
+        XCTAssertEqual(revised.words.map(\.speaker), [speakerA, speakerA])
+        XCTAssertEqual(attributedSegments.first { $0.text == "middle" }?.speaker, speakerB)
+        XCTAssertEqual(attributedSegments.first { $0.text == "latest" }?.speaker, speakerC)
+    }
+
     func testStreamingAnalyzerJitterBufferDefersTailAttribution() async throws {
         let speaker = SpeakerID(rawValue: "A")
         let transcript = Transcript(segments: [
@@ -520,6 +618,63 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertNil(attributedSegments.first { $0.text == "tail" }?.speaker)
     }
 
+    func testStreamingAnalyzerAllowsLargeConfiguredJitterBufferDelay() async throws {
+        let speaker = SpeakerID(rawValue: "A")
+        let transcript = Transcript(
+            segments: [
+                TranscriptSegment(
+                    text: "ready",
+                    startTime: 0,
+                    endTime: 1,
+                    words: [TranscriptWord(text: "ready", startTime: 0, endTime: 1)]
+                ),
+                TranscriptSegment(
+                    text: "remote tail",
+                    startTime: 23,
+                    endTime: 24,
+                    words: [
+                        TranscriptWord(text: "remote", startTime: 23, endTime: 23.5),
+                        TranscriptWord(text: "tail", startTime: 23.5, endTime: 24)
+                    ]
+                )
+            ],
+            duration: 30
+        )
+        let diarization = DiarizationResult(
+            turns: [SpeakerTurn(speaker: speaker, startTime: 0, endTime: 30)],
+            speakers: [Speaker(id: speaker)],
+            duration: 30
+        )
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: ChunkedStreamingTranscriber(eventsByChunk: [
+                [.snapshot(StreamingTranscriptSnapshot(stable: transcript))]
+            ]),
+            streamingDiarizer: RecordingStreamingDiarizer(
+                recorder: AudioChunkRecorder(),
+                snapshots: [StreamingDiarizationSnapshot(stable: diarization)]
+            )
+        )
+
+        let stream = analyzer.stream(
+            audio: testAudioChunks(startTimes: [0]),
+            options: StreamingSpeechAnalysisOptions(diarization: StreamingDiarizationRequest(
+                attributionJitterBufferDelay: 10,
+                maximumAttributionJitterBufferDelay: 20
+            ))
+        )
+
+        var lastAttributedSnapshot: StreamingTranscriptSnapshot?
+        for try await event in stream {
+            if case .speakerAttributedSnapshot(let snapshot) = event {
+                lastAttributedSnapshot = snapshot
+            }
+        }
+
+        let attributedSegments = try XCTUnwrap(lastAttributedSnapshot?.stable.segments)
+        XCTAssertEqual(attributedSegments.first { $0.text == "ready" }?.speaker, speaker)
+        XCTAssertNil(attributedSegments.first { $0.text == "remote tail" }?.speaker)
+    }
+
     func testStreamingAnalyzerFanOutPropagatesInputErrorToBothConsumers() async throws {
         let asrRecorder = AudioChunkRecorder()
         let diarizationRecorder = AudioChunkRecorder()
@@ -567,6 +722,91 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("fell behind"))
         }
+    }
+
+    func testStreamingAnalyzerCanDropBackloggedDiarizationAndContinueTranscription() async throws {
+        let transcript = Transcript(segments: [
+            TranscriptSegment(text: "transcription survives", startTime: 0, endTime: 0.5)
+        ])
+        let asrRecorder = AudioChunkRecorder()
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: RecordingStreamingTranscriber(
+                recorder: asrRecorder,
+                events: [.completed(transcript)]
+            ),
+            streamingDiarizer: StalledStreamingDiarizer()
+        )
+        let stream = analyzer.stream(
+            audio: pacedTestAudioChunks(startTimes: Array(stride(from: 0.0, to: 1.0, by: 0.05))),
+            options: StreamingSpeechAnalysisOptions(
+                diarization: StreamingDiarizationRequest(attributionJitterBufferDelay: 0),
+                audioFanOutBufferLimit: 4,
+                backlogPolicy: .dropDiarization
+            )
+        )
+
+        var sawDropDiagnostic = false
+        var completed: SpeechAnalysisResult?
+        for try await event in stream {
+            switch event {
+            case .transcription(.diagnostic(let diagnostic)):
+                sawDropDiagnostic = diagnostic.message.contains("Dropped diarization stream")
+            case .completed(let result):
+                completed = result
+            case .transcription, .diarization, .speakerAttributedSnapshot:
+                break
+            }
+        }
+
+        let asrChunks = await asrRecorder.recordedChunks()
+        XCTAssertEqual(asrChunks.count, 20)
+        XCTAssertTrue(sawDropDiagnostic)
+        XCTAssertEqual(completed?.transcript, transcript)
+        XCTAssertNil(completed?.diarization)
+    }
+
+    func testStreamingAnalyzerIgnoresLateDiarizationAfterSoftDrop() async throws {
+        let speaker = SpeakerID(rawValue: "late")
+        let transcript = Transcript(segments: [
+            TranscriptSegment(text: "transcription only", startTime: 0, endTime: 0.5)
+        ])
+        let lateSnapshot = StreamingDiarizationSnapshot(stable: DiarizationResult(
+            turns: [SpeakerTurn(speaker: speaker, startTime: 0, endTime: 0.5)],
+            speakers: [Speaker(id: speaker)],
+            duration: 0.5
+        ))
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: RecordingStreamingTranscriber(
+                recorder: AudioChunkRecorder(),
+                events: [.completed(transcript)]
+            ),
+            streamingDiarizer: StalledEmittingStreamingDiarizer(snapshot: lateSnapshot)
+        )
+        let stream = analyzer.stream(
+            audio: pacedTestAudioChunks(startTimes: Array(stride(from: 0.0, to: 1.0, by: 0.05))),
+            options: StreamingSpeechAnalysisOptions(
+                diarization: StreamingDiarizationRequest(attributionJitterBufferDelay: 0),
+                audioFanOutBufferLimit: 4,
+                backlogPolicy: .dropDiarization
+            )
+        )
+
+        var sawLateDiarization = false
+        var completed: SpeechAnalysisResult?
+        for try await event in stream {
+            switch event {
+            case .diarization, .speakerAttributedSnapshot:
+                sawLateDiarization = true
+            case .completed(let result):
+                completed = result
+            case .transcription:
+                break
+            }
+        }
+
+        XCTAssertFalse(sawLateDiarization)
+        XCTAssertEqual(completed?.transcript, transcript)
+        XCTAssertNil(completed?.diarization)
     }
 
     func testEngineRegistersDiarizerForAnalyzerConstruction() async {
@@ -770,6 +1010,34 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
                 duration: 0.1
             ))
             continuation.finish(throwing: StreamingFanOutTestError.input)
+        }
+    }
+
+    private func pacedTestAudioChunks(
+        startTimes: [TimeInterval],
+        nanosecondsBetweenChunks: UInt64 = 5_000_000
+    ) -> AsyncThrowingStream<AudioChunk, Error> {
+        AsyncThrowingStream<AudioChunk, Error> { continuation in
+            let task = Task {
+                do {
+                    for startTime in startTimes {
+                        continuation.yield(AudioChunk(
+                            samples: Array(repeating: 0.05, count: 1_600),
+                            sampleRate: 16_000,
+                            channelCount: 1,
+                            startTime: startTime,
+                            duration: 0.1
+                        ))
+                        try await Task.sleep(nanoseconds: nanosecondsBetweenChunks)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
         }
     }
 
@@ -1014,6 +1282,35 @@ private struct StalledStreamingDiarizer: StreamingSpeakerDiarizer {
                     for try await _ in audio {
                         try Task.checkCancellation()
                     }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+}
+
+private struct StalledEmittingStreamingDiarizer: StreamingSpeakerDiarizer {
+    var snapshot: StreamingDiarizationSnapshot
+
+    func stream(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        options: StreamingDiarizationOptions
+    ) -> AsyncThrowingStream<StreamingDiarizationSnapshot, Error> {
+        let snapshot = snapshot
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try options.options.validate()
+                    try await Task.sleep(nanoseconds: 200_000_000)
+                    for try await _ in audio {
+                        try Task.checkCancellation()
+                    }
+                    continuation.yield(snapshot)
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)

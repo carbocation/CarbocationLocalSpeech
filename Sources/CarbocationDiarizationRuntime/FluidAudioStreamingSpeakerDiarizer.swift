@@ -32,6 +32,20 @@ public enum FluidAudioStreamingSpeakerDiarizerError: Error, LocalizedError, Send
     }
 }
 
+public struct FluidAudioStreamingComputeUnits: Sendable {
+    public var sortformer: MLComputeUnits
+    public var lsEEND: MLComputeUnits
+
+    public init(sortformer: MLComputeUnits = .all, lsEEND: MLComputeUnits = .all) {
+        self.sortformer = sortformer
+        self.lsEEND = lsEEND
+    }
+
+    public static func uniform(_ computeUnits: MLComputeUnits) -> FluidAudioStreamingComputeUnits {
+        FluidAudioStreamingComputeUnits(sortformer: computeUnits, lsEEND: computeUnits)
+    }
+}
+
 @available(macOS 14.0, iOS 17.0, *)
 public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.StreamingSpeakerDiarizer,
     CarbocationLocalSpeech.DiarizationModelLifecycle {
@@ -50,7 +64,7 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
     }
 
     private let modelsDirectory: URL?
-    private let computeUnits: MLComputeUnits
+    private let computeUnits: FluidAudioStreamingComputeUnits
     private let sortformerConfig: SortformerConfig
     private let lseendVariant: LSEENDVariant
     private let lseendStepSize: LSEENDStepSize
@@ -67,6 +81,20 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
         lseendStepSize: LSEENDStepSize = .step100ms
     ) {
         self.modelsDirectory = modelsDirectory
+        self.computeUnits = .uniform(computeUnits)
+        self.sortformerConfig = sortformerConfig
+        self.lseendVariant = lseendVariant
+        self.lseendStepSize = lseendStepSize
+    }
+
+    public init(
+        modelsDirectory: URL? = nil,
+        computeUnits: FluidAudioStreamingComputeUnits,
+        sortformerConfig: SortformerConfig = .fastV2_1,
+        lseendVariant: LSEENDVariant = .dihard3,
+        lseendStepSize: LSEENDStepSize = .step100ms
+    ) {
+        self.modelsDirectory = modelsDirectory
         self.computeUnits = computeUnits
         self.sortformerConfig = sortformerConfig
         self.lseendVariant = lseendVariant
@@ -78,7 +106,7 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
         lseendDiarizer: (any Diarizer)? = nil
     ) {
         self.modelsDirectory = nil
-        self.computeUnits = .all
+        self.computeUnits = .uniform(.all)
         self.sortformerConfig = .fastV2_1
         self.lseendVariant = .dihard3
         self.lseendStepSize = .step100ms
@@ -150,7 +178,7 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
         let models = try await SortformerModels.loadFromHuggingFace(
             config: sortformerConfig,
             cacheDirectory: modelsDirectory,
-            computeUnits: computeUnits,
+            computeUnits: computeUnits.sortformer,
             progressHandler: { progress in
                 onProgress(FluidAudioModelInstallDiagnostics.mapProgress(progress))
             }
@@ -168,7 +196,7 @@ public actor FluidAudioStreamingSpeakerDiarizer: CarbocationLocalSpeech.Streamin
             variant: lseendVariant,
             stepSize: lseendStepSize,
             cacheDirectory: modelsDirectory,
-            computeUnits: computeUnits,
+            computeUnits: computeUnits.lsEEND,
             progressHandler: { progress in
                 onProgress(FluidAudioModelInstallDiagnostics.mapProgress(progress))
             }

@@ -208,6 +208,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
     public var attributionPolicy: SpeakerAttributionPolicy
     public var attributionLookbackWindow: TimeInterval
     public var attributionJitterBufferDelay: TimeInterval
+    public var maximumAttributionJitterBufferDelay: TimeInterval?
     public var attributionCacheRetentionWindow: TimeInterval
 
     public init(
@@ -217,6 +218,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         attributionPolicy: SpeakerAttributionPolicy = .preferStandardWordLevel,
         attributionLookbackWindow: TimeInterval = 30,
         attributionJitterBufferDelay: TimeInterval = 0.75,
+        maximumAttributionJitterBufferDelay: TimeInterval? = nil,
         attributionCacheRetentionWindow: TimeInterval = 600
     ) {
         self.options = options
@@ -225,6 +227,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         self.attributionPolicy = attributionPolicy
         self.attributionLookbackWindow = attributionLookbackWindow
         self.attributionJitterBufferDelay = attributionJitterBufferDelay
+        self.maximumAttributionJitterBufferDelay = maximumAttributionJitterBufferDelay.map { max(0, $0) }
         self.attributionCacheRetentionWindow = max(0, attributionCacheRetentionWindow)
     }
 
@@ -235,6 +238,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         case attributionPolicy
         case attributionLookbackWindow
         case attributionJitterBufferDelay
+        case maximumAttributionJitterBufferDelay
         case attributionCacheRetentionWindow
     }
 
@@ -255,6 +259,10 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
             TimeInterval.self,
             forKey: .attributionJitterBufferDelay
         ) ?? 0.75
+        maximumAttributionJitterBufferDelay = try container.decodeIfPresent(
+            TimeInterval.self,
+            forKey: .maximumAttributionJitterBufferDelay
+        ).map { max(0, $0) }
         attributionCacheRetentionWindow = max(0, try container.decodeIfPresent(
             TimeInterval.self,
             forKey: .attributionCacheRetentionWindow
@@ -269,6 +277,7 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         try container.encode(attributionPolicy, forKey: .attributionPolicy)
         try container.encode(attributionLookbackWindow, forKey: .attributionLookbackWindow)
         try container.encode(attributionJitterBufferDelay, forKey: .attributionJitterBufferDelay)
+        try container.encodeIfPresent(maximumAttributionJitterBufferDelay, forKey: .maximumAttributionJitterBufferDelay)
         try container.encode(attributionCacheRetentionWindow, forKey: .attributionCacheRetentionWindow)
     }
 
@@ -281,19 +290,27 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
     }
 }
 
+public enum StreamingAudioBacklogPolicy: String, Codable, Hashable, Sendable {
+    case fatal
+    case dropDiarization
+}
+
 public struct StreamingSpeechAnalysisOptions: Hashable, Sendable {
     public var transcription: StreamingTranscriptionOptions
     public var diarization: StreamingDiarizationRequest?
     public var audioFanOutBufferLimit: Int
+    public var backlogPolicy: StreamingAudioBacklogPolicy
 
     public init(
         transcription: StreamingTranscriptionOptions = StreamingTranscriptionOptions(),
         diarization: StreamingDiarizationRequest? = nil,
-        audioFanOutBufferLimit: Int = 128
+        audioFanOutBufferLimit: Int = 128,
+        backlogPolicy: StreamingAudioBacklogPolicy = .fatal
     ) {
         self.transcription = transcription
         self.diarization = diarization
         self.audioFanOutBufferLimit = max(1, audioFanOutBufferLimit)
+        self.backlogPolicy = backlogPolicy
     }
 }
 
