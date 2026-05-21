@@ -131,6 +131,15 @@ let library = SpeechModelLibrary(root: customModelsRoot)
 
 Installed Whisper models live in UUID directories under `SpeechModels/`, each with a `metadata.json` and one or more asset files.
 
+Companion diarization assets should use a separate root so they are not treated as selectable Whisper models:
+
+```swift
+let diarizationRoot = SpeechModelStorage.diarizationModelsDirectory(
+    sharedGroupIdentifier: "group.com.example.shared",
+    appSupportFolderName: "YourApp"
+)
+```
+
 ### Pick and persist a provider
 
 Persist `SpeechModelSelection.storageValue`, not a model filename. Installed Whisper models use UUID storage values; system providers use stable strings like `system.apple-speech`.
@@ -165,6 +174,28 @@ guard let plan = await LocalSpeechEngine.loadPlan(
 ```
 
 Use `loadPlan` for restored-selection UI state such as usable-provider checks, labels, and capabilities. For direct installed-model lists, call `await library.refresh()` and read the returned snapshot.
+
+Apps that offer diarization should persist a `SpeechPipelineSelection.storageValue` instead. The pipeline keeps transcription required and stores optional file/live diarization choices alongside it. Legacy `SpeechModelSelection.storageValue` strings still parse as transcription-only pipelines.
+
+```swift
+let pipeline = SpeechPipelineSelection(
+    transcription: selection,
+    diarization: SpeechDiarizationSelection(
+        file: .fluidAudio(.offline),
+        streaming: .fluidAudio(.streamingSortformer)
+    )
+)
+
+let valueToPersist = pipeline.storageValue
+
+guard let restoredPipeline = SpeechPipelineSelection(storageValue: valueFromPreferences) else {
+    throw LocalSpeechEngineError.invalidSelection(valueFromPreferences)
+}
+```
+
+Use `LocalSpeechEngine.pipelineLoadPlan(...)` when a settings UI or startup path needs to validate both parts together. Pass a `FluidAudioDiarizationModelManager` as the diarization planner when you import `CarbocationDiarizationRuntime`; otherwise the default catalog planner validates stable IDs and capabilities without loading FluidAudio.
+
+`CarbocationLocalSpeechUI` also provides `SpeechPipelinePickerView` for this shape. `SpeechModelLibraryPickerView` remains transcription-only for existing integrations.
 
 ### Transcribe a file
 
@@ -335,11 +366,32 @@ import CarbocationLocalSpeech
 import CarbocationLocalSpeechRuntime
 import CoreML
 
-let diarizer = FluidAudioStreamingSpeakerDiarizer(computeUnits: FluidAudioStreamingComputeUnits(
-    sortformer: .all,
-    lsEEND: .cpuAndGPU
-))
-try await diarizer.installModels(backend: .sortformer) { progress in
+let manager = FluidAudioDiarizationModelManager(
+    modelsDirectory: SpeechModelStorage.diarizationModelsDirectory(appSupportFolderName: "YourApp"),
+    streamingComputeUnits: FluidAudioStreamingComputeUnits(
+        sortformer: .all,
+        lsEEND: .cpuAndGPU
+    )
+)
+
+let pipeline = SpeechPipelineSelection(
+    transcription: selection,
+    diarization: SpeechDiarizationSelection(streaming: .fluidAudio(.streamingSortformer))
+)
+
+guard let plan = await LocalSpeechEngine.pipelineLoadPlan(
+    from: pipeline.storageValue,
+    in: library,
+    diarizationPlanner: manager
+) else {
+    throw LocalSpeechEngineError.invalidSelection(pipeline.storageValue)
+}
+
+try await LocalSpeechEngine.shared.load(selection: plan.transcription.selection, from: library)
+
+let diarizer = try await manager.installStreamingDiarizer(
+    selection: plan.streamingDiarization?.selection ?? DiarizationModelCatalog.defaultStreaming.selection
+) { progress in
     // Surface download/compile progress in your UI.
 }
 await LocalSpeechEngine.shared.registerStreamingDiarizer(diarizer)

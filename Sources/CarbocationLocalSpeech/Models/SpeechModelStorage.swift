@@ -61,6 +61,34 @@ public enum SpeechModelStorage {
         return base.appendingPathComponent("SpeechModels", isDirectory: true)
     }
 
+    public static func diarizationModelsDirectory(
+        sharedGroupIdentifier: String = defaultSharedGroupID,
+        appSupportFolderName: String,
+        fileManager: FileManager = .default
+    ) -> URL {
+        diarizationModelsDirectory(
+            sharedGroupIdentifier: sharedGroupIdentifier,
+            appSupportFolderName: appSupportFolderName,
+            fileManager: fileManager,
+            sharedGroupRootResolver: defaultSharedGroupRoot
+        )
+    }
+
+    static func diarizationModelsDirectory(
+        sharedGroupIdentifier: String = defaultSharedGroupID,
+        appSupportFolderName: String,
+        fileManager: FileManager = .default,
+        sharedGroupRootResolver: SharedGroupRootResolver
+    ) -> URL {
+        let base = sharedGroupRoot(
+            identifier: sharedGroupIdentifier,
+            fileManager: fileManager,
+            sharedGroupRootResolver: sharedGroupRootResolver
+        )
+            ?? appSupportDirectory(appSupportFolderName: appSupportFolderName, fileManager: fileManager)
+        return base.appendingPathComponent("DiarizationModels", isDirectory: true)
+    }
+
     public static func legacyPerAppModelsDirectory(
         appSupportFolderName: String,
         fileManager: FileManager = .default

@@ -1313,6 +1313,104 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertEqual(cached?.selection, .installed(id))
     }
 
+    func testPipelineLoadPlanValidatesTranscriptionAndDiarizationSelections() async throws {
+        let root = try makeTemporaryDirectory()
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let id = try createMetadataFreeModel(in: modelsRoot)
+        let selection = SpeechPipelineSelection(
+            transcription: .installed(id),
+            diarization: SpeechDiarizationSelection(
+                file: .fluidAudio(.offline),
+                streaming: .fluidAudio(.streamingSortformer)
+            )
+        )
+
+        let plan = await LocalSpeechEngine.pipelineLoadPlan(
+            from: selection.storageValue,
+            in: library,
+            diarizationPlanner: MockDiarizationModelLoadPlanner(plans: [
+                .fluidAudio(.offline): DiarizationModelLoadPlan(
+                    selection: .fluidAudio(.offline),
+                    displayName: "Offline",
+                    capabilities: .fileOnly,
+                    availability: .available
+                ),
+                .fluidAudio(.streamingSortformer): DiarizationModelLoadPlan(
+                    selection: .fluidAudio(.streamingSortformer),
+                    displayName: "Sortformer",
+                    capabilities: .streamingOnly,
+                    availability: .available
+                )
+            ])
+        )
+
+        XCTAssertEqual(plan?.selection, selection)
+        XCTAssertEqual(plan?.transcription.selection, .installed(id))
+        XCTAssertEqual(plan?.fileDiarization?.displayName, "Offline")
+        XCTAssertEqual(plan?.streamingDiarization?.displayName, "Sortformer")
+        XCTAssertTrue(plan?.capabilities.supportsFileDiarization == true)
+        XCTAssertTrue(plan?.capabilities.supportsStreamingDiarization == true)
+        XCTAssertEqual(plan?.availability, .available)
+    }
+
+    func testPipelineLoadPlanAcceptsLegacyTranscriptionOnlyStorage() async throws {
+        let root = try makeTemporaryDirectory()
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let id = try createMetadataFreeModel(in: modelsRoot)
+
+        let plan = await LocalSpeechEngine.pipelineLoadPlan(from: id.uuidString, in: library)
+
+        XCTAssertEqual(plan?.selection.transcription, .installed(id))
+        XCTAssertNil(plan?.selection.diarization.file)
+        XCTAssertNil(plan?.selection.diarization.streaming)
+        XCTAssertFalse(plan?.capabilities.supportsFileDiarization == true)
+        XCTAssertFalse(plan?.capabilities.supportsStreamingDiarization == true)
+    }
+
+    func testPipelineLoadPlanRejectsDiarizationSelectionsWithWrongCapability() async throws {
+        let root = try makeTemporaryDirectory()
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let id = try createMetadataFreeModel(in: modelsRoot)
+        let selection = SpeechPipelineSelection(
+            transcription: .installed(id),
+            diarization: SpeechDiarizationSelection(file: .fluidAudio(.streamingSortformer))
+        )
+
+        let plan = await LocalSpeechEngine.pipelineLoadPlan(from: selection.storageValue, in: library)
+
+        XCTAssertNil(plan)
+    }
+
+    func testPipelineLoadPlanReportsDiarizationAssetDownloadRequired() async throws {
+        let root = try makeTemporaryDirectory()
+        let modelsRoot = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        let library = SpeechModelLibrary(root: modelsRoot)
+        let id = try createMetadataFreeModel(in: modelsRoot)
+        let selection = SpeechPipelineSelection(
+            transcription: .installed(id),
+            diarization: SpeechDiarizationSelection(file: .fluidAudio(.offline))
+        )
+
+        let plan = await LocalSpeechEngine.pipelineLoadPlan(
+            from: selection.storageValue,
+            in: library,
+            diarizationPlanner: MockDiarizationModelLoadPlanner(plans: [
+                .fluidAudio(.offline): DiarizationModelLoadPlan(
+                    selection: .fluidAudio(.offline),
+                    displayName: "Offline",
+                    capabilities: .fileOnly,
+                    availability: .unavailable(.assetDownloadRequired)
+                )
+            ])
+        )
+
+        XCTAssertEqual(plan?.availability, .unavailable(.assetDownloadRequired))
+        XCTAssertEqual(plan?.fileDiarization?.availability, .unavailable(.assetDownloadRequired))
+    }
+
     func testLoadPlanReturnsNilForDeletedInstalledSelection() async throws {
         let root = try makeTemporaryDirectory()
         let source = root.appendingPathComponent("ggml-base.en.bin")
@@ -1712,6 +1810,14 @@ private struct StalledStreamingDiarizer: StreamingSpeakerDiarizer {
                 task.cancel()
             }
         }
+    }
+}
+
+private struct MockDiarizationModelLoadPlanner: DiarizationModelLoadPlanning {
+    var plans: [DiarizationModelSelection: DiarizationModelLoadPlan]
+
+    func loadPlan(for selection: DiarizationModelSelection) async -> DiarizationModelLoadPlan? {
+        plans[selection]
     }
 }
 

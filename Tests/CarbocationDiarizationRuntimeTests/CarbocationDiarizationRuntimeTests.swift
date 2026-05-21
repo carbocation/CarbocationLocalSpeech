@@ -24,6 +24,48 @@ final class CarbocationDiarizationRuntimeTests: XCTestCase {
         }
     }
 
+    func testFluidAudioDiarizationModelManagerMapsStableSelectionsToPlans() async throws {
+        let manager = FluidAudioDiarizationModelManager()
+
+        let offline = await manager.loadPlan(for: .fluidAudio(.offline))
+        let sortformer = await manager.loadPlan(for: .fluidAudio(.streamingSortformer))
+        let lseend = await manager.loadPlan(for: .fluidAudio(.streamingLSEEND))
+
+        XCTAssertEqual(offline?.displayName, "FluidAudio offline diarization")
+        XCTAssertTrue(offline?.capabilities.supportsFileDiarization == true)
+        XCTAssertFalse(offline?.capabilities.supportsStreamingDiarization == true)
+        XCTAssertEqual(sortformer?.displayName, "FluidAudio streaming Sortformer")
+        XCTAssertTrue(sortformer?.capabilities.supportsStreamingDiarization == true)
+        XCTAssertEqual(lseend?.displayName, "FluidAudio streaming LS-EEND")
+        XCTAssertTrue(lseend?.capabilities.supportsStreamingDiarization == true)
+    }
+
+    func testFluidAudioDiarizationModelManagerCreatesOnlyCompatibleDiarizers() async throws {
+        let manager = FluidAudioDiarizationModelManager()
+
+        _ = try await manager.makeFileDiarizer(selection: .fluidAudio(.offline))
+        _ = try await manager.makeStreamingDiarizer(selection: .fluidAudio(.streamingSortformer))
+        _ = try await manager.makeStreamingDiarizer(selection: .fluidAudio(.streamingLSEEND))
+
+        do {
+            _ = try await manager.makeFileDiarizer(selection: .fluidAudio(.streamingSortformer))
+            XCTFail("Expected streaming model to be rejected for file diarization.")
+        } catch let error as FluidAudioDiarizationModelManagerError {
+            guard case .unsupportedFileSelection = error else {
+                return XCTFail("Unexpected manager error: \(error)")
+            }
+        }
+
+        do {
+            _ = try await manager.makeStreamingDiarizer(selection: .fluidAudio(.offline))
+            XCTFail("Expected offline model to be rejected for streaming diarization.")
+        } catch let error as FluidAudioDiarizationModelManagerError {
+            guard case .unsupportedStreamingSelection = error else {
+                return XCTFail("Unexpected manager error: \(error)")
+            }
+        }
+    }
+
     func testFluidAudioDiarizerThrowsWhenModelsHaveNotBeenExplicitlyInstalled() async {
         let diarizer = FluidAudioSpeakerDiarizer()
 

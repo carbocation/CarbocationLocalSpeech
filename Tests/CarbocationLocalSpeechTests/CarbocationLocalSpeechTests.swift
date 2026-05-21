@@ -15,6 +15,88 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(SpeechModelSelection.self, from: encoded), .system(.appleSpeech))
     }
 
+    func testPipelineSelectionStorageRoundTripsTranscriptionAndDiarization() throws {
+        let id = UUID()
+        let selection = SpeechPipelineSelection(
+            transcription: .installed(id),
+            diarization: SpeechDiarizationSelection(
+                file: .fluidAudio(.offline),
+                streaming: .fluidAudio(.streamingSortformer)
+            )
+        )
+
+        XCTAssertTrue(selection.storageValue.hasPrefix("speech-pipeline.v1|"))
+        XCTAssertEqual(SpeechPipelineSelection(storageValue: selection.storageValue), selection)
+
+        let encoded = try JSONEncoder().encode(selection)
+        XCTAssertEqual(String(data: encoded, encoding: .utf8), "\"\(selection.storageValue)\"")
+        XCTAssertEqual(try JSONDecoder().decode(SpeechPipelineSelection.self, from: encoded), selection)
+    }
+
+    func testPipelineSelectionAcceptsLegacyTranscriptionSelectionStorage() {
+        let id = UUID()
+        XCTAssertEqual(
+            SpeechPipelineSelection(storageValue: id.uuidString),
+            SpeechPipelineSelection(transcription: .installed(id), diarization: .off)
+        )
+        XCTAssertEqual(
+            SpeechPipelineSelection(storageValue: SpeechSystemModelID.appleSpeech.rawValue),
+            SpeechPipelineSelection(transcription: .system(.appleSpeech), diarization: .off)
+        )
+        XCTAssertNil(SpeechPipelineSelection(storageValue: "not-a-selection"))
+    }
+
+    func testPipelineSelectionRepresentsDisabledFileAndStreamingDiarization() {
+        let transcription = SpeechModelSelection.system(.appleSpeech)
+        let disabled = SpeechPipelineSelection(transcription: transcription)
+        let file = SpeechPipelineSelection(
+            transcription: transcription,
+            diarization: SpeechDiarizationSelection(file: .fluidAudio(.offline))
+        )
+        let streaming = SpeechPipelineSelection(
+            transcription: transcription,
+            diarization: SpeechDiarizationSelection(streaming: .fluidAudio(.streamingSortformer))
+        )
+
+        XCTAssertNil(SpeechPipelineSelection(storageValue: disabled.storageValue)?.diarization.file)
+        XCTAssertNil(SpeechPipelineSelection(storageValue: disabled.storageValue)?.diarization.streaming)
+        XCTAssertEqual(SpeechPipelineSelection(storageValue: file.storageValue)?.diarization.file, .fluidAudio(.offline))
+        XCTAssertNil(SpeechPipelineSelection(storageValue: file.storageValue)?.diarization.streaming)
+        XCTAssertNil(SpeechPipelineSelection(storageValue: streaming.storageValue)?.diarization.file)
+        XCTAssertEqual(
+            SpeechPipelineSelection(storageValue: streaming.storageValue)?.diarization.streaming,
+            .fluidAudio(.streamingSortformer)
+        )
+    }
+
+    func testDiarizationModelCatalogExposesFluidAudioStableIDsAndDefaults() {
+        XCTAssertEqual(
+            DiarizationModelCatalog.all.map(\.id),
+            [
+                "diarization.fluid-audio.offline",
+                "diarization.fluid-audio.streaming.sortformer",
+                "diarization.fluid-audio.streaming.ls-eend"
+            ]
+        )
+        XCTAssertEqual(DiarizationModelCatalog.defaultFile.selection, .fluidAudio(.offline))
+        XCTAssertEqual(DiarizationModelCatalog.defaultStreaming.selection, .fluidAudio(.streamingSortformer))
+
+        let offline = DiarizationModelCatalog.fluidAudioOffline
+        XCTAssertEqual(offline.displayName, "FluidAudio offline diarization")
+        XCTAssertTrue(offline.capabilities.supportsFileDiarization)
+        XCTAssertFalse(offline.capabilities.supportsStreamingDiarization)
+
+        let sortformer = DiarizationModelCatalog.fluidAudioStreamingSortformer
+        XCTAssertEqual(sortformer.displayName, "FluidAudio streaming Sortformer")
+        XCTAssertFalse(sortformer.capabilities.supportsFileDiarization)
+        XCTAssertTrue(sortformer.capabilities.supportsStreamingDiarization)
+
+        let lseend = DiarizationModelCatalog.fluidAudioStreamingLSEEND
+        XCTAssertEqual(lseend.displayName, "FluidAudio streaming LS-EEND")
+        XCTAssertFalse(lseend.capabilities.supportsFileDiarization)
+        XCTAssertTrue(lseend.capabilities.supportsStreamingDiarization)
+    }
+
     func testSpeechAnalysisResultDefaultsLegacyDiarizationStatusWhenDecoding() throws {
         let result = SpeechAnalysisResult(
             diarization: DiarizationResult(turns: [], speakers: [], duration: 0),
@@ -231,6 +313,20 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(
             directory.standardizedFileURL.path,
             groupRoot.appendingPathComponent("SpeechModels", isDirectory: true).standardizedFileURL.path
+        )
+    }
+
+    func testSpeechModelStorageKeepsDiarizationModelsOutsideSpeechModelFolders() throws {
+        let groupRoot = try makeTemporaryDirectory()
+        let directory = SpeechModelStorage.diarizationModelsDirectory(
+            sharedGroupIdentifier: "group.com.example.shared",
+            appSupportFolderName: "ExampleApp",
+            sharedGroupRootResolver: { _, _ in groupRoot }
+        )
+
+        XCTAssertEqual(
+            directory.standardizedFileURL.path,
+            groupRoot.appendingPathComponent("DiarizationModels", isDirectory: true).standardizedFileURL.path
         )
     }
 
