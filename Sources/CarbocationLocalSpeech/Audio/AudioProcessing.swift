@@ -306,11 +306,24 @@ private final class CaptureTiming: @unchecked Sendable {
     }
 }
 
+private struct CaptureMonotonicTimestamp: Hashable, Sendable {
+    private var uptimeNanoseconds: UInt64
+
+    static func now() -> Self {
+        Self(uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    }
+
+    func duration(to end: Self = .now()) -> TimeInterval {
+        guard end.uptimeNanoseconds >= uptimeNanoseconds else { return 0 }
+        return Double(end.uptimeNanoseconds - uptimeNanoseconds) / 1_000_000_000
+    }
+}
+
 private final class CaptureRecoveryMarker: @unchecked Sendable {
     struct Context: Sendable {
         var reason: AudioCaptureRecoveryReason
         var attemptCount: Int
-        var startedAt: Date
+        var startedAt: CaptureMonotonicTimestamp
         var message: String?
     }
 
@@ -332,7 +345,7 @@ private final class CaptureRecoveryMarker: @unchecked Sendable {
         self.context = nil
         lock.unlock()
 
-        let unavailableDuration = max(0, Date().timeIntervalSince(context.startedAt))
+        let unavailableDuration = context.startedAt.duration()
         timing.advance(by: unavailableDuration)
         return AudioCaptureRecoveryEvent(
             reason: context.reason,
@@ -466,7 +479,7 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
     private struct RecoveryAttempt {
         var configuration: AudioCaptureConfiguration
         var reason: AudioCaptureRecoveryReason
-        var startedAt: Date
+        var startedAt: CaptureMonotonicTimestamp
         var attemptCount: Int
     }
 
@@ -488,7 +501,7 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
     private var activeConfiguration: AudioCaptureConfiguration?
     private var recoveryTask: Task<Void, Never>?
     private var pendingRecoveryReason: AudioCaptureRecoveryReason?
-    private var recoveryStartedAt: Date?
+    private var recoveryStartedAt: CaptureMonotonicTimestamp?
     private var consecutiveRecoveryAttempts = 0
 #if os(iOS)
     private var didConfigureApplicationAudioSession = false
@@ -938,7 +951,7 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
         engineGeneration &+= 1
         pendingRecoveryReason = reason
         if recoveryStartedAt == nil {
-            recoveryStartedAt = Date()
+            recoveryStartedAt = .now()
         }
         let oldEngine = engine
         engine = nil
@@ -968,7 +981,7 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
         engineGeneration &+= 1
         pendingRecoveryReason = .interruptionEnded
         if recoveryStartedAt == nil {
-            recoveryStartedAt = Date()
+            recoveryStartedAt = .now()
         }
         let oldEngine = engine
         engine = nil
@@ -1065,7 +1078,7 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
 
         state = .recovering
         consecutiveRecoveryAttempts += 1
-        let startedAt = recoveryStartedAt ?? Date()
+        let startedAt = recoveryStartedAt ?? .now()
         recoveryStartedAt = startedAt
         return RecoveryAttempt(
             configuration: configuration,
@@ -1131,8 +1144,8 @@ public final class AVAudioEngineCaptureSession: AudioCapturing, @unchecked Senda
 
     private func stopEngine(_ audioEngine: AVAudioEngine) {
         stopQueue.async {
-            audioEngine.stop()
             audioEngine.inputNode.removeTap(onBus: 0)
+            audioEngine.stop()
         }
     }
 
