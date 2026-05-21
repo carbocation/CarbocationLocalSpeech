@@ -65,6 +65,18 @@ public struct SpeechDiarizationSelection: Codable, Hashable, Sendable {
     public static let off = SpeechDiarizationSelection()
 }
 
+public struct SpeechDiarizationUsage: OptionSet, Hashable, Sendable {
+    public let rawValue: UInt8
+
+    public init(rawValue: UInt8) {
+        self.rawValue = rawValue
+    }
+
+    public static let file = SpeechDiarizationUsage(rawValue: 1 << 0)
+    public static let streaming = SpeechDiarizationUsage(rawValue: 1 << 1)
+    public static let all: SpeechDiarizationUsage = [.file, .streaming]
+}
+
 public struct SpeechPipelineSelection: Hashable, Sendable {
     private static let storagePrefix = "speech-pipeline.v1"
     private static let disabledDiarizationStorageValue = "none"
@@ -132,6 +144,26 @@ public struct SpeechPipelineSelection: Hashable, Sendable {
             return nil
         }
         return .some(selection)
+    }
+}
+
+public extension SpeechPipelineSelection {
+    func applyingDiarizationUsage(
+        _ usage: SpeechDiarizationUsage,
+        defaultFileSelection: DiarizationModelSelection = DiarizationModelCatalog.defaultFile.selection,
+        defaultStreamingSelection: DiarizationModelSelection = DiarizationModelCatalog.defaultStreaming.selection
+    ) -> SpeechPipelineSelection {
+        SpeechPipelineSelection(
+            transcription: transcription,
+            diarization: SpeechDiarizationSelection(
+                file: usage.contains(.file)
+                    ? diarization.file ?? defaultFileSelection
+                    : nil,
+                streaming: usage.contains(.streaming)
+                    ? diarization.streaming ?? defaultStreamingSelection
+                    : nil
+            )
+        )
     }
 }
 

@@ -755,15 +755,23 @@ private actor StreamingSpeechAnalysisState {
     }
 
     private func reconcileLockedSegments(with stableSegments: [TranscriptSegment]) {
-        let currentFingerprints = Dictionary(
-            uniqueKeysWithValues: stableSegments.map { ($0.id, TranscriptSegmentFingerprint(segment: $0)) }
-        )
+        let currentFingerprints = segmentFingerprintsByID(stableSegments)
 
         let staleSegmentIDs = lockedStableAttributions.compactMap { segmentID, lockedAttribution in
-            currentFingerprints[segmentID] == lockedAttribution.sourceFingerprint ? nil : segmentID
+            currentFingerprints[segmentID]?.contains(lockedAttribution.sourceFingerprint) == true
+                ? nil
+                : segmentID
         }
         for segmentID in staleSegmentIDs {
             lockedStableAttributions.removeValue(forKey: segmentID)
+        }
+    }
+
+    private func segmentFingerprintsByID(
+        _ segments: [TranscriptSegment]
+    ) -> [UUID: Set<TranscriptSegmentFingerprint>] {
+        segments.reduce(into: [UUID: Set<TranscriptSegmentFingerprint>]()) { result, segment in
+            result[segment.id, default: []].insert(TranscriptSegmentFingerprint(segment: segment))
         }
     }
 
@@ -1291,7 +1299,7 @@ private actor StreamingSpeechAnalysisState {
         guard let previousStable = latestTranscriptSnapshot?.stable else {
             return transcript
         }
-        let previousSegmentsByID = Dictionary(uniqueKeysWithValues: previousStable.segments.map { ($0.id, $0) })
+        let previousSegmentsByID = segmentsByID(previousStable.segments)
         let restorationOptions = diarizationRequest?.attributionRestorationOptions
             ?? SpeakerAttributionRestorationOptions()
         var restorationIndex: SpeakerAttributionRestorationIndex?
@@ -1299,8 +1307,10 @@ private actor StreamingSpeechAnalysisState {
         segments.reserveCapacity(transcript.segments.count)
 
         for segment in transcript.segments {
-            if let previous = previousSegmentsByID[segment.id],
-               TranscriptSegmentFingerprint(segment: previous) == TranscriptSegmentFingerprint(segment: segment) {
+            let segmentFingerprint = TranscriptSegmentFingerprint(segment: segment)
+            if let previous = previousSegmentsByID[segment.id]?.first(where: {
+                TranscriptSegmentFingerprint(segment: $0) == segmentFingerprint
+            }) {
                 segments.append(segmentByRestoringSpeakerAttribution(segment, from: previous))
             } else {
                 if restorationIndex == nil {
@@ -1324,6 +1334,12 @@ private actor StreamingSpeechAnalysisState {
             duration: transcript.duration,
             backend: transcript.backend
         )
+    }
+
+    private func segmentsByID(_ segments: [TranscriptSegment]) -> [UUID: [TranscriptSegment]] {
+        segments.reduce(into: [UUID: [TranscriptSegment]]()) { result, segment in
+            result[segment.id, default: []].append(segment)
+        }
     }
 
     private func segmentByRestoringSpeakerAttribution(

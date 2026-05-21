@@ -266,6 +266,8 @@ private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.vadSensitivity") private var vadSensitivityStorageValue = CLSSmokeVADSensitivity.medium.rawValue
     @AppStorage("CLSSmoke.liveInput") private var liveInputStorageValue = CLSSmokeLiveInput.microphone.rawValue
     @AppStorage("CLSSmoke.recordLiveAudio") private var recordLiveAudio = false
+    @AppStorage("CLSSmoke.useLiveDiarization") private var useLiveDiarization = false
+    @AppStorage("CLSSmoke.useFileDiarization") private var useFileDiarization = false
     @AppStorage("CLSSmoke.werReferenceText") private var werReferenceText = ""
     @State private var systemOptions: [SpeechSystemModelOption] = []
     @State private var librarySnapshot = SpeechModelLibrarySnapshot.empty
@@ -675,6 +677,16 @@ private struct CLSSmokeRootView: View {
                 }
                 .controlSize(.small)
             }
+
+            HStack(spacing: 10) {
+                Text("Diarization")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 80, alignment: .leading)
+
+                Toggle("Use live diarization", isOn: $useLiveDiarization)
+                    .modifier(CLSSmokePlatformCheckboxToggleStyle())
+                    .disabled(isStarting || isListening || isFileTranscribing)
+            }
         }
     }
 
@@ -764,6 +776,16 @@ private struct CLSSmokeRootView: View {
                     }
                     .disabled(selectedFileURL == nil || isStarting)
                 }
+            }
+
+            HStack(spacing: 10) {
+                Text("Diarization")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 80, alignment: .leading)
+
+                Toggle("Diarize speakers", isOn: $useFileDiarization)
+                    .modifier(CLSSmokePlatformCheckboxToggleStyle())
+                    .disabled(isFileTranscribing || isStarting)
             }
 
             fileDropTarget
@@ -968,6 +990,9 @@ private struct CLSSmokeRootView: View {
     private func startListening(with selection: SpeechPipelineSelection) {
         let storedSelectionValue = selection.storageValue
         selectionStorageValue = storedSelectionValue
+        let sessionSelectionValue = selection
+            .applyingDiarizationUsage(useLiveDiarization ? .streaming : [])
+            .storageValue
         let vadMode = selectedVADMode
         let vadSensitivity = selectedVADSensitivity
         let vadAvailability = vadAvailability(for: selection.transcription)
@@ -999,7 +1024,7 @@ private struct CLSSmokeRootView: View {
         transcriptionTask = Task {
             await runLiveTranscriptionSession(
                 id: sessionID,
-                selectionStorageValue: storedSelectionValue,
+                selectionStorageValue: sessionSelectionValue,
                 liveInput: liveInput,
                 vadMode: vadMode,
                 vadSensitivity: vadSensitivity
@@ -1413,6 +1438,9 @@ private struct CLSSmokeRootView: View {
 
         let storedSelectionValue = selectedPipelineSelection.storageValue
         selectionStorageValue = storedSelectionValue
+        let sessionSelectionValue = selectedPipelineSelection
+            .applyingDiarizationUsage(useFileDiarization ? .file : [])
+            .storageValue
         let vadMode = selectedVADMode
         let vadSensitivity = selectedVADSensitivity
 
@@ -1435,7 +1463,7 @@ private struct CLSSmokeRootView: View {
             await runFileTranscriptionSession(
                 id: sessionID,
                 fileURL: selectedFileURL,
-                selectionStorageValue: storedSelectionValue,
+                selectionStorageValue: sessionSelectionValue,
                 vadMode: vadMode,
                 vadSensitivity: vadSensitivity
             )

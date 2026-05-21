@@ -69,6 +69,52 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         )
     }
 
+    func testPipelineSelectionAppliesDiarizationUsageFromStoredDefaults() {
+        let transcription = SpeechModelSelection.system(.appleSpeech)
+        let selection = SpeechPipelineSelection(
+            transcription: transcription,
+            diarization: SpeechDiarizationSelection(
+                file: .fluidAudio(.offline),
+                streaming: .fluidAudio(.streamingLSEEND)
+            )
+        )
+
+        XCTAssertEqual(
+            selection.applyingDiarizationUsage(.file),
+            SpeechPipelineSelection(
+                transcription: transcription,
+                diarization: SpeechDiarizationSelection(file: .fluidAudio(.offline))
+            )
+        )
+        XCTAssertEqual(
+            selection.applyingDiarizationUsage(.streaming),
+            SpeechPipelineSelection(
+                transcription: transcription,
+                diarization: SpeechDiarizationSelection(streaming: .fluidAudio(.streamingLSEEND))
+            )
+        )
+        XCTAssertEqual(
+            selection.applyingDiarizationUsage([]),
+            SpeechPipelineSelection(transcription: transcription)
+        )
+    }
+
+    func testPipelineSelectionAppliesDiarizationUsageWithFallbackDefaults() {
+        let transcription = SpeechModelSelection.system(.appleSpeech)
+        let selection = SpeechPipelineSelection(transcription: transcription)
+
+        XCTAssertEqual(
+            selection.applyingDiarizationUsage(.all),
+            SpeechPipelineSelection(
+                transcription: transcription,
+                diarization: SpeechDiarizationSelection(
+                    file: .fluidAudio(.offline),
+                    streaming: .fluidAudio(.streamingSortformer)
+                )
+            )
+        )
+    }
+
     func testDiarizationModelCatalogExposesFluidAudioStableIDsAndDefaults() {
         XCTAssertEqual(
             DiarizationModelCatalog.all.map(\.id),

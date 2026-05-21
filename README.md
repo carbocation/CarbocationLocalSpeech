@@ -175,7 +175,7 @@ guard let plan = await LocalSpeechEngine.loadPlan(
 
 Use `loadPlan` for restored-selection UI state such as usable-provider checks, labels, and capabilities. For direct installed-model lists, call `await library.refresh()` and read the returned snapshot.
 
-Apps that offer diarization should persist a `SpeechPipelineSelection.storageValue` instead. The pipeline keeps transcription required and stores optional file/live diarization choices alongside it. Legacy `SpeechModelSelection.storageValue` strings still parse as transcription-only pipelines.
+Apps that offer diarization should persist a `SpeechPipelineSelection.storageValue` instead. The pipeline keeps transcription required and stores file/live diarization model defaults alongside it. Legacy `SpeechModelSelection.storageValue` strings still parse as transcription-only pipelines.
 
 ```swift
 let pipeline = SpeechPipelineSelection(
@@ -193,7 +193,7 @@ guard let restoredPipeline = SpeechPipelineSelection(storageValue: valueFromPref
 }
 ```
 
-Use `LocalSpeechEngine.pipelineLoadPlan(...)` when a settings UI or startup path needs to validate both parts together. Pass a `FluidAudioDiarizationModelManager` as the diarization planner when you import `CarbocationDiarizationRuntime`; otherwise the default catalog planner validates stable IDs and capabilities without loading FluidAudio.
+Use `LocalSpeechEngine.pipelineLoadPlan(...)` when a settings UI or startup path needs to validate the stored defaults together. Before a workflow run, call `applyingDiarizationUsage(_:)` to derive the operation-specific pipeline so unrequested file/live diarization defaults do not install assets or affect load availability. Pass a `FluidAudioDiarizationModelManager` as the diarization planner when you import `CarbocationDiarizationRuntime`; otherwise the default catalog planner validates stable IDs and capabilities without loading FluidAudio.
 
 `CarbocationLocalSpeechUI` also provides `SpeechPipelinePickerView` for this shape. `SpeechModelLibraryPickerView` remains transcription-only for existing integrations.
 

@@ -63,19 +63,6 @@ public struct SpeechPipelinePickerView: View {
         SpeechPipelineSelection(storageValue: selectionStorageValue)
     }
 
-    private var diarizationMode: SpeechPipelineDiarizationPickerMode {
-        guard let diarization = pipelineSelection?.diarization else {
-            return .off
-        }
-        if diarization.streaming != nil {
-            return .live
-        }
-        if diarization.file != nil {
-            return .file
-        }
-        return .off
-    }
-
     private var transcriptionBinding: Binding<String> {
         Binding {
             pipelineSelection?.transcription.storageValue
@@ -90,35 +77,33 @@ public struct SpeechPipelinePickerView: View {
         }
     }
 
-    private var diarizationModeBinding: Binding<SpeechPipelineDiarizationPickerMode> {
-        Binding {
-            diarizationMode
-        } set: { mode in
-            updatePipeline(diarization: diarizationSelection(for: mode))
-        }
+    private var diarizationDefaultsEditor: SpeechPipelineDiarizationDefaultsEditor {
+        SpeechPipelineDiarizationDefaultsEditor(
+            selection: pipelineSelection?.diarization ?? .off,
+            defaultFileSelection: defaultFileSelection,
+            defaultStreamingSelection: defaultStreamingSelection
+        )
     }
 
     private var fileDiarizationBinding: Binding<String> {
         Binding {
-            pipelineSelection?.diarization.file?.storageValue
-                ?? defaultFileSelection.storageValue
+            diarizationDefaultsEditor.fileSelection?.storageValue ?? ""
         } set: { newValue in
             guard let selection = DiarizationModelSelection(storageValue: newValue) else {
                 return
             }
-            updatePipeline(diarization: SpeechDiarizationSelection(file: selection))
+            updatePipeline(diarization: diarizationDefaultsEditor.settingFileSelection(selection))
         }
     }
 
     private var streamingDiarizationBinding: Binding<String> {
         Binding {
-            pipelineSelection?.diarization.streaming?.storageValue
-                ?? defaultStreamingSelection.storageValue
+            diarizationDefaultsEditor.streamingSelection?.storageValue ?? ""
         } set: { newValue in
             guard let selection = DiarizationModelSelection(storageValue: newValue) else {
                 return
             }
-            updatePipeline(diarization: SpeechDiarizationSelection(streaming: selection))
+            updatePipeline(diarization: diarizationDefaultsEditor.settingStreamingSelection(selection))
         }
     }
 
@@ -130,12 +115,14 @@ public struct SpeechPipelinePickerView: View {
         diarizationOptions.filter(\.capabilities.supportsStreamingDiarization)
     }
 
-    private var defaultFileSelection: DiarizationModelSelection {
-        fileOptions.first?.selection ?? DiarizationModelCatalog.defaultFile.selection
+    private var defaultFileSelection: DiarizationModelSelection? {
+        fileOptions.first { $0.selection == DiarizationModelCatalog.defaultFile.selection }?.selection
+            ?? fileOptions.first?.selection
     }
 
-    private var defaultStreamingSelection: DiarizationModelSelection {
-        streamingOptions.first?.selection ?? DiarizationModelCatalog.defaultStreaming.selection
+    private var defaultStreamingSelection: DiarizationModelSelection? {
+        streamingOptions.first { $0.selection == DiarizationModelCatalog.defaultStreaming.selection }?.selection
+            ?? streamingOptions.first?.selection
     }
 
     public var body: some View {
@@ -178,7 +165,7 @@ public struct SpeechPipelinePickerView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.title3.bold())
-                Text("Choose a required transcription provider and optional speaker diarization model.")
+                Text("Choose a required transcription provider and default speaker diarization models.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -191,36 +178,45 @@ public struct SpeechPipelinePickerView: View {
 
     private var diarizationSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Speaker Diarization")
+            Text("Diarization Defaults")
                 .font(.headline)
 
-            Picker("Diarization", selection: diarizationModeBinding) {
-                ForEach(SpeechPipelineDiarizationPickerMode.allCases) { mode in
-                    Text(mode.label).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
+            diarizationDefaultPicker(
+                title: "File diarization",
+                unavailableMessage: "No file diarization models are available.",
+                selection: fileDiarizationBinding,
+                options: fileOptions
+            )
 
-            switch diarizationMode {
-            case .off:
-                Label("Speaker diarization is off.", systemImage: "person.2.slash")
-                    .font(.callout)
+            diarizationDefaultPicker(
+                title: "Live diarization",
+                unavailableMessage: "No live diarization models are available.",
+                selection: streamingDiarizationBinding,
+                options: streamingOptions
+            )
+        }
+        .padding(20)
+    }
+
+    private func diarizationDefaultPicker(
+        title: String,
+        unavailableMessage: String,
+        selection: Binding<String>,
+        options: [DiarizationModelOption]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if options.isEmpty {
+                Label(unavailableMessage, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-            case .file:
+            } else {
                 diarizationModelPicker(
-                    title: "File diarization model",
-                    selection: fileDiarizationBinding,
-                    options: fileOptions
-                )
-            case .live:
-                diarizationModelPicker(
-                    title: "Live diarization model",
-                    selection: streamingDiarizationBinding,
-                    options: streamingOptions
+                    title: title,
+                    selection: selection,
+                    options: options
                 )
             }
         }
-        .padding(20)
     }
 
     private func diarizationModelPicker(
@@ -229,12 +225,18 @@ public struct SpeechPipelinePickerView: View {
         options: [DiarizationModelOption]
     ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Picker(title, selection: selection) {
-                ForEach(options) { option in
-                    Text(option.displayName).tag(option.selection.storageValue)
+            HStack(spacing: 10) {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 112, alignment: .leading)
+
+                Picker(title, selection: selection) {
+                    ForEach(options) { option in
+                        Text(option.displayName).tag(option.selection.storageValue)
+                    }
                 }
+                .labelsHidden()
             }
-            .labelsHidden()
 
             if let option = options.first(where: { $0.selection.storageValue == selection.wrappedValue }) {
                 Label(option.subtitle, systemImage: option.systemImageName)
@@ -287,59 +289,64 @@ public struct SpeechPipelinePickerView: View {
         ).storageValue
     }
 
-    private func diarizationSelection(
-        for mode: SpeechPipelineDiarizationPickerMode
-    ) -> SpeechDiarizationSelection {
-        switch mode {
-        case .off:
-            return .off
-        case .file:
-            return SpeechDiarizationSelection(
-                file: pipelineSelection?.diarization.file ?? defaultFileSelection
-            )
-        case .live:
-            return SpeechDiarizationSelection(
-                streaming: pipelineSelection?.diarization.streaming ?? defaultStreamingSelection
-            )
-        }
-    }
-
     private func normalizePipelineStorage() {
         guard let pipelineSelection else {
             return
         }
-        selectionStorageValue = pipelineSelection.storageValue
+        selectionStorageValue = SpeechPipelineSelection(
+            transcription: pipelineSelection.transcription,
+            diarization: diarizationDefaultsEditor.normalizedSelection
+        ).storageValue
     }
 
     private func summary(for pipelineSelection: SpeechPipelineSelection) -> String {
-        switch pipelineSelection.diarization {
-        case let diarization where diarization.streaming != nil:
-            return "Transcription with live diarization"
-        case let diarization where diarization.file != nil:
-            return "Transcription with file diarization"
-        default:
-            return "Transcription only"
+        let hasFileDiarization = pipelineSelection.diarization.file != nil
+        let hasStreamingDiarization = pipelineSelection.diarization.streaming != nil
+
+        switch (hasFileDiarization, hasStreamingDiarization) {
+        case (true, true):
+            return "Transcription with file and live diarization defaults"
+        case (false, true):
+            return "Transcription with live diarization default"
+        case (true, false):
+            return "Transcription with file diarization default"
+        case (false, false):
+            return "Transcription provider selected"
         }
     }
 }
 
-private enum SpeechPipelineDiarizationPickerMode: String, CaseIterable, Identifiable {
-    case off
-    case file
-    case live
+struct SpeechPipelineDiarizationDefaultsEditor {
+    var selection: SpeechDiarizationSelection
+    var defaultFileSelection: DiarizationModelSelection?
+    var defaultStreamingSelection: DiarizationModelSelection?
 
-    var id: String {
-        rawValue
+    var fileSelection: DiarizationModelSelection? {
+        selection.file ?? defaultFileSelection
     }
 
-    var label: String {
-        switch self {
-        case .off:
-            return "Off"
-        case .file:
-            return "File Diarization"
-        case .live:
-            return "Live Diarization"
-        }
+    var streamingSelection: DiarizationModelSelection? {
+        selection.streaming ?? defaultStreamingSelection
+    }
+
+    var normalizedSelection: SpeechDiarizationSelection {
+        SpeechDiarizationSelection(
+            file: fileSelection,
+            streaming: streamingSelection
+        )
+    }
+
+    func settingFileSelection(_ fileSelection: DiarizationModelSelection) -> SpeechDiarizationSelection {
+        SpeechDiarizationSelection(
+            file: fileSelection,
+            streaming: streamingSelection
+        )
+    }
+
+    func settingStreamingSelection(_ streamingSelection: DiarizationModelSelection) -> SpeechDiarizationSelection {
+        SpeechDiarizationSelection(
+            file: fileSelection,
+            streaming: streamingSelection
+        )
     }
 }

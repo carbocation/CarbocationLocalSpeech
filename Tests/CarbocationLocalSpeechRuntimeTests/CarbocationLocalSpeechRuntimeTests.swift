@@ -219,6 +219,110 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         })
     }
 
+    func testStreamingAnalyzerToleratesDuplicateStableSegmentIDsDuringRestoration() async throws {
+        let duplicateID = UUID()
+        let transcript = Transcript(segments: [
+            TranscriptSegment(
+                id: duplicateID,
+                text: "first",
+                startTime: 0,
+                endTime: 0.2,
+                words: [TranscriptWord(text: "first", startTime: 0, endTime: 0.2)]
+            ),
+            TranscriptSegment(
+                id: duplicateID,
+                text: "second",
+                startTime: 0.2,
+                endTime: 0.4,
+                words: [TranscriptWord(text: "second", startTime: 0.2, endTime: 0.4)]
+            )
+        ])
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: RecordingStreamingTranscriber(
+                recorder: AudioChunkRecorder(),
+                events: [
+                    .snapshot(StreamingTranscriptSnapshot(stable: transcript)),
+                    .snapshot(StreamingTranscriptSnapshot(stable: transcript)),
+                    .completed(transcript)
+                ]
+            )
+        )
+
+        let stream = analyzer.stream(
+            audio: testAudioChunks(),
+            options: StreamingSpeechAnalysisOptions()
+        )
+
+        var completedResult: SpeechAnalysisResult?
+        for try await event in stream {
+            if case .completed(let result) = event {
+                completedResult = result
+            }
+        }
+
+        XCTAssertEqual(completedResult?.transcript?.segments.map(\.text), ["first", "second"])
+    }
+
+    func testStreamingAnalyzerToleratesDuplicateStableSegmentIDsDuringDiarizationReconciliation() async throws {
+        let duplicateID = UUID()
+        let speakerA = SpeakerID(rawValue: "A")
+        let speakerB = SpeakerID(rawValue: "B")
+        let transcript = Transcript(segments: [
+            TranscriptSegment(
+                id: duplicateID,
+                text: "first",
+                startTime: 0,
+                endTime: 0.2,
+                words: [TranscriptWord(text: "first", startTime: 0, endTime: 0.2)]
+            ),
+            TranscriptSegment(
+                id: duplicateID,
+                text: "second",
+                startTime: 0.2,
+                endTime: 0.4,
+                words: [TranscriptWord(text: "second", startTime: 0.2, endTime: 0.4)]
+            )
+        ])
+        let diarization = DiarizationResult(
+            turns: [
+                SpeakerTurn(speaker: speakerA, startTime: 0, endTime: 0.2),
+                SpeakerTurn(speaker: speakerB, startTime: 0.2, endTime: 0.4)
+            ],
+            speakers: [Speaker(id: speakerA), Speaker(id: speakerB)],
+            duration: 0.4
+        )
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: RecordingStreamingTranscriber(
+                recorder: AudioChunkRecorder(),
+                events: [
+                    .snapshot(StreamingTranscriptSnapshot(stable: transcript)),
+                    .completed(transcript)
+                ]
+            ),
+            streamingDiarizer: RecordingStreamingDiarizer(
+                recorder: AudioChunkRecorder(),
+                snapshots: [StreamingDiarizationSnapshot(stable: diarization)]
+            )
+        )
+
+        let stream = analyzer.stream(
+            audio: testAudioChunks(),
+            options: StreamingSpeechAnalysisOptions(diarization: StreamingDiarizationRequest(
+                attributionJitterBufferDelay: 0
+            ))
+        )
+
+        var completedResult: SpeechAnalysisResult?
+        for try await event in stream {
+            if case .completed(let result) = event {
+                completedResult = result
+            }
+        }
+
+        XCTAssertEqual(completedResult?.transcript?.segments.map(\.text), ["first", "second"])
+        XCTAssertEqual(completedResult?.diarizationStatus, .completed)
+    }
+
     func testStreamingAnalyzerReconcilesConfiguredSpeakerIdentityAliases() async throws {
         let canonicalSpeaker = SpeakerID(rawValue: "speaker_0")
         let recoverySpeaker = SpeakerID(rawValue: "recovery_1_speaker_0")

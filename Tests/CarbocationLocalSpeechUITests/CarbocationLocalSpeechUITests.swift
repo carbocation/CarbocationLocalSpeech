@@ -145,6 +145,56 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
         XCTAssertEqual(best?.id, "large-v3-turbo")
     }
 
+    func testDiarizationDefaultsEditorSuppliesDefaultsForLegacySelection() {
+        let editor = SpeechPipelineDiarizationDefaultsEditor(
+            selection: .off,
+            defaultFileSelection: .fluidAudio(.offline),
+            defaultStreamingSelection: .fluidAudio(.streamingSortformer)
+        )
+
+        XCTAssertEqual(editor.fileSelection, .fluidAudio(.offline))
+        XCTAssertEqual(editor.streamingSelection, .fluidAudio(.streamingSortformer))
+        XCTAssertEqual(
+            editor.normalizedSelection,
+            SpeechDiarizationSelection(
+                file: .fluidAudio(.offline),
+                streaming: .fluidAudio(.streamingSortformer)
+            )
+        )
+    }
+
+    func testDiarizationDefaultsEditorChangingFilePreservesStreamingSelection() {
+        let editor = SpeechPipelineDiarizationDefaultsEditor(
+            selection: SpeechDiarizationSelection(streaming: .fluidAudio(.streamingLSEEND)),
+            defaultFileSelection: .fluidAudio(.offline),
+            defaultStreamingSelection: .fluidAudio(.streamingSortformer)
+        )
+
+        XCTAssertEqual(
+            editor.settingFileSelection(.fluidAudio(.offline)),
+            SpeechDiarizationSelection(
+                file: .fluidAudio(.offline),
+                streaming: .fluidAudio(.streamingLSEEND)
+            )
+        )
+    }
+
+    func testDiarizationDefaultsEditorChangingStreamingPreservesFileSelection() {
+        let editor = SpeechPipelineDiarizationDefaultsEditor(
+            selection: SpeechDiarizationSelection(file: .fluidAudio(.offline)),
+            defaultFileSelection: .fluidAudio(.offline),
+            defaultStreamingSelection: .fluidAudio(.streamingSortformer)
+        )
+
+        XCTAssertEqual(
+            editor.settingStreamingSelection(.fluidAudio(.streamingLSEEND)),
+            SpeechDiarizationSelection(
+                file: .fluidAudio(.offline),
+                streaming: .fluidAudio(.streamingLSEEND)
+            )
+        )
+    }
+
     func testLiveTranscriptDebugSnapshotBuildsReadableCommittedTranscript() {
         let events: [TranscriptEvent] = [
             .progress(TranscriptionProgress(processedDuration: 0.8)),
