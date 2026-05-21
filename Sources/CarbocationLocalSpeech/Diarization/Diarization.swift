@@ -62,6 +62,7 @@ public struct DiarizationResult: Codable, Hashable, Sendable {
     public var turns: [SpeakerTurn]
     public var exclusiveTurns: [SpeakerTurn]
     public var speakers: [Speaker]
+    public var speakerVoiceEmbeddings: [SpeakerVoiceEmbedding]
     public var duration: TimeInterval
     public var backend: SpeechBackendDescriptor?
     public var diagnostics: [SpeechDiagnostic]
@@ -70,6 +71,7 @@ public struct DiarizationResult: Codable, Hashable, Sendable {
         turns: [SpeakerTurn],
         exclusiveTurns: [SpeakerTurn] = [],
         speakers: [Speaker],
+        speakerVoiceEmbeddings: [SpeakerVoiceEmbedding] = [],
         duration: TimeInterval,
         backend: SpeechBackendDescriptor? = nil,
         diagnostics: [SpeechDiagnostic] = []
@@ -77,9 +79,45 @@ public struct DiarizationResult: Codable, Hashable, Sendable {
         self.turns = turns
         self.exclusiveTurns = exclusiveTurns
         self.speakers = speakers
+        self.speakerVoiceEmbeddings = speakerVoiceEmbeddings
         self.duration = duration
         self.backend = backend
         self.diagnostics = diagnostics
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case turns
+        case exclusiveTurns
+        case speakers
+        case speakerVoiceEmbeddings
+        case duration
+        case backend
+        case diagnostics
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        turns = try container.decode([SpeakerTurn].self, forKey: .turns)
+        exclusiveTurns = try container.decodeIfPresent([SpeakerTurn].self, forKey: .exclusiveTurns) ?? []
+        speakers = try container.decode([Speaker].self, forKey: .speakers)
+        speakerVoiceEmbeddings = try container.decodeIfPresent(
+            [SpeakerVoiceEmbedding].self,
+            forKey: .speakerVoiceEmbeddings
+        ) ?? []
+        duration = try container.decode(TimeInterval.self, forKey: .duration)
+        backend = try container.decodeIfPresent(SpeechBackendDescriptor.self, forKey: .backend)
+        diagnostics = try container.decodeIfPresent([SpeechDiagnostic].self, forKey: .diagnostics) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(turns, forKey: .turns)
+        try container.encode(exclusiveTurns, forKey: .exclusiveTurns)
+        try container.encode(speakers, forKey: .speakers)
+        try container.encode(speakerVoiceEmbeddings, forKey: .speakerVoiceEmbeddings)
+        try container.encode(duration, forKey: .duration)
+        try container.encodeIfPresent(backend, forKey: .backend)
+        try container.encode(diagnostics, forKey: .diagnostics)
     }
 }
 
@@ -139,11 +177,16 @@ public struct StreamingDiarizationSnapshot: Codable, Hashable, Sendable {
         let speakers = referencedSpeakerIDs.map { speakerID in
             availableSpeakers.first { $0.id == speakerID } ?? Speaker(id: speakerID)
         }
+        let availableVoiceEmbeddings = stable.speakerVoiceEmbeddings + volatile.speakerVoiceEmbeddings
+        let speakerVoiceEmbeddings = referencedSpeakerIDs.compactMap { speakerID in
+            availableVoiceEmbeddings.last { $0.speaker == speakerID }
+        }
 
         return DiarizationResult(
             turns: combinedTurns,
             exclusiveTurns: combinedExclusiveTurns,
             speakers: speakers,
+            speakerVoiceEmbeddings: speakerVoiceEmbeddings,
             duration: max(stable.duration, volatile.duration),
             backend: stable.backend ?? volatile.backend,
             diagnostics: stable.diagnostics + volatile.diagnostics

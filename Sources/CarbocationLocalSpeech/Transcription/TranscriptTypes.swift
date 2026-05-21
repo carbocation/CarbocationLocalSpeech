@@ -299,8 +299,12 @@ public struct SpeakerAttributionRestorationOptions: Codable, Hashable, Sendable 
 
 public struct SpeakerIdentityReconciliationOptions: Codable, Hashable, Sendable {
     public var aliases: [String: String]
+    public var voiceEmbeddingMatching: SpeakerVoiceEmbeddingMatchingOptions?
 
-    public init(aliases: [String: String] = [:]) {
+    public init(
+        aliases: [String: String] = [:],
+        voiceEmbeddingMatching: SpeakerVoiceEmbeddingMatchingOptions? = nil
+    ) {
         self.aliases = aliases.reduce(into: [String: String]()) { result, pair in
             guard !pair.key.isEmpty,
                   !pair.value.isEmpty,
@@ -310,6 +314,29 @@ public struct SpeakerIdentityReconciliationOptions: Codable, Hashable, Sendable 
             }
             result[pair.key] = pair.value
         }
+        self.voiceEmbeddingMatching = voiceEmbeddingMatching
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case aliases
+        case voiceEmbeddingMatching
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            aliases: try container.decodeIfPresent([String: String].self, forKey: .aliases) ?? [:],
+            voiceEmbeddingMatching: try container.decodeIfPresent(
+                SpeakerVoiceEmbeddingMatchingOptions.self,
+                forKey: .voiceEmbeddingMatching
+            )
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(aliases, forKey: .aliases)
+        try container.encodeIfPresent(voiceEmbeddingMatching, forKey: .voiceEmbeddingMatching)
     }
 }
 

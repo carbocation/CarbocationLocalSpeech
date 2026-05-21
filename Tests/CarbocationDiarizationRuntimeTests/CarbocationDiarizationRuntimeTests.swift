@@ -97,6 +97,36 @@ final class CarbocationDiarizationRuntimeTests: XCTestCase {
         XCTAssertEqual(rangeOverride.clustering.maxSpeakers, 6)
     }
 
+    func testOfflineDiarizerMapsSpeakerVoiceEmbeddings() throws {
+        let diarizer = FluidAudioSpeakerDiarizer()
+        let result = diarizer.map(
+            segments: [
+                TimedSpeakerSegment(
+                    speakerId: "speaker_0",
+                    embedding: [0, 1],
+                    startTimeSeconds: 0,
+                    endTimeSeconds: 2,
+                    qualityScore: 0.8
+                )
+            ],
+            speakerDatabase: ["speaker_0": [1, 0]],
+            timings: nil,
+            audioDuration: 2,
+            minimumTurnDuration: 0,
+            exclusiveOutput: true
+        )
+
+        let embedding = result.speakerVoiceEmbeddings.first
+        XCTAssertEqual(embedding?.speaker, SpeakerID(rawValue: "speaker_0"))
+        XCTAssertEqual(embedding?.modelIdentifier, "FluidAudio.WeSpeaker.v2")
+        XCTAssertEqual(embedding?.source, "FluidAudio.offline")
+        XCTAssertEqual(embedding?.vector, [1, 0])
+        XCTAssertEqual(embedding?.speechDuration, 2)
+        XCTAssertEqual(embedding?.sampleCount, 1)
+        XCTAssertEqual(try XCTUnwrap(embedding?.quality), 0.8, accuracy: 0.000_1)
+        XCTAssertEqual(embedding?.metadata["embeddingSource"], "speakerDatabase")
+    }
+
     func testStreamingDiarizerMapsFinalizedAndTentativeSegments() throws {
         let snapshot = FluidAudioStreamingSpeakerDiarizer.mapSnapshot(
             finalizedSegments: [

@@ -109,6 +109,111 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertEqual(snapshot.diarization.speakers.map(\.id), [stableSpeaker, volatileSpeaker])
     }
 
+    func testDiarizationResultDefaultsLegacyVoiceEmbeddingsWhenDecoding() throws {
+        let encoded = Data(#"{"turns":[],"speakers":[],"duration":0,"diagnostics":[]}"#.utf8)
+        let decoded = try JSONDecoder().decode(DiarizationResult.self, from: encoded)
+
+        XCTAssertTrue(decoded.speakerVoiceEmbeddings.isEmpty)
+        XCTAssertTrue(decoded.exclusiveTurns.isEmpty)
+    }
+
+    func testStreamingDiarizationSnapshotCarriesReferencedVoiceEmbeddings() {
+        let stableSpeaker = SpeakerID(rawValue: "stable")
+        let volatileSpeaker = SpeakerID(rawValue: "volatile")
+        let artifactSpeaker = SpeakerID(rawValue: "artifact")
+        let snapshot = StreamingDiarizationSnapshot(
+            stable: DiarizationResult(
+                turns: [SpeakerTurn(speaker: stableSpeaker, startTime: 0, endTime: 0.5)],
+                speakers: [Speaker(id: stableSpeaker)],
+                speakerVoiceEmbeddings: [
+                    SpeakerVoiceEmbedding(
+                        speaker: stableSpeaker,
+                        vector: [1, 0],
+                        modelIdentifier: "test"
+                    )
+                ],
+                duration: 0.5
+            ),
+            volatile: DiarizationResult(
+                turns: [SpeakerTurn(speaker: volatileSpeaker, startTime: 0.5, endTime: 1.0)],
+                speakers: [Speaker(id: volatileSpeaker), Speaker(id: artifactSpeaker)],
+                speakerVoiceEmbeddings: [
+                    SpeakerVoiceEmbedding(
+                        speaker: volatileSpeaker,
+                        vector: [0, 1],
+                        modelIdentifier: "test"
+                    ),
+                    SpeakerVoiceEmbedding(
+                        speaker: artifactSpeaker,
+                        vector: [0.5, 0.5],
+                        modelIdentifier: "test"
+                    )
+                ],
+                duration: 1.0
+            )
+        )
+
+        XCTAssertEqual(snapshot.diarization.speakerVoiceEmbeddings.map(\.speaker), [stableSpeaker, volatileSpeaker])
+    }
+
+    func testSpeakerVoiceEmbeddingCacheAliasesMatchingRecoverySpeaker() {
+        let canonical = SpeakerVoiceEmbedding(
+            speaker: SpeakerID(rawValue: "speaker_0"),
+            vector: [1, 0, 0],
+            modelIdentifier: "test",
+            speechDuration: 2,
+            sampleCount: 2
+        )
+        let recovery = SpeakerVoiceEmbedding(
+            speaker: SpeakerID(rawValue: "recovery_1_speaker_0"),
+            vector: [0.999, 0.01, 0],
+            modelIdentifier: "test",
+            speechDuration: 2,
+            sampleCount: 2
+        )
+        var cache = SpeakerVoiceEmbeddingCache()
+        _ = cache.reconcile(profiles: [canonical])
+
+        let result = cache.reconcile(profiles: [recovery])
+
+        XCTAssertEqual(result.reconciliation.aliases["recovery_1_speaker_0"], "speaker_0")
+        XCTAssertEqual(result.matches.first?.canonicalSpeaker, SpeakerID(rawValue: "speaker_0"))
+    }
+
+    func testSpeakerVoiceEmbeddingCacheRequiresMatchMargin() {
+        let speakerA = SpeakerVoiceEmbedding(
+            speaker: SpeakerID(rawValue: "speaker_0"),
+            vector: [1, 0],
+            modelIdentifier: "test",
+            speechDuration: 2,
+            sampleCount: 2
+        )
+        let speakerB = SpeakerVoiceEmbedding(
+            speaker: SpeakerID(rawValue: "speaker_1"),
+            vector: [0.999, 0.02],
+            modelIdentifier: "test",
+            speechDuration: 2,
+            sampleCount: 2
+        )
+        let recovery = SpeakerVoiceEmbedding(
+            speaker: SpeakerID(rawValue: "recovery_1_speaker_0"),
+            vector: [0.999, 0.01],
+            modelIdentifier: "test",
+            speechDuration: 2,
+            sampleCount: 2
+        )
+        var cache = SpeakerVoiceEmbeddingCache()
+        _ = cache.reconcile(profiles: [speakerA, speakerB])
+
+        let result = cache.reconcile(
+            profiles: [recovery],
+            options: SpeakerVoiceEmbeddingMatchingOptions(minimumDistanceMargin: 0.05)
+        )
+
+        XCTAssertNil(result.reconciliation.aliases["recovery_1_speaker_0"])
+        XCTAssertTrue(result.matches.isEmpty)
+    }
+
     func testSpeechModelStorageUsesSharedGroupWhenAvailable() throws {
         let groupRoot = try makeTemporaryDirectory()
         var requestedIdentifier: String?

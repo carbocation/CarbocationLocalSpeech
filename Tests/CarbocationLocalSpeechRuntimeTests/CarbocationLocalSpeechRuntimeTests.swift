@@ -279,6 +279,93 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertEqual(completedResult?.speakerAttributedTranscript?.segments.first?.speaker, canonicalSpeaker)
     }
 
+    func testStreamingAnalyzerReconcilesVoiceEmbeddingAliases() async throws {
+        let canonicalSpeaker = SpeakerID(rawValue: "speaker_0")
+        let recoverySpeaker = SpeakerID(rawValue: "recovery_1_speaker_0")
+        let transcript = Transcript(segments: [
+            TranscriptSegment(
+                text: "one",
+                startTime: 0,
+                endTime: 0.1,
+                words: [TranscriptWord(text: "one", startTime: 0, endTime: 0.1)]
+            ),
+            TranscriptSegment(
+                text: "two",
+                startTime: 0.1,
+                endTime: 0.2,
+                words: [TranscriptWord(text: "two", startTime: 0.1, endTime: 0.2)]
+            )
+        ])
+        let firstSnapshot = StreamingDiarizationSnapshot(stable: DiarizationResult(
+            turns: [SpeakerTurn(speaker: canonicalSpeaker, startTime: 0, endTime: 0.1)],
+            speakers: [Speaker(id: canonicalSpeaker)],
+            speakerVoiceEmbeddings: [
+                SpeakerVoiceEmbedding(
+                    speaker: canonicalSpeaker,
+                    vector: [1, 0],
+                    modelIdentifier: "test",
+                    speechDuration: 2,
+                    sampleCount: 2
+                )
+            ],
+            duration: 0.1
+        ))
+        let recoverySnapshot = StreamingDiarizationSnapshot(stable: DiarizationResult(
+            turns: [SpeakerTurn(speaker: recoverySpeaker, startTime: 0.1, endTime: 0.2)],
+            speakers: [Speaker(id: recoverySpeaker)],
+            speakerVoiceEmbeddings: [
+                SpeakerVoiceEmbedding(
+                    speaker: recoverySpeaker,
+                    vector: [0.999, 0.01],
+                    modelIdentifier: "test",
+                    speechDuration: 2,
+                    sampleCount: 2
+                )
+            ],
+            duration: 0.2
+        ))
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: RecordingStreamingTranscriber(
+                recorder: AudioChunkRecorder(),
+                events: [
+                    .snapshot(StreamingTranscriptSnapshot(stable: transcript)),
+                    .completed(transcript)
+                ]
+            ),
+            streamingDiarizer: RecordingStreamingDiarizer(
+                recorder: AudioChunkRecorder(),
+                snapshots: [firstSnapshot, recoverySnapshot]
+            )
+        )
+
+        let stream = analyzer.stream(
+            audio: testAudioChunks(),
+            options: StreamingSpeechAnalysisOptions(diarization: StreamingDiarizationRequest(
+                attributionJitterBufferDelay: 0,
+                speakerIdentityReconciliation: SpeakerIdentityReconciliationOptions(
+                    voiceEmbeddingMatching: SpeakerVoiceEmbeddingMatchingOptions()
+                )
+            ))
+        )
+
+        var completedResult: SpeechAnalysisResult?
+        for try await event in stream {
+            if case .completed(let result) = event {
+                completedResult = result
+            }
+        }
+
+        XCTAssertEqual(completedResult?.diarization?.turns.map(\.speaker), [canonicalSpeaker, canonicalSpeaker])
+        XCTAssertEqual(
+            completedResult?.diarization?.speakerVoiceEmbeddings.map(\.speaker),
+            [canonicalSpeaker]
+        )
+        XCTAssertEqual(
+            completedResult?.speakerAttributedTranscript?.segments.compactMap(\.speaker),
+            [canonicalSpeaker, canonicalSpeaker]
+        )
+    }
+
     func testStreamingAnalyzerLocksAttributedStableWindowAcrossDiarizationUpdates() async throws {
         let speakerA = SpeakerID(rawValue: "A")
         let speakerB = SpeakerID(rawValue: "B")

@@ -499,6 +499,7 @@ private actor StreamingSpeechAnalysisState {
     private var latestDiarizationSnapshot: StreamingDiarizationSnapshot?
     private var finalTranscript: Transcript?
     private var lockedStableAttributions: [UUID: LockedStableAttribution] = [:]
+    private var speakerVoiceEmbeddingCache = SpeakerVoiceEmbeddingCache()
     private var diagnostics: [SpeechDiagnostic] = []
     private var diarizationStatus: SpeechAnalysisDiarizationStatus
 
@@ -979,6 +980,7 @@ private actor StreamingSpeechAnalysisState {
             return DiarizationResult(
                 turns: [],
                 speakers: [],
+                speakerVoiceEmbeddings: [],
                 duration: 0,
                 backend: diarization.backend,
                 diagnostics: diarization.diagnostics
@@ -1008,11 +1010,15 @@ private actor StreamingSpeechAnalysisState {
         for speakerID in orderedSpeakerIDs where !speakers.contains(where: { $0.id == speakerID }) {
             speakers.append(Speaker(id: speakerID))
         }
+        let speakerVoiceEmbeddings = orderedSpeakerIDs.compactMap { speakerID in
+            diarization.speakerVoiceEmbeddings.last { $0.speaker == speakerID }
+        }
 
         return DiarizationResult(
             turns: turns,
             exclusiveTurns: exclusiveTurns,
             speakers: speakers,
+            speakerVoiceEmbeddings: speakerVoiceEmbeddings,
             duration: max(turns.map(\.endTime).max() ?? 0, exclusiveTurns.map(\.endTime).max() ?? 0),
             backend: diarization.backend,
             diagnostics: diarization.diagnostics
@@ -1057,13 +1063,25 @@ private actor StreamingSpeechAnalysisState {
     private func snapshotByReconcilingSpeakerIdentities(
         _ snapshot: StreamingDiarizationSnapshot
     ) -> StreamingDiarizationSnapshot {
-        guard let diarizationRequest,
-              !diarizationRequest.speakerIdentityReconciliation.aliases.isEmpty
-        else {
+        guard let diarizationRequest else {
             return snapshot
         }
 
-        let aliases = diarizationRequest.speakerIdentityReconciliation.aliases
+        var aliases = diarizationRequest.speakerIdentityReconciliation.aliases
+        if let matchingOptions = diarizationRequest.speakerIdentityReconciliation.voiceEmbeddingMatching {
+            let profiles = snapshot.stable.speakerVoiceEmbeddings + (snapshot.volatile?.speakerVoiceEmbeddings ?? [])
+            let result = speakerVoiceEmbeddingCache.reconcile(
+                profiles: profiles,
+                existingAliases: aliases,
+                options: matchingOptions
+            )
+            aliases = result.reconciliation.aliases
+        }
+
+        guard !aliases.isEmpty else {
+            return snapshot
+        }
+
         return StreamingDiarizationSnapshot(
             stable: diarizationByReconcilingSpeakerIdentities(snapshot.stable, aliases: aliases),
             volatile: snapshot.volatile.map {
@@ -1096,11 +1114,18 @@ private actor StreamingSpeechAnalysisState {
             ids.append(turn.speaker)
         }
         let speakers = orderedSpeakerIDs.map { speakerByID[$0] ?? Speaker(id: $0) }
+        let speakerVoiceEmbeddings = mergedSpeakerVoiceEmbeddings(
+            diarization.speakerVoiceEmbeddings.map { embedding in
+                embedding.replacingSpeaker(canonicalSpeakerID(for: embedding.speaker, aliases: aliases))
+            },
+            orderedSpeakerIDs: orderedSpeakerIDs
+        )
 
         return DiarizationResult(
             turns: turns,
             exclusiveTurns: exclusiveTurns,
             speakers: speakers,
+            speakerVoiceEmbeddings: speakerVoiceEmbeddings,
             duration: diarization.duration,
             backend: diarization.backend,
             diagnostics: diarization.diagnostics
@@ -1159,11 +1184,16 @@ private actor StreamingSpeechAnalysisState {
             uniquingKeysWith: { _, current in current }
         )
         let speakers = orderedSpeakerIDs.map { speakersByID[$0] ?? Speaker(id: $0) }
+        let speakerVoiceEmbeddings = mergedSpeakerVoiceEmbeddings(
+            previous.speakerVoiceEmbeddings + current.speakerVoiceEmbeddings,
+            orderedSpeakerIDs: orderedSpeakerIDs
+        )
 
         return DiarizationResult(
             turns: turns,
             exclusiveTurns: exclusiveTurns,
             speakers: speakers,
+            speakerVoiceEmbeddings: speakerVoiceEmbeddings,
             duration: max(previous.duration, current.duration),
             backend: current.backend ?? previous.backend,
             diagnostics: current.diagnostics
@@ -1220,14 +1250,33 @@ private actor StreamingSpeechAnalysisState {
         let speakers = orderedSpeakerIDs.map { speakerID in
             diarization.speakers.first { $0.id == speakerID } ?? Speaker(id: speakerID)
         }
+        let speakerVoiceEmbeddings = orderedSpeakerIDs.compactMap { speakerID in
+            diarization.speakerVoiceEmbeddings.last { $0.speaker == speakerID }
+        }
         return DiarizationResult(
             turns: turns,
             exclusiveTurns: exclusiveTurns,
             speakers: speakers,
+            speakerVoiceEmbeddings: speakerVoiceEmbeddings,
             duration: diarization.duration,
             backend: diarization.backend,
             diagnostics: diarization.diagnostics
         )
+    }
+
+    private func mergedSpeakerVoiceEmbeddings(
+        _ embeddings: [SpeakerVoiceEmbedding],
+        orderedSpeakerIDs: [SpeakerID]
+    ) -> [SpeakerVoiceEmbedding] {
+        var embeddingsBySpeaker: [SpeakerID: SpeakerVoiceEmbedding] = [:]
+        for embedding in embeddings where orderedSpeakerIDs.contains(embedding.speaker) {
+            if let existing = embeddingsBySpeaker[embedding.speaker] {
+                embeddingsBySpeaker[embedding.speaker] = existing.merged(with: embedding) ?? embedding
+            } else {
+                embeddingsBySpeaker[embedding.speaker] = embedding
+            }
+        }
+        return orderedSpeakerIDs.compactMap { embeddingsBySpeaker[$0] }
     }
 
     private func snapshotByRestoringSpeakerAttribution(

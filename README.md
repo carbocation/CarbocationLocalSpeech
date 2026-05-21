@@ -359,7 +359,7 @@ let events = analyzer.stream(
             speakerIdentityReconciliation: SpeakerIdentityReconciliationOptions(aliases: [
                 // Fill this only from enrollment, embeddings, or user-confirmed speaker identity.
                 "recovery_1_speaker_0": "speaker_0"
-            ])
+            ], voiceEmbeddingMatching: SpeakerVoiceEmbeddingMatchingOptions())
         ),
         audioFanOutBufferLimit: 128,
         backlogPolicy: .dropDiarization
@@ -386,7 +386,9 @@ For live attribution, keep `attributionCacheRetentionWindow` comfortably larger 
 
 `attributionTimingOptions` compensates for small ASR/diarizer timestamp offsets and applies short speaker-switch hysteresis near diarization boundaries. Use `.live` for real-time sessions and `.disabled` when you need strict overlap-only attribution.
 
-Recovery speaker IDs are intentionally namespaced, so the library will not automatically assume `recovery_1_speaker_0` is the same physical person as `speaker_0`. Use `SpeakerIdentityReconciliationOptions.aliases` only when your app has an external identity signal such as enrollment, speaker embeddings, or explicit user confirmation.
+Recovery speaker IDs are intentionally namespaced, so the library will not automatically assume `recovery_1_speaker_0` is the same physical person as `speaker_0`. Use `SpeakerIdentityReconciliationOptions.aliases` only when your app has an external identity signal such as enrollment, speaker embeddings, or explicit user confirmation. When diarization snapshots include `speakerVoiceEmbeddings`, `voiceEmbeddingMatching` maintains an in-session cache and can add conservative recovery aliases from cosine-distance matches with a required margin.
+
+Offline FluidAudio diarization surfaces per-speaker 256-dimensional voice profiles in `DiarizationResult.speakerVoiceEmbeddings`. Apps that persist those profiles should treat them as biometric-adjacent user data: keep storage opt-in, scoped to the user/workspace, and clearable.
 
 Use `backlogPolicy: .fatal` when complete diarization is required. Use `.dropDiarization` for meeting capture UIs where transcription should continue if Core ML diarization falls behind during a CPU or ANE spike. Soft drops are exposed structurally through `SpeechDiagnostic.code == .diarizationDropped` during streaming and `SpeechAnalysisResult.diarizationStatus == .dropped` at completion.
 

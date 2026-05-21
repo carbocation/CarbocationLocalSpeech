@@ -156,6 +156,7 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
             try Task.checkCancellation()
             return map(
                 segments: fluidResult.segments,
+                speakerDatabase: fluidResult.speakerDatabase,
                 timings: fluidResult.timings,
                 audioDuration: audio.duration,
                 minimumTurnDuration: options.minimumTurnDuration,
@@ -198,6 +199,7 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
                 ?? 0
             return map(
                 segments: fluidResult.segments,
+                speakerDatabase: fluidResult.speakerDatabase,
                 timings: fluidResult.timings,
                 audioDuration: duration,
                 minimumTurnDuration: options.minimumTurnDuration,
@@ -269,15 +271,18 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
             .samples
     }
 
-    private nonisolated func map(
+    internal nonisolated func map(
         segments: [TimedSpeakerSegment],
+        speakerDatabase: [String: [Float]]? = nil,
         timings: PipelineTimings?,
         audioDuration: TimeInterval,
         minimumTurnDuration: TimeInterval,
         exclusiveOutput: Bool
     ) -> CarbocationLocalSpeech.DiarizationResult {
-        let turns: [SpeakerTurn] = segments
+        let filteredSegments = segments
             .filter { TimeInterval($0.durationSeconds) >= minimumTurnDuration }
+
+        let turns: [SpeakerTurn] = filteredSegments
             .map { segment in
                 SpeakerTurn(
                     speaker: SpeakerID(rawValue: segment.speakerId),
@@ -297,6 +302,11 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
             }
 
         let speakers = buildSpeakers(from: turns)
+        let speakerVoiceEmbeddings = buildSpeakerVoiceEmbeddings(
+            from: filteredSegments,
+            speakerDatabase: speakerDatabase,
+            orderedSpeakerIDs: speakers.map(\.id)
+        )
         let duration = max(audioDuration, turns.map { $0.endTime }.max() ?? 0)
         let diagnostics = timings.map { timings in
             [
@@ -311,6 +321,7 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
             turns: turns,
             exclusiveTurns: exclusiveOutput ? turns : [],
             speakers: speakers,
+            speakerVoiceEmbeddings: speakerVoiceEmbeddings,
             duration: duration,
             backend: SpeechBackendDescriptor(kind: .fluidAudio, displayName: "FluidAudio Offline Diarizer"),
             diagnostics: diagnostics
@@ -342,5 +353,80 @@ public actor FluidAudioSpeakerDiarizer: CarbocationLocalSpeech.SpeakerDiarizer,
                 metadata: ["source": "FluidAudio.offline"]
             )
         }
+    }
+
+    private nonisolated func buildSpeakerVoiceEmbeddings(
+        from segments: [TimedSpeakerSegment],
+        speakerDatabase: [String: [Float]]?,
+        orderedSpeakerIDs: [SpeakerID]
+    ) -> [CarbocationLocalSpeech.SpeakerVoiceEmbedding] {
+        orderedSpeakerIDs.compactMap { speakerID in
+            let speakerSegments = segments.filter { $0.speakerId == speakerID.rawValue }
+            let databaseEmbedding = validEmbedding(speakerDatabase?[speakerID.rawValue])
+            let vector = databaseEmbedding ?? averagedEmbedding(from: speakerSegments)
+            guard let vector else { return nil }
+
+            let speechDuration = speakerSegments.reduce(0) { total, segment in
+                total + TimeInterval(segment.durationSeconds)
+            }
+            let sampleCount = max(
+                1,
+                speakerSegments.filter { validEmbedding($0.embedding) != nil }.count
+            )
+            let quality = averagedQuality(from: speakerSegments)
+
+            return CarbocationLocalSpeech.SpeakerVoiceEmbedding(
+                speaker: speakerID,
+                vector: vector,
+                modelIdentifier: "FluidAudio.WeSpeaker.v2",
+                source: "FluidAudio.offline",
+                speechDuration: speechDuration,
+                sampleCount: sampleCount,
+                quality: quality,
+                metadata: [
+                    "backend": "FluidAudio",
+                    "embeddingSource": databaseEmbedding == nil ? "segmentAverage" : "speakerDatabase"
+                ]
+            )
+        }
+    }
+
+    private nonisolated func validEmbedding(_ embedding: [Float]?) -> [Float]? {
+        guard let embedding,
+              !embedding.isEmpty
+        else {
+            return nil
+        }
+        var magnitudeSquared: Float = 0
+        for value in embedding {
+            guard value.isFinite else { return nil }
+            magnitudeSquared += value * value
+        }
+        guard magnitudeSquared > 0 else { return nil }
+        return embedding
+    }
+
+    private nonisolated func averagedEmbedding(from segments: [TimedSpeakerSegment]) -> [Float]? {
+        let embeddings = segments.compactMap { validEmbedding($0.embedding) }
+        guard let first = embeddings.first else { return nil }
+
+        var sum = [Float](repeating: 0, count: first.count)
+        var count = 0
+        for embedding in embeddings where embedding.count == first.count {
+            for index in embedding.indices {
+                sum[index] += embedding[index]
+            }
+            count += 1
+        }
+        guard count > 0 else { return nil }
+        return sum.map { $0 / Float(count) }
+    }
+
+    private nonisolated func averagedQuality(from segments: [TimedSpeakerSegment]) -> Double? {
+        guard !segments.isEmpty else { return nil }
+        let total = segments.reduce(0) { partial, segment in
+            partial + Double(segment.qualityScore)
+        }
+        return total / Double(segments.count)
     }
 }
