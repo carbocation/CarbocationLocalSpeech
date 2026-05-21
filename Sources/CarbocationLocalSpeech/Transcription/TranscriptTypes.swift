@@ -187,16 +187,74 @@ public enum SpeakerAttributionPolicy: String, Codable, Hashable, Sendable {
     case segmentLargestOverlap
 }
 
+public struct SpeakerAttributionTimingOptions: Codable, Hashable, Sendable {
+    public var timingTolerance: TimeInterval
+    public var speakerSwitchGraceDuration: TimeInterval
+    public var speakerSwitchScoreTolerance: Double
+
+    public init(
+        timingTolerance: TimeInterval = 0,
+        speakerSwitchGraceDuration: TimeInterval = 0.2,
+        speakerSwitchScoreTolerance: Double = 0.15
+    ) {
+        self.timingTolerance = max(0, timingTolerance)
+        self.speakerSwitchGraceDuration = max(0, speakerSwitchGraceDuration)
+        self.speakerSwitchScoreTolerance = Self.clampedUnit(speakerSwitchScoreTolerance)
+    }
+
+    public static let disabled = SpeakerAttributionTimingOptions(
+        timingTolerance: 0,
+        speakerSwitchGraceDuration: 0,
+        speakerSwitchScoreTolerance: 0
+    )
+
+    public static let live = SpeakerAttributionTimingOptions(
+        timingTolerance: 0.15,
+        speakerSwitchGraceDuration: 0.25,
+        speakerSwitchScoreTolerance: 0.6
+    )
+
+    private static func clampedUnit(_ value: Double) -> Double {
+        min(1, max(0, value))
+    }
+}
+
 public struct DiarizationRequest: Codable, Hashable, Sendable {
     public var options: DiarizationOptions
     public var policy: SpeakerAttributionPolicy
+    public var attributionTimingOptions: SpeakerAttributionTimingOptions
 
     public init(
         options: DiarizationOptions = DiarizationOptions(),
-        policy: SpeakerAttributionPolicy = .preferExclusiveWordLevel
+        policy: SpeakerAttributionPolicy = .preferExclusiveWordLevel,
+        attributionTimingOptions: SpeakerAttributionTimingOptions = .disabled
     ) {
         self.options = options
         self.policy = policy
+        self.attributionTimingOptions = attributionTimingOptions
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case options
+        case policy
+        case attributionTimingOptions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        options = try container.decodeIfPresent(DiarizationOptions.self, forKey: .options) ?? DiarizationOptions()
+        policy = try container.decodeIfPresent(SpeakerAttributionPolicy.self, forKey: .policy) ?? .preferExclusiveWordLevel
+        attributionTimingOptions = try container.decodeIfPresent(
+            SpeakerAttributionTimingOptions.self,
+            forKey: .attributionTimingOptions
+        ) ?? .disabled
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(options, forKey: .options)
+        try container.encode(policy, forKey: .policy)
+        try container.encode(attributionTimingOptions, forKey: .attributionTimingOptions)
     }
 }
 
@@ -239,40 +297,62 @@ public struct SpeakerAttributionRestorationOptions: Codable, Hashable, Sendable 
     }
 }
 
+public struct SpeakerIdentityReconciliationOptions: Codable, Hashable, Sendable {
+    public var aliases: [String: String]
+
+    public init(aliases: [String: String] = [:]) {
+        self.aliases = aliases.reduce(into: [String: String]()) { result, pair in
+            guard !pair.key.isEmpty,
+                  !pair.value.isEmpty,
+                  pair.key != pair.value
+            else {
+                return
+            }
+            result[pair.key] = pair.value
+        }
+    }
+}
+
 public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
     public var options: DiarizationOptions
     public var backend: StreamingDiarizationBackend
     public var emitsTentativeTurns: Bool
     public var attributionPolicy: SpeakerAttributionPolicy
+    public var attributionTimingOptions: SpeakerAttributionTimingOptions
     public var attributionLookbackWindow: TimeInterval
     public var attributionJitterBufferDelay: TimeInterval
     public var maximumAttributionJitterBufferDelay: TimeInterval?
     public var attributionCacheRetentionWindow: TimeInterval
     public var lockedAttributionCorrectionWindow: TimeInterval
     public var attributionRestorationOptions: SpeakerAttributionRestorationOptions
+    public var speakerIdentityReconciliation: SpeakerIdentityReconciliationOptions
 
     public init(
         options: DiarizationOptions = DiarizationOptions(),
         backend: StreamingDiarizationBackend = .automatic,
         emitsTentativeTurns: Bool = true,
         attributionPolicy: SpeakerAttributionPolicy = .preferStandardWordLevel,
+        attributionTimingOptions: SpeakerAttributionTimingOptions = .live,
         attributionLookbackWindow: TimeInterval = 30,
         attributionJitterBufferDelay: TimeInterval = 0.75,
         maximumAttributionJitterBufferDelay: TimeInterval? = nil,
         attributionCacheRetentionWindow: TimeInterval = 600,
         lockedAttributionCorrectionWindow: TimeInterval = 60,
-        attributionRestorationOptions: SpeakerAttributionRestorationOptions = SpeakerAttributionRestorationOptions()
+        attributionRestorationOptions: SpeakerAttributionRestorationOptions = SpeakerAttributionRestorationOptions(),
+        speakerIdentityReconciliation: SpeakerIdentityReconciliationOptions = SpeakerIdentityReconciliationOptions()
     ) {
         self.options = options
         self.backend = backend
         self.emitsTentativeTurns = emitsTentativeTurns
         self.attributionPolicy = attributionPolicy
+        self.attributionTimingOptions = attributionTimingOptions
         self.attributionLookbackWindow = attributionLookbackWindow
         self.attributionJitterBufferDelay = attributionJitterBufferDelay
         self.maximumAttributionJitterBufferDelay = maximumAttributionJitterBufferDelay.map { max(0, $0) }
         self.attributionCacheRetentionWindow = max(0, attributionCacheRetentionWindow)
         self.lockedAttributionCorrectionWindow = max(0, lockedAttributionCorrectionWindow)
         self.attributionRestorationOptions = attributionRestorationOptions
+        self.speakerIdentityReconciliation = speakerIdentityReconciliation
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -280,12 +360,14 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         case backend
         case emitsTentativeTurns
         case attributionPolicy
+        case attributionTimingOptions
         case attributionLookbackWindow
         case attributionJitterBufferDelay
         case maximumAttributionJitterBufferDelay
         case attributionCacheRetentionWindow
         case lockedAttributionCorrectionWindow
         case attributionRestorationOptions
+        case speakerIdentityReconciliation
     }
 
     public init(from decoder: Decoder) throws {
@@ -297,6 +379,10 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
             SpeakerAttributionPolicy.self,
             forKey: .attributionPolicy
         ) ?? .preferStandardWordLevel
+        attributionTimingOptions = try container.decodeIfPresent(
+            SpeakerAttributionTimingOptions.self,
+            forKey: .attributionTimingOptions
+        ) ?? .live
         attributionLookbackWindow = try container.decodeIfPresent(
             TimeInterval.self,
             forKey: .attributionLookbackWindow
@@ -321,6 +407,10 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
             SpeakerAttributionRestorationOptions.self,
             forKey: .attributionRestorationOptions
         ) ?? SpeakerAttributionRestorationOptions()
+        speakerIdentityReconciliation = try container.decodeIfPresent(
+            SpeakerIdentityReconciliationOptions.self,
+            forKey: .speakerIdentityReconciliation
+        ) ?? SpeakerIdentityReconciliationOptions()
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -329,12 +419,14 @@ public struct StreamingDiarizationRequest: Codable, Hashable, Sendable {
         try container.encode(backend, forKey: .backend)
         try container.encode(emitsTentativeTurns, forKey: .emitsTentativeTurns)
         try container.encode(attributionPolicy, forKey: .attributionPolicy)
+        try container.encode(attributionTimingOptions, forKey: .attributionTimingOptions)
         try container.encode(attributionLookbackWindow, forKey: .attributionLookbackWindow)
         try container.encode(attributionJitterBufferDelay, forKey: .attributionJitterBufferDelay)
         try container.encodeIfPresent(maximumAttributionJitterBufferDelay, forKey: .maximumAttributionJitterBufferDelay)
         try container.encode(attributionCacheRetentionWindow, forKey: .attributionCacheRetentionWindow)
         try container.encode(lockedAttributionCorrectionWindow, forKey: .lockedAttributionCorrectionWindow)
         try container.encode(attributionRestorationOptions, forKey: .attributionRestorationOptions)
+        try container.encode(speakerIdentityReconciliation, forKey: .speakerIdentityReconciliation)
     }
 
     public var streamingOptions: StreamingDiarizationOptions {

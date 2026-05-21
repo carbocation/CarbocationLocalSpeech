@@ -179,7 +179,8 @@ private func makeSpeechAnalysisResult(
         attributedResult = SpeakerAttributionMerger.merge(
             transcript: transcript,
             diarization: diarization,
-            policy: diarizationRequest.policy
+            policy: diarizationRequest.policy,
+            timingOptions: diarizationRequest.attributionTimingOptions
         )
     }
 
@@ -532,7 +533,9 @@ private actor StreamingSpeechAnalysisState {
     func recordDiarization(_ snapshot: StreamingDiarizationSnapshot) -> [StreamingSpeechAnalysisEvent] {
         guard diarizationStatus != .dropped else { return [] }
 
-        let retainedSnapshot = snapshotByRetainingStableDiarization(snapshot)
+        let retainedSnapshot = snapshotByRetainingStableDiarization(
+            snapshotByReconcilingSpeakerIdentities(snapshot)
+        )
         latestDiarizationSnapshot = retainedSnapshot
         var outputs: [StreamingSpeechAnalysisEvent] = [.diarization(retainedSnapshot)]
 
@@ -662,7 +665,8 @@ private actor StreamingSpeechAnalysisState {
         return SpeakerAttributionMerger.merge(
             transcript: transcript,
             diarization: diarization,
-            policy: diarizationRequest.attributionPolicy
+            policy: diarizationRequest.attributionPolicy,
+            timingOptions: diarizationRequest.attributionTimingOptions
         )
     }
 
@@ -721,7 +725,8 @@ private actor StreamingSpeechAnalysisState {
             let merged = SpeakerAttributionMerger.merge(
                 transcript: partialTranscript,
                 diarization: relevantDiarization,
-                policy: request.attributionPolicy
+                policy: request.attributionPolicy,
+                timingOptions: request.attributionTimingOptions
             ).transcript
             output.append(contentsOf: segmentsByRestoringSingleSegmentIdentities(
                 merged.segments,
@@ -844,7 +849,8 @@ private actor StreamingSpeechAnalysisState {
         let attributed = SpeakerAttributionMerger.merge(
             transcript: partialTranscript,
             diarization: relevantDiarization,
-            policy: request.attributionPolicy
+            policy: request.attributionPolicy,
+            timingOptions: request.attributionTimingOptions
         ).transcript
         let attributedSegmentsWithSourceIDs = segmentsByRestoringSingleSegmentIdentities(
             attributed.segments,
@@ -880,7 +886,8 @@ private actor StreamingSpeechAnalysisState {
         let attributed = SpeakerAttributionMerger.merge(
             transcript: partialTranscript,
             diarization: relevantDiarization,
-            policy: request.attributionPolicy
+            policy: request.attributionPolicy,
+            timingOptions: request.attributionTimingOptions
         ).transcript
         return segmentsByRestoringSingleSegmentIdentities(
             attributed.segments,
@@ -1045,6 +1052,84 @@ private actor StreamingSpeechAnalysisState {
 
     private func hasSpeakerAttribution(_ segment: TranscriptSegment) -> Bool {
         segment.speaker != nil || segment.words.contains { $0.speaker != nil }
+    }
+
+    private func snapshotByReconcilingSpeakerIdentities(
+        _ snapshot: StreamingDiarizationSnapshot
+    ) -> StreamingDiarizationSnapshot {
+        guard let diarizationRequest,
+              !diarizationRequest.speakerIdentityReconciliation.aliases.isEmpty
+        else {
+            return snapshot
+        }
+
+        let aliases = diarizationRequest.speakerIdentityReconciliation.aliases
+        return StreamingDiarizationSnapshot(
+            stable: diarizationByReconcilingSpeakerIdentities(snapshot.stable, aliases: aliases),
+            volatile: snapshot.volatile.map {
+                diarizationByReconcilingSpeakerIdentities($0, aliases: aliases)
+            },
+            volatileRange: snapshot.volatileRange
+        )
+    }
+
+    private func diarizationByReconcilingSpeakerIdentities(
+        _ diarization: DiarizationResult,
+        aliases: [String: String]
+    ) -> DiarizationResult {
+        let turns = diarization.turns.map { turn in
+            turnByReconcilingSpeakerIdentity(turn, aliases: aliases)
+        }
+        let exclusiveTurns = diarization.exclusiveTurns.map { turn in
+            turnByReconcilingSpeakerIdentity(turn, aliases: aliases)
+        }
+        let speakerByID = diarization.speakers.reduce(into: [SpeakerID: Speaker]()) { speakers, speaker in
+            let canonicalID = canonicalSpeakerID(for: speaker.id, aliases: aliases)
+            var updatedSpeaker = speaker
+            updatedSpeaker.id = canonicalID
+            if speakers[canonicalID] == nil || speaker.id == canonicalID {
+                speakers[canonicalID] = updatedSpeaker
+            }
+        }
+        let orderedSpeakerIDs = (turns + exclusiveTurns).reduce(into: [SpeakerID]()) { ids, turn in
+            guard !ids.contains(turn.speaker) else { return }
+            ids.append(turn.speaker)
+        }
+        let speakers = orderedSpeakerIDs.map { speakerByID[$0] ?? Speaker(id: $0) }
+
+        return DiarizationResult(
+            turns: turns,
+            exclusiveTurns: exclusiveTurns,
+            speakers: speakers,
+            duration: diarization.duration,
+            backend: diarization.backend,
+            diagnostics: diarization.diagnostics
+        )
+    }
+
+    private func turnByReconcilingSpeakerIdentity(
+        _ turn: SpeakerTurn,
+        aliases: [String: String]
+    ) -> SpeakerTurn {
+        var updatedTurn = turn
+        updatedTurn.speaker = canonicalSpeakerID(for: turn.speaker, aliases: aliases)
+        return updatedTurn
+    }
+
+    private func canonicalSpeakerID(for speakerID: SpeakerID, aliases: [String: String]) -> SpeakerID {
+        let original = speakerID.rawValue
+        var current = original
+        var visited = Set<String>()
+
+        while let next = aliases[current] {
+            guard !visited.contains(next) else {
+                return SpeakerID(rawValue: original)
+            }
+            visited.insert(current)
+            current = next
+        }
+
+        return SpeakerID(rawValue: current)
     }
 
     private func snapshotByRetainingStableDiarization(

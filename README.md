@@ -350,11 +350,16 @@ let events = analyzer.stream(
     options: StreamingSpeechAnalysisOptions(
         transcription: StreamingTranscriptionOptions(),
         diarization: StreamingDiarizationRequest(
+            attributionTimingOptions: .live,
             attributionLookbackWindow: 30,
             attributionJitterBufferDelay: 0.75,
             maximumAttributionJitterBufferDelay: 3,
             attributionCacheRetentionWindow: 600,
-            lockedAttributionCorrectionWindow: 60
+            lockedAttributionCorrectionWindow: 60,
+            speakerIdentityReconciliation: SpeakerIdentityReconciliationOptions(aliases: [
+                // Fill this only from enrollment, embeddings, or user-confirmed speaker identity.
+                "recovery_1_speaker_0": "speaker_0"
+            ])
         ),
         audioFanOutBufferLimit: 128,
         backlogPolicy: .dropDiarization
@@ -378,6 +383,10 @@ try await diarizer.unloadModels()
 For live attribution, keep `attributionCacheRetentionWindow` comfortably larger than the ASR revision horizon. A practical default is at least 3x the transcriber's rolling context window, and 10 minutes is a reasonable floor for long meetings. Setting it near zero minimizes memory but can only recover historic ASR revisions from the already-emitted stable transcript snapshot.
 
 `lockedAttributionCorrectionWindow` keeps recently locked speaker labels eligible for correction when a streaming diarizer revises the speaker evidence for that time range. Set it to `0` only when you want the lowest CPU overhead and accept that locked labels are final.
+
+`attributionTimingOptions` compensates for small ASR/diarizer timestamp offsets and applies short speaker-switch hysteresis near diarization boundaries. Use `.live` for real-time sessions and `.disabled` when you need strict overlap-only attribution.
+
+Recovery speaker IDs are intentionally namespaced, so the library will not automatically assume `recovery_1_speaker_0` is the same physical person as `speaker_0`. Use `SpeakerIdentityReconciliationOptions.aliases` only when your app has an external identity signal such as enrollment, speaker embeddings, or explicit user confirmation.
 
 Use `backlogPolicy: .fatal` when complete diarization is required. Use `.dropDiarization` for meeting capture UIs where transcription should continue if Core ML diarization falls behind during a CPU or ANE spike. Soft drops are exposed structurally through `SpeechDiagnostic.code == .diarizationDropped` during streaming and `SpeechAnalysisResult.diarizationStatus == .dropped` at completion.
 

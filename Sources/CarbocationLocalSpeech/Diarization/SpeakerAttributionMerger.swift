@@ -16,7 +16,8 @@ public enum SpeakerAttributionMerger {
         diarization: DiarizationResult,
         policy: SpeakerAttributionPolicy,
         minimumSegmentOverlap: TimeInterval = 0.05,
-        minimumWordOverlap: TimeInterval = 0.0
+        minimumWordOverlap: TimeInterval = 0.0,
+        timingOptions: SpeakerAttributionTimingOptions = .disabled
     ) -> SpeakerAttributionMergeResult {
         var diagnostics: [SpeechDiagnostic] = []
         let selectedTurns: [SpeakerTurn]
@@ -51,23 +52,34 @@ public enum SpeakerAttributionMerger {
         for segment in transcript.segments {
             if !segment.words.isEmpty && policy != .segmentLargestOverlap {
                 var attributedWords = segment.words
+                var preferredSpeaker = segment.speaker
+                let timingOffset = bestLocalTimingOffset(
+                    for: attributedWords,
+                    turns: selectedTurns,
+                    timingOptions: timingOptions
+                )
                 for index in attributedWords.indices {
                     let word = attributedWords[index]
+                    let adjustedStart = word.startTime + timingOffset
+                    let adjustedEnd = word.endTime + timingOffset
                     reportCollapsedOverlapIfNeeded(
-                        start: word.startTime,
-                        end: word.endTime,
+                        start: adjustedStart,
+                        end: adjustedEnd,
                         turns: selectedTurns,
                         minimumOverlap: minWordOverlap,
                         diagnostics: &diagnostics,
                         reported: &reportedCollapsedOverlap
                     )
                     if let turn = bestSpeakerTurn(
-                        start: word.startTime,
-                        end: word.endTime,
+                        start: adjustedStart,
+                        end: adjustedEnd,
                         turns: selectedTurns,
-                        minimumOverlap: minWordOverlap
+                        minimumOverlap: minWordOverlap,
+                        preferredSpeaker: preferredSpeaker,
+                        timingOptions: timingOptions
                     ) {
                         attributedWords[index].speaker = turn.speaker
+                        preferredSpeaker = turn.speaker
                     }
                 }
 
@@ -111,7 +123,9 @@ public enum SpeakerAttributionMerger {
                     start: segment.startTime,
                     end: segment.endTime,
                     turns: selectedTurns,
-                    minimumOverlap: minSegOverlap
+                    minimumOverlap: minSegOverlap,
+                    preferredSpeaker: nil,
+                    timingOptions: timingOptions
                 ) {
                     updatedSegment.speaker = turn.speaker
                 }
@@ -149,20 +163,229 @@ public enum SpeakerAttributionMerger {
         ).transcript
     }
 
+    private struct SpeakerTurnMatch {
+        var turn: SpeakerTurn
+        var actualOverlap: TimeInterval
+        var tolerantOverlap: TimeInterval
+        var score: TimeInterval
+    }
+
+    private struct TimingOffsetScore {
+        var offset: TimeInterval
+        var totalOverlap: TimeInterval
+        var attributedWordCount: Int
+        var speakerSwitchCount: Int
+    }
+
+    private static func bestLocalTimingOffset(
+        for words: [TranscriptWord],
+        turns: [SpeakerTurn],
+        timingOptions: SpeakerAttributionTimingOptions
+    ) -> TimeInterval {
+        let radius = max(0, timingOptions.timingTolerance)
+        guard radius > 0,
+              !words.isEmpty,
+              !turns.isEmpty
+        else {
+            return 0
+        }
+
+        return timingOffsetCandidates(radius: radius)
+            .map { offset in
+                timingOffsetScore(offset: offset, words: words, turns: turns)
+            }
+            .max(by: timingOffsetScoreSort)?
+            .offset ?? 0
+    }
+
+    private static func timingOffsetCandidates(radius: TimeInterval) -> [TimeInterval] {
+        let step = max(0.025, min(0.05, radius / 2))
+        var candidates: [TimeInterval] = [0]
+        var offset = step
+        while offset < radius {
+            candidates.append(-offset)
+            candidates.append(offset)
+            offset += step
+        }
+        candidates.append(-radius)
+        candidates.append(radius)
+        return candidates
+    }
+
+    private static func timingOffsetScore(
+        offset: TimeInterval,
+        words: [TranscriptWord],
+        turns: [SpeakerTurn]
+    ) -> TimingOffsetScore {
+        var totalOverlap: TimeInterval = 0
+        var attributedWordCount = 0
+        var speakerSwitchCount = 0
+        var previousSpeaker: SpeakerID?
+
+        for word in words {
+            let start = word.startTime + offset
+            let end = word.endTime + offset
+            guard let match = speakerTurnMatches(
+                start: start,
+                end: end,
+                turns: turns,
+                minimumOverlap: 0,
+                timingOptions: .disabled
+            ).max(by: speakerTurnMatchSort) else {
+                continue
+            }
+
+            totalOverlap += match.actualOverlap
+            attributedWordCount += 1
+            if let previousSpeaker, previousSpeaker != match.turn.speaker {
+                speakerSwitchCount += 1
+            }
+            previousSpeaker = match.turn.speaker
+        }
+
+        return TimingOffsetScore(
+            offset: offset,
+            totalOverlap: totalOverlap,
+            attributedWordCount: attributedWordCount,
+            speakerSwitchCount: speakerSwitchCount
+        )
+    }
+
+    private static func timingOffsetScoreSort(lhs: TimingOffsetScore, rhs: TimingOffsetScore) -> Bool {
+        let epsilon = 0.000_001
+        if abs(lhs.totalOverlap - rhs.totalOverlap) > epsilon {
+            return lhs.totalOverlap < rhs.totalOverlap
+        }
+        if lhs.attributedWordCount != rhs.attributedWordCount {
+            return lhs.attributedWordCount < rhs.attributedWordCount
+        }
+        if lhs.speakerSwitchCount != rhs.speakerSwitchCount {
+            return lhs.speakerSwitchCount > rhs.speakerSwitchCount
+        }
+        return abs(lhs.offset) > abs(rhs.offset)
+    }
+
     private static func bestSpeakerTurn(
         start: TimeInterval,
         end: TimeInterval,
         turns: [SpeakerTurn],
-        minimumOverlap: TimeInterval
+        minimumOverlap: TimeInterval,
+        preferredSpeaker: SpeakerID?,
+        timingOptions: SpeakerAttributionTimingOptions
     ) -> SpeakerTurn? {
-        turns
-            .map { turn -> (SpeakerTurn, TimeInterval) in
-                let overlap = max(0, min(end, turn.endTime) - max(start, turn.startTime))
-                return (turn, overlap)
-            }
-            .filter { minimumOverlap <= 0 ? $0.1 > 0 : $0.1 >= minimumOverlap }
-            .max { lhs, rhs in lhs.1 < rhs.1 }?
-            .0
+        let matches = speakerTurnMatches(
+            start: start,
+            end: end,
+            turns: turns,
+            minimumOverlap: minimumOverlap,
+            timingOptions: timingOptions
+        )
+        guard let best = matches.max(by: speakerTurnMatchSort) else {
+            return nil
+        }
+
+        guard let preferredSpeaker,
+              best.turn.speaker != preferredSpeaker,
+              timingOptions.speakerSwitchScoreTolerance > 0,
+              timingOptions.speakerSwitchGraceDuration > 0,
+              isNearSpeakerSwitchBoundary(
+                start: start,
+                end: end,
+                matches: matches,
+                preferredSpeaker: preferredSpeaker,
+                graceDuration: timingOptions.speakerSwitchGraceDuration
+              ),
+              let preferred = matches
+                .filter({ $0.turn.speaker == preferredSpeaker })
+                .max(by: speakerTurnMatchSort)
+        else {
+            return best.turn
+        }
+
+        let toleratedScore = best.score * (1 - timingOptions.speakerSwitchScoreTolerance)
+        return preferred.score >= toleratedScore ? preferred.turn : best.turn
+    }
+
+    private static func speakerTurnMatches(
+        start: TimeInterval,
+        end: TimeInterval,
+        turns: [SpeakerTurn],
+        minimumOverlap: TimeInterval,
+        timingOptions: SpeakerAttributionTimingOptions
+    ) -> [SpeakerTurnMatch] {
+        let tolerance = max(0, timingOptions.timingTolerance)
+        let expandedStart = start - tolerance
+        let expandedEnd = end + tolerance
+
+        return turns.compactMap { turn -> SpeakerTurnMatch? in
+            let actualOverlap = intervalOverlap(start: start, end: end, otherStart: turn.startTime, otherEnd: turn.endTime)
+            let tolerantOverlap = tolerance > 0
+                ? intervalOverlap(start: expandedStart, end: expandedEnd, otherStart: turn.startTime, otherEnd: turn.endTime)
+                : actualOverlap
+            let effectiveOverlap = actualOverlap > 0 ? actualOverlap : tolerantOverlap
+            let meetsThreshold = minimumOverlap <= 0 ? effectiveOverlap > 0 : effectiveOverlap >= minimumOverlap
+            guard meetsThreshold else { return nil }
+
+            return SpeakerTurnMatch(
+                turn: turn,
+                actualOverlap: actualOverlap,
+                tolerantOverlap: tolerantOverlap,
+                score: actualOverlap > 0 ? actualOverlap : tolerantOverlap * 0.75
+            )
+        }
+    }
+
+    private static func speakerTurnMatchSort(lhs: SpeakerTurnMatch, rhs: SpeakerTurnMatch) -> Bool {
+        let epsilon = 0.000_001
+        if abs(lhs.score - rhs.score) > epsilon {
+            return lhs.score < rhs.score
+        }
+        if abs(lhs.actualOverlap - rhs.actualOverlap) > epsilon {
+            return lhs.actualOverlap < rhs.actualOverlap
+        }
+        return lhs.turn.startTime > rhs.turn.startTime
+    }
+
+    private static func isNearSpeakerSwitchBoundary(
+        start: TimeInterval,
+        end: TimeInterval,
+        matches: [SpeakerTurnMatch],
+        preferredSpeaker: SpeakerID,
+        graceDuration: TimeInterval
+    ) -> Bool {
+        matches.contains { match in
+            guard match.turn.speaker == preferredSpeaker else { return false }
+            return intervalDistance(
+                start: start,
+                end: end,
+                otherStart: match.turn.startTime,
+                otherEnd: match.turn.endTime
+            ) <= graceDuration
+        }
+    }
+
+    private static func intervalOverlap(
+        start: TimeInterval,
+        end: TimeInterval,
+        otherStart: TimeInterval,
+        otherEnd: TimeInterval
+    ) -> TimeInterval {
+        max(0, min(end, otherEnd) - max(start, otherStart))
+    }
+
+    private static func intervalDistance(
+        start: TimeInterval,
+        end: TimeInterval,
+        otherStart: TimeInterval,
+        otherEnd: TimeInterval
+    ) -> TimeInterval {
+        if end < otherStart {
+            return otherStart - end
+        }
+        if otherEnd < start {
+            return start - otherEnd
+        }
+        return 0
     }
 
     private static func reportCollapsedOverlapIfNeeded(

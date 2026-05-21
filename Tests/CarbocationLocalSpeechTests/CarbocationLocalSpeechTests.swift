@@ -1780,6 +1780,72 @@ final class CarbocationLocalSpeechTests: XCTestCase {
         XCTAssertNil(result.transcript.segments[0].words[0].speaker)
     }
 
+    func testSpeakerAttributionMergerUsesTimingToleranceForDelayedBoundaryWords() throws {
+        let speakerA = SpeakerID(rawValue: "A")
+        let speakerB = SpeakerID(rawValue: "B")
+        let transcript = Transcript(segments: [
+            TranscriptSegment(
+                text: "hi there now",
+                startTime: 0.20,
+                endTime: 0.82,
+                words: [
+                    TranscriptWord(text: "hi", startTime: 0.20, endTime: 0.35),
+                    TranscriptWord(text: "there", startTime: 0.45, endTime: 0.60),
+                    TranscriptWord(text: "now", startTime: 0.68, endTime: 0.82)
+                ]
+            )
+        ])
+        let diarization = DiarizationResult(
+            turns: [
+                SpeakerTurn(speaker: speakerA, startTime: 0.00, endTime: 0.50),
+                SpeakerTurn(speaker: speakerB, startTime: 0.50, endTime: 1.00)
+            ],
+            speakers: [Speaker(id: speakerA), Speaker(id: speakerB)],
+            duration: 1.0
+        )
+
+        let result = SpeakerAttributionMerger.merge(
+            transcript: transcript,
+            diarization: diarization,
+            policy: .preferStandardWordLevel,
+            timingOptions: .live
+        )
+
+        XCTAssertEqual(result.transcript.segments.map(\.text), ["hi there", "now"])
+        XCTAssertEqual(result.transcript.segments.map(\.speaker), [speakerA, speakerB])
+        XCTAssertEqual(
+            result.transcript.segments.flatMap(\.words).map(\.speaker),
+            [speakerA, speakerA, speakerB]
+        )
+    }
+
+    func testSpeakerAttributionMergerCanAttributeSmallTimestampGapsWithTolerance() {
+        let speaker = SpeakerID(rawValue: "A")
+        let transcript = Transcript(segments: [
+            TranscriptSegment(
+                text: "late",
+                startTime: 0.52,
+                endTime: 0.62,
+                words: [TranscriptWord(text: "late", startTime: 0.52, endTime: 0.62)]
+            )
+        ])
+        let diarization = DiarizationResult(
+            turns: [SpeakerTurn(speaker: speaker, startTime: 0.0, endTime: 0.5)],
+            speakers: [Speaker(id: speaker)],
+            duration: 0.5
+        )
+
+        let result = SpeakerAttributionMerger.merge(
+            transcript: transcript,
+            diarization: diarization,
+            policy: .preferStandardWordLevel,
+            timingOptions: SpeakerAttributionTimingOptions(timingTolerance: 0.05)
+        )
+
+        XCTAssertEqual(result.transcript.segments[0].speaker, speaker)
+        XCTAssertEqual(result.transcript.segments[0].words[0].speaker, speaker)
+    }
+
     func testSpeakerAttributionMergerReportsCollapsedOverlappingSpeech() {
         let speakerA = SpeakerID(rawValue: "A")
         let speakerB = SpeakerID(rawValue: "B")
