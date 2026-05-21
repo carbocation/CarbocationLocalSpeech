@@ -268,6 +268,10 @@ private struct CLSSmokeRootView: View {
     @AppStorage("CLSSmoke.recordLiveAudio") private var recordLiveAudio = false
     @AppStorage("CLSSmoke.useLiveDiarization") private var useLiveDiarization = false
     @AppStorage("CLSSmoke.useFileDiarization") private var useFileDiarization = false
+    @AppStorage("CLSSmoke.fileDiarizationSpeakerCountMode") private var fileDiarizationSpeakerCountModeStorageValue = CLSSmokeDiarizationSpeakerCountMode.automatic.rawValue
+    @AppStorage("CLSSmoke.fileDiarizationExactSpeakerCount") private var fileDiarizationExactSpeakerCount = 2
+    @AppStorage("CLSSmoke.fileDiarizationMinimumSpeakerCount") private var fileDiarizationMinimumSpeakerCount = 2
+    @AppStorage("CLSSmoke.fileDiarizationMaximumSpeakerCount") private var fileDiarizationMaximumSpeakerCount = 8
     @AppStorage("CLSSmoke.werReferenceText") private var werReferenceText = ""
     @State private var systemOptions: [SpeechSystemModelOption] = []
     @State private var librarySnapshot = SpeechModelLibrarySnapshot.empty
@@ -317,6 +321,7 @@ private struct CLSSmokeRootView: View {
     private let currentTranscriptWERUpdateInterval: TimeInterval = 1.0
     private let diagnosticLogThrottleInterval: TimeInterval = 1.0
     private let transcriptMetricThrottleInterval: TimeInterval = 1.0
+    private static let diarizationSpeakerCountBounds = 1...16
     private static let supportedAudioFileExtensions: Set<String> = [
         "aac", "aif", "aiff", "caf", "flac", "m4a", "m4b", "m4p",
         "m4v", "mov", "mp3", "mp4", "wav", "wave"
@@ -453,6 +458,35 @@ private struct CLSSmokeRootView: View {
         CLSSmokeVADSensitivity(rawValue: vadSensitivityStorageValue) ?? .medium
     }
 
+    private var selectedFileDiarizationSpeakerCountMode: CLSSmokeDiarizationSpeakerCountMode {
+        CLSSmokeDiarizationSpeakerCountMode(rawValue: fileDiarizationSpeakerCountModeStorageValue) ?? .automatic
+    }
+
+    private var selectedFileDiarizationExactSpeakerCount: Int {
+        Self.clampedDiarizationSpeakerCount(fileDiarizationExactSpeakerCount)
+    }
+
+    private var selectedFileDiarizationSpeakerRange: (minimum: Int, maximum: Int) {
+        let minimum = Self.clampedDiarizationSpeakerCount(fileDiarizationMinimumSpeakerCount)
+        let maximum = max(minimum, Self.clampedDiarizationSpeakerCount(fileDiarizationMaximumSpeakerCount))
+        return (minimum, maximum)
+    }
+
+    private var selectedFileDiarizationOptions: DiarizationOptions {
+        switch selectedFileDiarizationSpeakerCountMode {
+        case .automatic:
+            return DiarizationOptions()
+        case .exact:
+            return DiarizationOptions(exactSpeakerCount: selectedFileDiarizationExactSpeakerCount)
+        case .range:
+            let range = selectedFileDiarizationSpeakerRange
+            return DiarizationOptions(
+                minimumSpeakerCount: range.minimum,
+                maximumSpeakerCount: range.maximum
+            )
+        }
+    }
+
     private var selectedLiveInput: CLSSmokeLiveInput {
         let input = CLSSmokeLiveInput(rawValue: liveInputStorageValue) ?? .microphone
 #if os(macOS)
@@ -473,6 +507,46 @@ private struct CLSSmokeRootView: View {
         Binding(
             get: { selectedVADSensitivity },
             set: { vadSensitivityStorageValue = $0.rawValue }
+        )
+    }
+
+    private var fileDiarizationSpeakerCountModeBinding: Binding<CLSSmokeDiarizationSpeakerCountMode> {
+        Binding(
+            get: { selectedFileDiarizationSpeakerCountMode },
+            set: { fileDiarizationSpeakerCountModeStorageValue = $0.rawValue }
+        )
+    }
+
+    private var fileDiarizationExactSpeakerCountBinding: Binding<Int> {
+        Binding(
+            get: { selectedFileDiarizationExactSpeakerCount },
+            set: { fileDiarizationExactSpeakerCount = Self.clampedDiarizationSpeakerCount($0) }
+        )
+    }
+
+    private var fileDiarizationMinimumSpeakerCountBinding: Binding<Int> {
+        Binding(
+            get: { selectedFileDiarizationSpeakerRange.minimum },
+            set: { newValue in
+                let count = Self.clampedDiarizationSpeakerCount(newValue)
+                fileDiarizationMinimumSpeakerCount = count
+                if fileDiarizationMaximumSpeakerCount < count {
+                    fileDiarizationMaximumSpeakerCount = count
+                }
+            }
+        )
+    }
+
+    private var fileDiarizationMaximumSpeakerCountBinding: Binding<Int> {
+        Binding(
+            get: { selectedFileDiarizationSpeakerRange.maximum },
+            set: { newValue in
+                let count = Self.clampedDiarizationSpeakerCount(newValue)
+                fileDiarizationMaximumSpeakerCount = count
+                if fileDiarizationMinimumSpeakerCount > count {
+                    fileDiarizationMinimumSpeakerCount = count
+                }
+            }
         )
     }
 
@@ -778,15 +852,7 @@ private struct CLSSmokeRootView: View {
                 }
             }
 
-            HStack(spacing: 10) {
-                Text("Diarization")
-                    .font(.caption.weight(.semibold))
-                    .frame(width: 80, alignment: .leading)
-
-                Toggle("Diarize speakers", isOn: $useFileDiarization)
-                    .modifier(CLSSmokePlatformCheckboxToggleStyle())
-                    .disabled(isFileTranscribing || isStarting)
-            }
+            fileDiarizationSettings
 
             fileDropTarget
 
@@ -802,6 +868,87 @@ private struct CLSSmokeRootView: View {
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
         .background(CLSSmokePlatformColor.windowBackground)
+    }
+
+    private var fileDiarizationSettings: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Text("Diarization")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 80, alignment: .leading)
+
+                Toggle("Diarize speakers", isOn: $useFileDiarization)
+                    .modifier(CLSSmokePlatformCheckboxToggleStyle())
+                    .disabled(isFileTranscribing || isStarting)
+            }
+
+            if useFileDiarization {
+                HStack(spacing: 10) {
+                    Text("Speakers")
+                        .font(.caption.weight(.semibold))
+                        .frame(width: 80, alignment: .leading)
+
+                    Picker("Speaker count", selection: fileDiarizationSpeakerCountModeBinding) {
+                        ForEach(CLSSmokeDiarizationSpeakerCountMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 260)
+                    .disabled(isFileTranscribing || isStarting)
+                }
+
+                fileDiarizationSpeakerCountControls
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var fileDiarizationSpeakerCountControls: some View {
+        switch selectedFileDiarizationSpeakerCountMode {
+        case .automatic:
+            EmptyView()
+        case .exact:
+            HStack(spacing: 10) {
+                Text("")
+                    .frame(width: 80, alignment: .leading)
+
+                Stepper(
+                    value: fileDiarizationExactSpeakerCountBinding,
+                    in: Self.diarizationSpeakerCountBounds
+                ) {
+                    Text("Exact \(selectedFileDiarizationExactSpeakerCount)")
+                        .font(.caption.monospaced())
+                }
+                .disabled(isFileTranscribing || isStarting)
+            }
+        case .range:
+            let range = selectedFileDiarizationSpeakerRange
+            HStack(alignment: .top, spacing: 10) {
+                Text("")
+                    .frame(width: 80, alignment: .leading)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Stepper(
+                        value: fileDiarizationMinimumSpeakerCountBinding,
+                        in: Self.diarizationSpeakerCountBounds
+                    ) {
+                        Text("Min \(range.minimum)")
+                            .font(.caption.monospaced())
+                    }
+
+                    Stepper(
+                        value: fileDiarizationMaximumSpeakerCountBinding,
+                        in: Self.diarizationSpeakerCountBounds
+                    ) {
+                        Text("Max \(range.maximum)")
+                            .font(.caption.monospaced())
+                    }
+                }
+                .disabled(isFileTranscribing || isStarting)
+            }
+        }
     }
 
     private var werPanel: some View {
@@ -1443,6 +1590,7 @@ private struct CLSSmokeRootView: View {
             .storageValue
         let vadMode = selectedVADMode
         let vadSensitivity = selectedVADSensitivity
+        let diarizationOptions = selectedFileDiarizationOptions
 
         cancelFileTranscription(updateStatus: false)
         stopListening(updateStatus: false, unloadProvider: false)
@@ -1465,7 +1613,8 @@ private struct CLSSmokeRootView: View {
                 fileURL: selectedFileURL,
                 selectionStorageValue: sessionSelectionValue,
                 vadMode: vadMode,
-                vadSensitivity: vadSensitivity
+                vadSensitivity: vadSensitivity,
+                diarizationOptions: diarizationOptions
             )
         }
     }
@@ -1492,7 +1641,8 @@ private struct CLSSmokeRootView: View {
         fileURL: URL,
         selectionStorageValue: String,
         vadMode: CLSSmokeVADMode,
-        vadSensitivity: CLSSmokeVADSensitivity
+        vadSensitivity: CLSSmokeVADSensitivity,
+        diarizationOptions: DiarizationOptions
     ) async {
         do {
             guard activeFileTranscriptionID == id else { return }
@@ -1544,9 +1694,19 @@ private struct CLSSmokeRootView: View {
             guard activeFileTranscriptionID == id else { return }
             loadedInfo = loaded
             appendEvent(.started(loaded.backend))
+            let diarizationDiagnostic = plan.fileDiarization == nil
+                ? "none"
+                : Self.diarizationOptionsDiagnosticValue(diarizationOptions)
             appendEvent(.diagnostic(TranscriptionDiagnostic(
                 source: "smoke.file",
-                message: "file=\(fileURL.lastPathComponent) provider=\(loaded.backend.displayName) vad=\(vadMode.diagnosticValue) sensitivity=\(vadSensitivity.diagnosticValue) availability=\(vadAvailability.diagnosticValue)"
+                message: [
+                    "file=\(fileURL.lastPathComponent)",
+                    "provider=\(loaded.backend.displayName)",
+                    "vad=\(vadMode.diagnosticValue)",
+                    "sensitivity=\(vadSensitivity.diagnosticValue)",
+                    "availability=\(vadAvailability.diagnosticValue)",
+                    "diarization=\(diarizationDiagnostic)"
+                ].joined(separator: " ")
             )))
 
             if let filePlan = plan.fileDiarization,
@@ -1564,7 +1724,7 @@ private struct CLSSmokeRootView: View {
                 await LocalSpeechEngine.shared.registerDiarizer(diarizer)
                 appendEvent(.diagnostic(TranscriptionDiagnostic(
                     source: "smoke.diarization",
-                    message: "file=\(filePlan.displayName) selection=\(fileSelection.storageValue)"
+                    message: "file=\(filePlan.displayName) selection=\(fileSelection.storageValue) \(Self.diarizationOptionsDiagnosticValue(diarizationOptions))"
                 )))
             }
 
@@ -1586,7 +1746,10 @@ private struct CLSSmokeRootView: View {
                             sensitivity: vadSensitivity.runtimeSensitivity
                         )
                     ),
-                    diarization: fileDiarizationRequest(for: plan.selection.diarization.file)
+                    diarization: fileDiarizationRequest(
+                        for: plan.selection.diarization.file,
+                        options: diarizationOptions
+                    )
                 )
             )
             let processingDuration = Date().timeIntervalSince(startedAt)
@@ -1703,9 +1866,12 @@ private struct CLSSmokeRootView: View {
         }
     }
 
-    private func fileDiarizationRequest(for selection: DiarizationModelSelection?) -> DiarizationRequest? {
+    private func fileDiarizationRequest(
+        for selection: DiarizationModelSelection?,
+        options: DiarizationOptions
+    ) -> DiarizationRequest? {
         guard selection != nil else { return nil }
-        return DiarizationRequest()
+        return DiarizationRequest(options: options)
     }
 
     private func streamingDiarizationRequest(
@@ -1773,6 +1939,24 @@ private struct CLSSmokeRootView: View {
             ?? transcript.duration
             ?? transcript.segments.last?.endTime
             ?? 0
+    }
+
+    private static func clampedDiarizationSpeakerCount(_ count: Int) -> Int {
+        min(diarizationSpeakerCountBounds.upperBound, max(diarizationSpeakerCountBounds.lowerBound, count))
+    }
+
+    private static func diarizationOptionsDiagnosticValue(_ options: DiarizationOptions) -> String {
+        if let exactSpeakerCount = options.exactSpeakerCount {
+            return "speakers=exact:\(exactSpeakerCount)"
+        }
+
+        if options.minimumSpeakerCount != nil || options.maximumSpeakerCount != nil {
+            let minimum = options.minimumSpeakerCount.map(String.init) ?? "any"
+            let maximum = options.maximumSpeakerCount.map(String.init) ?? "any"
+            return "speakers=range:\(minimum)-\(maximum)"
+        }
+
+        return "speakers=automatic"
     }
 
     private static func formatDiarizationInstallProgress(_ progress: FluidAudioModelInstallProgress) -> String {
@@ -2348,6 +2532,25 @@ private enum CLSSmokeLiveInputError: Error, LocalizedError {
         switch self {
         case .systemAudioRequiresMacOS15:
             return "System audio input requires macOS 15 or newer."
+        }
+    }
+}
+
+private enum CLSSmokeDiarizationSpeakerCountMode: String, CaseIterable, Identifiable {
+    case automatic
+    case exact
+    case range
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .automatic:
+            return "Auto"
+        case .exact:
+            return "Exact"
+        case .range:
+            return "Range"
         }
     }
 }
