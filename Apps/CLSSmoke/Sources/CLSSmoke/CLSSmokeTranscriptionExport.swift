@@ -71,13 +71,11 @@ enum CLSSmokeTranscriptionExportBuilder {
         generatedAt: Date
     ) throws -> Data {
         let transcriptForPlainText = transcript
-        let transcriptForTimedChunks = analysisResult.transcript ?? transcript
         let attributedTranscript = speakerAttributedTranscript(
             displayTranscript: transcript,
             analysisResult: analysisResult
         )
         let diarization = analysisResult.diarization
-        let speakersByID = Dictionary(uniqueKeysWithValues: (diarization?.speakers ?? []).map { ($0.id, $0) })
 
         var artifacts: [CLSSmokeExportArtifact] = []
         var entries: [CLSSmokeZIPArchive.Entry] = []
@@ -107,26 +105,29 @@ enum CLSSmokeTranscriptionExportBuilder {
             data: utf8Data(transcriptText + "\n")
         )
 
-        let timedChunks = CLSSmokeTimedTextChunksFile(
+        let exportSource = TranscriptExportSource(
+            transcript: attributedTranscript ?? transcript,
+            diarization: diarization,
+            speakers: diarization?.speakers ?? [],
+            title: defaultTranscriptTitle(sourceFileName: sourceFileName),
             sourceFileName: sourceFileName,
-            generatedAt: generatedAt,
-            diarized: false,
-            languageCode: transcriptForTimedChunks.language?.code,
-            backendDisplayName: transcriptForTimedChunks.backend?.displayName,
-            duration: transcriptForTimedChunks.duration,
-            chunks: chunks(
-                from: transcriptForTimedChunks,
-                speakersByID: speakersByID,
-                includeSpeakerLabels: false
+            generatedAt: generatedAt
+        )
+        for format in [TranscriptExportFormat.json, .srt, .webVTT, .markdownMinutes] {
+            let baseName = format == .markdownMinutes ? "meeting-minutes" : "transcript"
+            let artifact = try TranscriptExporter.export(
+                format: format,
+                source: exportSource,
+                options: TranscriptExportOptions(fileBaseName: baseName)
             )
-        )
-        appendFile(
-            name: "timed-text-chunks.json",
-            mediaType: "application/json",
-            role: "timedTextChunks",
-            description: "Segment-level timed text chunks from the transcription result.",
-            data: try encodeJSON(timedChunks)
-        )
+            appendFile(
+                name: artifact.fileName,
+                mediaType: artifact.mediaType,
+                role: artifact.role,
+                description: standardArtifactDescription(for: artifact.format),
+                data: artifact.data
+            )
+        }
 
         appendFile(
             name: "analysis-result.json",
@@ -169,40 +170,6 @@ enum CLSSmokeTranscriptionExportBuilder {
             )
         }
 
-        if let attributedTranscript {
-            appendFile(
-                name: "transcript-diarized.txt",
-                mediaType: "text/plain; charset=utf-8",
-                role: "diarizedPlainTextTranscript",
-                description: "Plain transcript text grouped by speaker labels.",
-                data: utf8Data(diarizedText(
-                    from: attributedTranscript,
-                    speakersByID: speakersByID
-                ) + "\n")
-            )
-
-            let diarizedChunks = CLSSmokeTimedTextChunksFile(
-                sourceFileName: sourceFileName,
-                generatedAt: generatedAt,
-                diarized: true,
-                languageCode: attributedTranscript.language?.code,
-                backendDisplayName: attributedTranscript.backend?.displayName,
-                duration: attributedTranscript.duration,
-                chunks: chunks(
-                    from: attributedTranscript,
-                    speakersByID: speakersByID,
-                    includeSpeakerLabels: true
-                )
-            )
-            appendFile(
-                name: "diarized-timed-text-chunks.json",
-                mediaType: "application/json",
-                role: "diarizedTimedTextChunks",
-                description: "Segment-level timed text chunks with speaker attribution.",
-                data: try encodeJSON(diarizedChunks)
-            )
-        }
-
         let manifestArtifact = CLSSmokeExportArtifact(
             fileName: "manifest.json",
             mediaType: "application/json",
@@ -214,11 +181,11 @@ enum CLSSmokeTranscriptionExportBuilder {
             generatedAt: generatedAt,
             processingDuration: processingDuration,
             transcript: CLSSmokeTranscriptSummary(
-                segmentCount: transcriptForTimedChunks.segments.count,
-                wordCount: transcriptForTimedChunks.segments.flatMap(\.words).count,
-                duration: transcriptForTimedChunks.duration ?? transcriptForTimedChunks.segments.last?.endTime,
-                backendDisplayName: transcriptForTimedChunks.backend?.displayName,
-                languageCode: transcriptForTimedChunks.language?.code
+                segmentCount: transcript.segments.count,
+                wordCount: transcript.segments.flatMap(\.words).count,
+                duration: transcript.duration ?? transcript.segments.last?.endTime,
+                backendDisplayName: transcript.backend?.displayName,
+                languageCode: transcript.language?.code
             ),
             diarization: diarization.map {
                 CLSSmokeDiarizationSummary(
@@ -257,6 +224,25 @@ enum CLSSmokeTranscriptionExportBuilder {
         return URL(fileURLWithPath: trimmed).lastPathComponent
     }
 
+    private static func defaultTranscriptTitle(sourceFileName: String) -> String {
+        let title = URL(fileURLWithPath: sourceFileName).deletingPathExtension().lastPathComponent
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Meeting Minutes" : trimmed
+    }
+
+    private static func standardArtifactDescription(for format: TranscriptExportFormat) -> String {
+        switch format {
+        case .json:
+            return "Standard portable transcript JSON generated by CarbocationLocalSpeech."
+        case .srt:
+            return "Standard SubRip subtitle transcript generated by CarbocationLocalSpeech."
+        case .webVTT:
+            return "Standard WebVTT subtitle transcript generated by CarbocationLocalSpeech."
+        case .markdownMinutes:
+            return "Readable Markdown meeting minutes generated by CarbocationLocalSpeech."
+        }
+    }
+
     private static func speakerAttributedTranscript(
         displayTranscript: Transcript,
         analysisResult: SpeechAnalysisResult
@@ -289,77 +275,6 @@ enum CLSSmokeTranscriptionExportBuilder {
         transcript.segments.contains { segment in
             segment.speaker != nil || segment.words.contains { $0.speaker != nil }
         }
-    }
-
-    private static func chunks(
-        from transcript: Transcript,
-        speakersByID: [SpeakerID: Speaker],
-        includeSpeakerLabels: Bool
-    ) -> [CLSSmokeTimedTextChunk] {
-        transcript.segments.enumerated().map { index, segment in
-            let speakerID = includeSpeakerLabels ? segment.speaker?.rawValue : nil
-            return CLSSmokeTimedTextChunk(
-                index: index,
-                id: segment.id.uuidString,
-                startTime: segment.startTime,
-                endTime: segment.endTime,
-                duration: max(0, segment.endTime - segment.startTime),
-                text: segment.text.trimmingCharacters(in: .whitespacesAndNewlines),
-                speakerID: speakerID,
-                speakerLabel: includeSpeakerLabels
-                    ? speakerLabel(for: segment.speaker, speakersByID: speakersByID)
-                    : nil,
-                confidence: segment.confidence,
-                words: segment.words.enumerated().map { wordIndex, word in
-                    let wordSpeakerID = includeSpeakerLabels ? word.speaker?.rawValue : nil
-                    return CLSSmokeTimedTextWord(
-                        index: wordIndex,
-                        id: word.id.uuidString,
-                        startTime: word.startTime,
-                        endTime: word.endTime,
-                        duration: max(0, word.endTime - word.startTime),
-                        text: word.text,
-                        speakerID: wordSpeakerID,
-                        speakerLabel: includeSpeakerLabels
-                            ? speakerLabel(for: word.speaker, speakersByID: speakersByID)
-                            : nil,
-                        confidence: word.confidence
-                    )
-                }
-            )
-        }
-    }
-
-    private static func diarizedText(
-        from transcript: Transcript,
-        speakersByID: [SpeakerID: Speaker]
-    ) -> String {
-        var lines: [String] = []
-        var currentSpeaker: SpeakerID?
-        var currentText: [String] = []
-
-        func flush() {
-            let text = currentText.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return }
-            let label = speakerLabel(for: currentSpeaker, speakersByID: speakersByID) ?? "Unknown Speaker"
-            lines.append("[\(label)] \(text)")
-        }
-
-        for segment in transcript.segments {
-            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { continue }
-
-            if segment.speaker != currentSpeaker {
-                flush()
-                currentSpeaker = segment.speaker
-                currentText.removeAll(keepingCapacity: true)
-            }
-
-            currentText.append(text)
-        }
-
-        flush()
-        return lines.joined(separator: "\n")
     }
 
     fileprivate static func speakerLabel(
@@ -427,43 +342,6 @@ private struct CLSSmokeExportArtifact: Codable {
     var mediaType: String
     var role: String
     var description: String
-}
-
-private struct CLSSmokeTimedTextChunksFile: Codable {
-    var schema = "clssmoke.timed-text-chunks"
-    var version = 1
-    var sourceFileName: String
-    var generatedAt: Date
-    var diarized: Bool
-    var languageCode: String?
-    var backendDisplayName: String?
-    var duration: TimeInterval?
-    var chunks: [CLSSmokeTimedTextChunk]
-}
-
-private struct CLSSmokeTimedTextChunk: Codable {
-    var index: Int
-    var id: String
-    var startTime: TimeInterval
-    var endTime: TimeInterval
-    var duration: TimeInterval
-    var text: String
-    var speakerID: String?
-    var speakerLabel: String?
-    var confidence: Double?
-    var words: [CLSSmokeTimedTextWord]
-}
-
-private struct CLSSmokeTimedTextWord: Codable {
-    var index: Int
-    var id: String
-    var startTime: TimeInterval
-    var endTime: TimeInterval
-    var duration: TimeInterval
-    var text: String
-    var speakerID: String?
-    var speakerLabel: String?
-    var confidence: Double?
 }
 
 private struct CLSSmokeDiagnosticsFile: Codable {
