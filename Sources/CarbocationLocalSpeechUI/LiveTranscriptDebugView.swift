@@ -437,10 +437,11 @@ public struct LiveTranscriptDebugSnapshot: Equatable {
             realTimeFactor = stats.realTimeFactor
         case .completed(let transcript):
             let nonEmptySegments = transcript.segments.filter { !Self.trim($0.text).isEmpty }
-            if !nonEmptySegments.isEmpty && nonEmptySegments.count != segmentCount {
+            let signature = Self.stableSnapshotSignature(for: transcript.segments)
+            if !nonEmptySegments.isEmpty && signature != stableSnapshotSignature {
                 applyStableSegments(
                     transcript.segments,
-                    signature: Self.stableSnapshotSignature(for: transcript.segments)
+                    signature: signature
                 )
             }
             applyVolatileTranscript(nil)

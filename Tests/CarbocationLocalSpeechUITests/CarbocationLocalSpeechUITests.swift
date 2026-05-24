@@ -315,6 +315,149 @@ final class CarbocationLocalSpeechUITests: XCTestCase {
         XCTAssertEqual(snapshot.latestDisplayText, "[Speaker 1] world")
     }
 
+    func testLiveTranscriptDebugSnapshotUpdatesUnattributedStableBadgeWithoutDuplicatingText() {
+        let segmentID = UUID()
+        var snapshot = LiveTranscriptDebugSnapshot(events: [
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(id: segmentID, text: "hello", startTime: 0.0, endTime: 0.4)
+            ])))
+        ])
+
+        XCTAssertEqual(snapshot.stableText, "hello")
+        XCTAssertEqual(snapshot.stableDisplayText, "[?] hello")
+
+        snapshot.apply(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+            TranscriptSegment(
+                id: segmentID,
+                text: "hello",
+                startTime: 0.0,
+                endTime: 0.4,
+                speaker: SpeakerID(rawValue: "speaker_0")
+            )
+        ])))
+
+        XCTAssertEqual(snapshot.transcriptText, "hello")
+        XCTAssertEqual(snapshot.stableText, "hello")
+        XCTAssertEqual(snapshot.stableDisplayText, "[Speaker 0] hello")
+        XCTAssertEqual(snapshot.latestDisplayText, "[Speaker 0] hello")
+        XCTAssertEqual(snapshot.segmentCount, 1)
+    }
+
+    func testLiveTranscriptDebugSnapshotUpdatesStableSpeakerBadgeWithoutDuplicatingText() {
+        let segmentID = UUID()
+        var snapshot = LiveTranscriptDebugSnapshot(events: [
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(
+                    id: segmentID,
+                    text: "hello",
+                    startTime: 0.0,
+                    endTime: 0.4,
+                    speaker: SpeakerID(rawValue: "speaker_0")
+                )
+            ])))
+        ])
+
+        XCTAssertEqual(snapshot.stableDisplayText, "[Speaker 0] hello")
+
+        snapshot.apply(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+            TranscriptSegment(
+                id: segmentID,
+                text: "hello",
+                startTime: 0.0,
+                endTime: 0.4,
+                speaker: SpeakerID(rawValue: "speaker_1")
+            )
+        ])))
+
+        XCTAssertEqual(snapshot.transcriptText, "hello")
+        XCTAssertEqual(snapshot.stableText, "hello")
+        XCTAssertEqual(snapshot.stableDisplayText, "[Speaker 1] hello")
+        XCTAssertEqual(snapshot.latestDisplayText, "[Speaker 1] hello")
+        XCTAssertEqual(snapshot.segmentCount, 1)
+    }
+
+    func testLiveTranscriptDebugSnapshotInsertsSpeakerBadgeWhenCollapsedRunSplits() {
+        let speakerOne = SpeakerID(rawValue: "speaker_1")
+        let speakerTwo = SpeakerID(rawValue: "speaker_2")
+        let firstID = UUID()
+        let secondID = UUID()
+        let thirdID = UUID()
+        var snapshot = LiveTranscriptDebugSnapshot(events: [
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(id: firstID, text: "But why", startTime: 0.0, endTime: 0.4, speaker: speakerOne),
+                TranscriptSegment(id: secondID, text: "do you think that", startTime: 0.4, endTime: 0.8, speaker: speakerOne),
+                TranscriptSegment(id: thirdID, text: "I love you so much?", startTime: 0.8, endTime: 1.2, speaker: speakerOne)
+            ])))
+        ])
+
+        XCTAssertEqual(
+            snapshot.stableDisplayText,
+            "[Speaker 1] But why do you think that I love you so much?"
+        )
+
+        snapshot.apply(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+            TranscriptSegment(id: firstID, text: "But why", startTime: 0.0, endTime: 0.4, speaker: speakerOne),
+            TranscriptSegment(id: secondID, text: "do you think that", startTime: 0.4, endTime: 0.8, speaker: speakerOne),
+            TranscriptSegment(id: thirdID, text: "I love you so much?", startTime: 0.8, endTime: 1.2, speaker: speakerTwo)
+        ])))
+
+        XCTAssertEqual(snapshot.stableText, "But why do you think that I love you so much?")
+        XCTAssertEqual(
+            snapshot.stableDisplayText,
+            "[Speaker 1] But why do you think that [Speaker 2] I love you so much?"
+        )
+        XCTAssertEqual(snapshot.latestDisplayText, "[Speaker 2] I love you so much?")
+    }
+
+    func testLiveTranscriptDebugSnapshotSuppressesRepeatedSpeakerBadgesAfterRebuild() {
+        let speaker = SpeakerID(rawValue: "speaker_0")
+        let firstID = UUID()
+        let secondID = UUID()
+        let thirdID = UUID()
+        var snapshot = LiveTranscriptDebugSnapshot(events: [
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(id: firstID, text: "first", startTime: 0.0, endTime: 0.4),
+                TranscriptSegment(id: secondID, text: "second", startTime: 0.4, endTime: 0.8),
+                TranscriptSegment(id: thirdID, text: "third", startTime: 0.8, endTime: 1.2)
+            ])))
+        ])
+
+        XCTAssertEqual(snapshot.stableDisplayText, "[?] first second third")
+
+        snapshot.apply(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+            TranscriptSegment(id: firstID, text: "first", startTime: 0.0, endTime: 0.4, speaker: speaker),
+            TranscriptSegment(id: secondID, text: "second", startTime: 0.4, endTime: 0.8, speaker: speaker),
+            TranscriptSegment(id: thirdID, text: "third", startTime: 0.8, endTime: 1.2, speaker: speaker)
+        ])))
+
+        XCTAssertEqual(snapshot.stableText, "first second third")
+        XCTAssertEqual(snapshot.stableDisplayText, "[Speaker 0] first second third")
+        XCTAssertEqual(snapshot.latestDisplayText, "[Speaker 0] third")
+    }
+
+    func testLiveTranscriptDebugSnapshotCompletedTranscriptCanUpdateSpeakerBadges() {
+        let segmentID = UUID()
+        var snapshot = LiveTranscriptDebugSnapshot(events: [
+            .snapshot(StreamingTranscriptSnapshot(stable: Transcript(segments: [
+                TranscriptSegment(id: segmentID, text: "hello", startTime: 0.0, endTime: 0.4)
+            ])))
+        ])
+
+        snapshot.apply(.completed(Transcript(segments: [
+            TranscriptSegment(
+                id: segmentID,
+                text: "hello",
+                startTime: 0.0,
+                endTime: 0.4,
+                speaker: SpeakerID(rawValue: "speaker_0")
+            )
+        ])))
+
+        XCTAssertEqual(snapshot.transcriptText, "hello")
+        XCTAssertEqual(snapshot.stableDisplayText, "[Speaker 0] hello")
+        XCTAssertEqual(snapshot.volatileText, "")
+    }
+
     func testLiveTranscriptDebugSnapshotMarksUnattributedGapsBetweenSameSpeaker() {
         let speaker = SpeakerID(rawValue: "speaker_0")
         let snapshot = LiveTranscriptDebugSnapshot(events: [
