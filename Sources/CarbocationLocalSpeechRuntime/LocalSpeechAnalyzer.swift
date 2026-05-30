@@ -208,12 +208,10 @@ private func streamTranscriptionOnly(
     let transcriptStream = transcriber.stream(audio: audio, options: options.transcription)
 
     for try await event in transcriptStream {
-        for output in await state.recordTranscription(event) {
-            continuation.yield(output)
-        }
+        try yieldStreamingEvents(await state.recordTranscription(event), to: continuation)
     }
 
-    continuation.yield(await state.completed())
+    try yieldStreamingEvent(await state.completed(), to: continuation)
 }
 
 private func streamWithDiarization(
@@ -231,88 +229,91 @@ private func streamWithDiarization(
     let state = StreamingSpeechAnalysisState(diarizationRequest: diarizationRequest)
 
     do {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                var reportedDroppedConsumers = Set<AudioStreamConsumer>()
-                var broadcastError: Error?
-                do {
-                    for try await chunk in audio {
-                        try Task.checkCancellation()
-                        let result: AudioStreamBroadcastResult
-                        do {
-                            result = try await audioBroadcast.broadcaster.broadcast(chunk)
-                        } catch {
-                            broadcastError = error
+        try await withTaskCancellationHandler {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    var reportedDroppedConsumers = Set<AudioStreamConsumer>()
+                    var broadcastError: Error?
+                    do {
+                        for try await chunk in audio {
+                            try Task.checkCancellation()
+                            let result: AudioStreamBroadcastResult
+                            do {
+                                result = try await audioBroadcast.broadcaster.broadcast(chunk)
+                            } catch {
+                                broadcastError = error
+                                throw error
+                            }
+                            for consumer in result.droppedConsumers where reportedDroppedConsumers.insert(consumer).inserted {
+                                if consumer == .diarization {
+                                    if let diagnostic = await state.recordDiarizationDropped() {
+                                        try yieldStreamingEvent(.transcription(.diagnostic(diagnostic)), to: continuation)
+                                    }
+                                } else {
+                                    try yieldStreamingEvent(.transcription(.diagnostic(SpeechDiagnostic(
+                                        source: "analyzer",
+                                        message: "Dropped \(consumer.displayName) stream after it exceeded the real-time fan-out buffer limit; transcription will continue."
+                                    ))), to: continuation)
+                                }
+                            }
+                            guard result.hasActiveConsumers else { break }
+                        }
+                        await audioBroadcast.broadcaster.finish()
+                    } catch is CancellationError {
+                        await audioBroadcast.broadcaster.finish(throwing: CancellationError())
+                        throw CancellationError()
+                    } catch {
+                        await audioBroadcast.broadcaster.finish(throwing: error)
+                        if broadcastError != nil {
                             throw error
                         }
-                        for consumer in result.droppedConsumers where reportedDroppedConsumers.insert(consumer).inserted {
-                            if consumer == .diarization {
-                                if let diagnostic = await state.recordDiarizationDropped() {
-                                    continuation.yield(.transcription(.diagnostic(diagnostic)))
-                                }
-                            } else {
-                                continuation.yield(.transcription(.diagnostic(SpeechDiagnostic(
-                                    source: "analyzer",
-                                    message: "Dropped \(consumer.displayName) stream after it exceeded the real-time fan-out buffer limit; transcription will continue."
-                                ))))
-                            }
-                        }
-                        guard result.hasActiveConsumers else { break }
-                    }
-                    await audioBroadcast.broadcaster.finish()
-                } catch is CancellationError {
-                    await audioBroadcast.broadcaster.finish(throwing: CancellationError())
-                    throw CancellationError()
-                } catch {
-                    await audioBroadcast.broadcaster.finish(throwing: error)
-                    if broadcastError != nil {
-                        throw error
                     }
                 }
-            }
 
-            group.addTask {
-                let transcriptStream = transcriber.stream(
-                    audio: audioBroadcast.asr,
-                    options: options.transcription
-                )
-                for try await event in transcriptStream {
-                    for output in await state.recordTranscription(event) {
-                        continuation.yield(output)
-                    }
-                }
-            }
-
-            group.addTask {
-                do {
-                    let diarizationStream = streamingDiarizer.stream(
-                        audio: audioBroadcast.diarization,
-                        options: diarizationRequest.streamingOptions
+                group.addTask {
+                    let transcriptStream = transcriber.stream(
+                        audio: audioBroadcast.asr,
+                        options: options.transcription
                     )
-                    for try await snapshot in diarizationStream {
+                    for try await event in transcriptStream {
+                        try yieldStreamingEvents(await state.recordTranscription(event), to: continuation)
+                    }
+                }
+
+                group.addTask {
+                    do {
+                        let diarizationStream = streamingDiarizer.stream(
+                            audio: audioBroadcast.diarization,
+                            options: diarizationRequest.streamingOptions
+                        )
+                        for try await snapshot in diarizationStream {
+                            if options.backlogPolicy == .dropDiarization,
+                               await state.diarizationWasDropped() {
+                                return
+                            }
+                            try Task.checkCancellation()
+                            try yieldStreamingEvents(try await state.recordDiarization(snapshot), to: continuation)
+                        }
+                    } catch is CancellationError {
                         if options.backlogPolicy == .dropDiarization,
                            await state.diarizationWasDropped() {
                             return
                         }
-                        for output in await state.recordDiarization(snapshot) {
-                            continuation.yield(output)
-                        }
+                        throw CancellationError()
                     }
-                } catch is CancellationError {
-                    if options.backlogPolicy == .dropDiarization,
-                       await state.diarizationWasDropped() {
-                        return
-                    }
-                    throw CancellationError()
+                }
+
+                do {
+                    while try await group.next() != nil {}
+                } catch {
+                    group.cancelAll()
+                    await audioBroadcast.broadcaster.finish(throwing: error)
+                    throw error
                 }
             }
-
-            do {
-                while try await group.next() != nil {}
-            } catch {
-                group.cancelAll()
-                await audioBroadcast.broadcaster.finish(throwing: error)
-                throw error
+        } onCancel: {
+            Task {
+                await audioBroadcast.broadcaster.finish(throwing: CancellationError())
             }
         }
     } catch {
@@ -320,7 +321,30 @@ private func streamWithDiarization(
         throw error
     }
 
-    continuation.yield(await state.completed())
+    try yieldStreamingEvent(await state.completed(), to: continuation)
+}
+
+private func yieldStreamingEvents(
+    _ events: [StreamingSpeechAnalysisEvent],
+    to continuation: AsyncThrowingStream<StreamingSpeechAnalysisEvent, Error>.Continuation
+) throws {
+    for event in events {
+        try yieldStreamingEvent(event, to: continuation)
+    }
+}
+
+private func yieldStreamingEvent(
+    _ event: StreamingSpeechAnalysisEvent,
+    to continuation: AsyncThrowingStream<StreamingSpeechAnalysisEvent, Error>.Continuation
+) throws {
+    switch continuation.yield(event) {
+    case .enqueued, .dropped:
+        return
+    case .terminated:
+        throw CancellationError()
+    @unknown default:
+        return
+    }
 }
 
 private struct AudioStreamBroadcast: Sendable {
@@ -531,12 +555,14 @@ private actor StreamingSpeechAnalysisState {
         return outputs
     }
 
-    func recordDiarization(_ snapshot: StreamingDiarizationSnapshot) -> [StreamingSpeechAnalysisEvent] {
+    func recordDiarization(_ snapshot: StreamingDiarizationSnapshot) throws -> [StreamingSpeechAnalysisEvent] {
         guard diarizationStatus != .dropped else { return [] }
+        try Task.checkCancellation()
 
-        let retainedSnapshot = snapshotByRetainingStableDiarization(
+        let retainedSnapshot = try snapshotByRetainingStableDiarization(
             snapshotByReconcilingSpeakerIdentities(snapshot)
         )
+        try Task.checkCancellation()
         latestDiarizationSnapshot = retainedSnapshot
         var outputs: [StreamingSpeechAnalysisEvent] = [.diarization(retainedSnapshot)]
 
@@ -1167,9 +1193,9 @@ private actor StreamingSpeechAnalysisState {
 
     private func snapshotByRetainingStableDiarization(
         _ snapshot: StreamingDiarizationSnapshot
-    ) -> StreamingDiarizationSnapshot {
+    ) throws -> StreamingDiarizationSnapshot {
         StreamingDiarizationSnapshot(
-            stable: mergedDiarization(previous: latestDiarizationSnapshot?.stable, current: snapshot.stable),
+            stable: try mergedDiarization(previous: latestDiarizationSnapshot?.stable, current: snapshot.stable),
             volatile: snapshot.volatile,
             volatileRange: snapshot.volatileRange
         )
@@ -1178,11 +1204,12 @@ private actor StreamingSpeechAnalysisState {
     private func mergedDiarization(
         previous: DiarizationResult?,
         current: DiarizationResult
-    ) -> DiarizationResult {
+    ) throws -> DiarizationResult {
         guard let previous else { return current }
 
-        let turns = mergedTurns(previous.turns, current.turns)
-        let exclusiveTurns = mergedTurns(previous.exclusiveTurns, current.exclusiveTurns)
+        try Task.checkCancellation()
+        let turns = try mergedTurns(previous.turns, current.turns)
+        let exclusiveTurns = try mergedTurns(previous.exclusiveTurns, current.exclusiveTurns)
         let orderedSpeakerIDs = (turns + exclusiveTurns).reduce(into: [SpeakerID]()) { ids, turn in
             guard !ids.contains(turn.speaker) else { return }
             ids.append(turn.speaker)
@@ -1208,21 +1235,37 @@ private actor StreamingSpeechAnalysisState {
         )
     }
 
-    private func mergedTurns(_ previous: [SpeakerTurn], _ current: [SpeakerTurn]) -> [SpeakerTurn] {
+    private func mergedTurns(_ previous: [SpeakerTurn], _ current: [SpeakerTurn]) throws -> [SpeakerTurn] {
         var output: [SpeakerTurn] = []
+        output.reserveCapacity(previous.count + current.count)
+        var fingerprints = Set<SpeakerTurnFingerprint>()
+        fingerprints.reserveCapacity(previous.count + current.count)
+
         for turn in previous {
+            try Task.checkCancellation()
             let fingerprint = SpeakerTurnFingerprint(turn: turn)
-            guard !output.contains(where: { SpeakerTurnFingerprint(turn: $0) == fingerprint }) else { continue }
-            output.append(turn)
+            if fingerprints.insert(fingerprint).inserted {
+                output.append(turn)
+            }
         }
 
         for turn in current {
+            try Task.checkCancellation()
+            var removedFingerprints: [SpeakerTurnFingerprint] = []
             output.removeAll { previousTurn in
-                shouldSupersedePreviousTurn(previousTurn, with: turn)
+                let shouldRemove = shouldSupersedePreviousTurn(previousTurn, with: turn)
+                if shouldRemove {
+                    removedFingerprints.append(SpeakerTurnFingerprint(turn: previousTurn))
+                }
+                return shouldRemove
+            }
+            for fingerprint in removedFingerprints {
+                fingerprints.remove(fingerprint)
             }
             let fingerprint = SpeakerTurnFingerprint(turn: turn)
-            guard !output.contains(where: { SpeakerTurnFingerprint(turn: $0) == fingerprint }) else { continue }
-            output.append(turn)
+            if fingerprints.insert(fingerprint).inserted {
+                output.append(turn)
+            }
         }
         return output.sorted { lhs, rhs in
             if lhs.startTime == rhs.startTime {

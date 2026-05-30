@@ -1178,8 +1178,8 @@ private struct CLSSmokeRootView: View {
             return
         }
 
-        cancelFileTranscription(updateStatus: false)
-        stopListening(updateStatus: false, unloadProvider: false)
+        let stoppedFileTask = cancelFileTranscription(updateStatus: false)
+        let stoppedLiveTask = stopListening(updateStatus: false, unloadProvider: false)
 
         let sessionID = UUID()
         activeSessionID = sessionID
@@ -1192,6 +1192,9 @@ private struct CLSSmokeRootView: View {
         statusMessage = "Preparing selected provider..."
 
         transcriptionTask = Task {
+            await stoppedFileTask?.value
+            await stoppedLiveTask?.value
+            guard !Task.isCancelled else { return }
             await runLiveTranscriptionSession(
                 id: sessionID,
                 selectionStorageValue: sessionSelectionValue,
@@ -1202,7 +1205,8 @@ private struct CLSSmokeRootView: View {
         }
     }
 
-    private func stopListening(updateStatus: Bool = true, unloadProvider: Bool = true) {
+    @discardableResult
+    private func stopListening(updateStatus: Bool = true, unloadProvider: Bool = true) -> Task<Void, Never>? {
         activeSessionID = nil
         let capture = captureSession
         captureSession = nil
@@ -1225,6 +1229,8 @@ private struct CLSSmokeRootView: View {
             statusTone = .secondary
             statusMessage = "Stopped."
         }
+
+        return task
     }
 
     private func runLiveTranscriptionSession(
@@ -1617,8 +1623,8 @@ private struct CLSSmokeRootView: View {
         let vadSensitivity = selectedVADSensitivity
         let diarizationOptions = selectedFileDiarizationOptions
 
-        cancelFileTranscription(updateStatus: false)
-        stopListening(updateStatus: false, unloadProvider: false)
+        let stoppedFileTask = cancelFileTranscription(updateStatus: false)
+        let stoppedLiveTask = stopListening(updateStatus: false, unloadProvider: false)
         statusTone = .secondary
         statusMessage = "Live listening stopped for file transcription."
 
@@ -1634,6 +1640,9 @@ private struct CLSSmokeRootView: View {
         fileStatusMessage = "Preparing \(selectedFileURL.lastPathComponent)..."
 
         fileTranscriptionTask = Task {
+            await stoppedFileTask?.value
+            await stoppedLiveTask?.value
+            guard !Task.isCancelled else { return }
             await runFileTranscriptionSession(
                 id: sessionID,
                 fileURL: selectedFileURL,
@@ -1650,8 +1659,10 @@ private struct CLSSmokeRootView: View {
         return WhisperRuntimeSmoke.linkStatus().isUsable
     }
 
-    private func cancelFileTranscription(updateStatus: Bool = true) {
+    @discardableResult
+    private func cancelFileTranscription(updateStatus: Bool = true) -> Task<Void, Never>? {
         activeFileTranscriptionID = nil
+        let task = fileTranscriptionTask
         fileTranscriptionTask?.cancel()
         fileTranscriptionTask = nil
         isFileTranscribing = false
@@ -1660,6 +1671,8 @@ private struct CLSSmokeRootView: View {
             fileStatusTone = .secondary
             fileStatusMessage = "File transcription cancelled."
         }
+
+        return task
     }
 
     private func runFileTranscriptionSession(

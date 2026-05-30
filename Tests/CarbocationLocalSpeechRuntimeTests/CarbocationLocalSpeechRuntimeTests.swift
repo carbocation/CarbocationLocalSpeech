@@ -1287,6 +1287,35 @@ final class CarbocationLocalSpeechRuntimeTests: XCTestCase {
         XCTAssertEqual(completed?.diarizationStatus, .dropped)
     }
 
+    func testStreamingAnalyzerCancelsDiarizationWhenConsumerStops() async throws {
+        let probe = StreamTerminationProbe()
+        let speaker = SpeakerID(rawValue: "cancelled")
+        let snapshot = StreamingDiarizationSnapshot(stable: DiarizationResult(
+            turns: [SpeakerTurn(speaker: speaker, startTime: 0, endTime: 0.5)],
+            speakers: [Speaker(id: speaker)],
+            duration: 0.5
+        ))
+        let analyzer = LocalSpeechAnalyzer(
+            transcriber: RecordingStreamingTranscriber(recorder: AudioChunkRecorder(), events: []),
+            streamingDiarizer: RepeatingStreamingDiarizer(probe: probe, snapshot: snapshot)
+        )
+
+        do {
+            let stream = analyzer.stream(
+                audio: pacedTestAudioChunks(startTimes: Array(stride(from: 0.0, to: 10.0, by: 0.05))),
+                options: StreamingSpeechAnalysisOptions(diarization: StreamingDiarizationRequest(
+                    attributionJitterBufferDelay: 0
+                ))
+            )
+            var iterator = stream.makeAsyncIterator()
+            let firstEvent = try await iterator.next()
+            XCTAssertNotNil(firstEvent)
+        }
+
+        let didTerminate = await probe.waitForTermination()
+        XCTAssertTrue(didTerminate)
+    }
+
     func testEngineRegistersDiarizerForAnalyzerConstruction() async {
         let engine = LocalSpeechEngine()
         let speaker = SpeakerID(rawValue: "A")
@@ -1949,6 +1978,61 @@ private struct StalledEmittingStreamingDiarizer: StreamingSpeakerDiarizer {
             }
             continuation.onTermination = { _ in
                 task.cancel()
+            }
+        }
+    }
+}
+
+private actor StreamTerminationProbe {
+    private var didTerminate = false
+
+    func markTerminated() {
+        didTerminate = true
+    }
+
+    func waitForTermination() async -> Bool {
+        for _ in 0..<50 {
+            if didTerminate {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return didTerminate
+    }
+}
+
+private struct RepeatingStreamingDiarizer: StreamingSpeakerDiarizer {
+    var probe: StreamTerminationProbe
+    var snapshot: StreamingDiarizationSnapshot
+
+    func stream(
+        audio: AsyncThrowingStream<AudioChunk, Error>,
+        options: StreamingDiarizationOptions
+    ) -> AsyncThrowingStream<StreamingDiarizationSnapshot, Error> {
+        let probe = probe
+        let snapshot = snapshot
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try options.options.validate()
+                    for try await _ in audio {
+                        try Task.checkCancellation()
+                        continuation.yield(snapshot)
+                    }
+                    while !Task.isCancelled {
+                        continuation.yield(snapshot)
+                        try await Task.sleep(nanoseconds: 10_000_000)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+                Task {
+                    await probe.markTerminated()
+                }
             }
         }
     }
